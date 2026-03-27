@@ -28,7 +28,7 @@ const SUCCESS_HTML = `<!DOCTYPE html>
 <style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8f9fa}
 .card{text-align:center;padding:2rem;border-radius:8px;background:white;box-shadow:0 2px 8px rgba(0,0,0,0.1)}
 h1{color:#22c55e;margin-bottom:0.5rem}p{color:#6b7280}</style></head>
-<body><div class="card"><h1>✓ Authentication Successful</h1><p>You can close this window and return to the terminal.</p></div></body></html>`;
+<body><div class="card"><h1>Authentication Successful</h1><p>You can close this window and return to the terminal.</p></div></body></html>`;
 
 const ERROR_HTML = (msg: string) => `<!DOCTYPE html>
 <html><head><title>Monocle - Authentication Failed</title>
