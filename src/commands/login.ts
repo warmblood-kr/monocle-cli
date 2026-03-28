@@ -186,6 +186,7 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
         code_challenge: codeChallenge,
         code_challenge_method: 'S256',
         state: state,
+        tenant: options.tenantDomain,
       });
 
       const authUrl = `${oidc.authorization_endpoint}?${authParams.toString()}`;

@@ -91,6 +91,7 @@ describe('loginCommand', () => {
     expect(authUrl.searchParams.get('code_challenge')).toBeTruthy();
     expect(authUrl.searchParams.get('state')).toBeTruthy();
     expect(authUrl.searchParams.get('redirect_uri')).toContain('http://127.0.0.1:');
+    expect(authUrl.searchParams.get('tenant')).toBe('test.stark.com');
 
     // Verify credentials saved
     const stored = getStored();
