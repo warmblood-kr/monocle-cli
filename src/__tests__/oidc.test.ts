@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC } from '../oidc';
+import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain } from '../oidc';
 import * as crypto from 'crypto';
 
 describe('PKCE', () => {
@@ -43,6 +43,29 @@ describe('PKCE', () => {
     const state2 = generateState();
     expect(state1).not.toBe(state2);
     expect(state1.length).toBeGreaterThan(0);
+  });
+});
+
+describe('resolveStarkDomain', () => {
+  it('resolves stg tenant to stg Stark domain', () => {
+    expect(resolveStarkDomain('stg-warmblood091803.monocle-ai.com')).toBe('stg.monocle-ai.com');
+  });
+
+  it('resolves production tenant to base domain', () => {
+    expect(resolveStarkDomain('warmblood.monocle-ai.com')).toBe('monocle-ai.com');
+  });
+
+  it('throws on bare domain (no subdomain)', () => {
+    expect(() => resolveStarkDomain('monocle-ai.com')).toThrow('Invalid tenant domain');
+    expect(() => resolveStarkDomain('monocle-ai.com')).toThrow('Tenant must be a subdomain');
+  });
+
+  it('preserves localhost as-is', () => {
+    expect(resolveStarkDomain('localhost:8080')).toBe('localhost:8080');
+  });
+
+  it('preserves 127.0.0.1 as-is', () => {
+    expect(resolveStarkDomain('127.0.0.1:8080')).toBe('127.0.0.1:8080');
   });
 });
 

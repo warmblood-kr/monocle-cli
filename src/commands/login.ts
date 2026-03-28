@@ -1,7 +1,7 @@
 import * as http from 'http';
 import * as url from 'url';
 import { Credentials, CredentialsData } from '../credentials';
-import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, OIDCDeps } from '../oidc';
+import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain, OIDCDeps } from '../oidc';
 import { decodeIdTokenPayload } from '../refresh';
 
 const CLIENT_ID = 'monocle-cli';
@@ -44,8 +44,9 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
   const createServerFn = deps?.createServer ?? ((handler: any) => http.createServer(handler) as any);
 
   // Step 1: OIDC Discovery
-  process.stderr.write(`Discovering OIDC configuration for ${options.tenantDomain}...\n`);
-  const oidc = await discoverOIDC(options.tenantDomain, { fetch: fetchFn } as OIDCDeps);
+  const starkDomain = resolveStarkDomain(options.tenantDomain);
+  process.stderr.write(`Discovering OIDC configuration for ${starkDomain}...\n`);
+  const oidc = await discoverOIDC(starkDomain, { fetch: fetchFn } as OIDCDeps);
 
   // Step 2: Generate PKCE + state
   const codeVerifier = generateCodeVerifier();

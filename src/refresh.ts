@@ -1,5 +1,5 @@
 import { Credentials, CredentialsData } from './credentials';
-import { discoverOIDC, OIDCDeps } from './oidc';
+import { discoverOIDC, resolveStarkDomain, OIDCDeps } from './oidc';
 
 export interface RefreshDeps {
   fetch?: (url: string, init?: any) => Promise<{ ok: boolean; status: number; json: () => Promise<any> }>;
@@ -29,7 +29,8 @@ export async function refreshAccessToken(
   let tokenEndpoint: string;
   let discoveredRouterUrl: string | undefined;
   try {
-    const oidc = await discoverOIDC(currentCredentials.tenant_domain, { fetch: deps?.fetch } as OIDCDeps);
+    const starkDomain = resolveStarkDomain(currentCredentials.tenant_domain);
+    const oidc = await discoverOIDC(starkDomain, { fetch: deps?.fetch } as OIDCDeps);
     tokenEndpoint = oidc.token_endpoint;
     discoveredRouterUrl = oidc.router_url;
   } catch (err: any) {
