@@ -43,6 +43,37 @@ export function generateState(): string {
 }
 
 /**
+ * Resolve the Stark (control plane) domain from a tenant domain.
+ * Tenants always run on a subdomain — bare domains are rejected.
+ *
+ * Examples:
+ *   stg-warmblood091803.monocle-ai.com → stg.monocle-ai.com
+ *   warmblood.monocle-ai.com           → monocle-ai.com
+ *   localhost:8080                      → localhost:8080
+ */
+export function resolveStarkDomain(tenantDomain: string): string {
+  if (tenantDomain.startsWith('localhost') || tenantDomain.startsWith('127.0.0.1')) {
+    return tenantDomain;
+  }
+
+  const parts = tenantDomain.split('.');
+  if (parts.length <= 2) {
+    throw new Error(
+      `Invalid tenant domain: ${tenantDomain}. Tenant must be a subdomain (e.g., mytenant.monocle-ai.com)`
+    );
+  }
+
+  const subdomain = parts[0];
+  const baseDomain = parts.slice(1).join('.');
+
+  if (subdomain.startsWith('stg-')) {
+    return `stg.${baseDomain}`;
+  }
+
+  return baseDomain;
+}
+
+/**
  * Discover OIDC endpoints from tenant domain
  */
 export async function discoverOIDC(
