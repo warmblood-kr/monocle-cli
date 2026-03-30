@@ -54,7 +54,8 @@ export async function setupCommand(deps?: SetupDeps): Promise<void> {
   if (creds.router_url) {
     routerUrl = creds.router_url;
   } else {
-    const protocol = creds.tenant_domain.startsWith('localhost') ? 'http' : 'https';
+    const isLocal = creds.tenant_domain.startsWith('localhost') || creds.tenant_domain.startsWith('127.0.0.1');
+    const protocol = isLocal ? 'http' : 'https';
     routerUrl = `${protocol}://${creds.tenant_domain}`;
     process.stderr.write('Warning: router_url not found. Using tenant domain as fallback.\n');
     process.stderr.write('Run `monocle login --tenant <domain>` to update credentials.\n');
@@ -71,12 +72,9 @@ export async function setupCommand(deps?: SetupDeps): Promise<void> {
   process.stderr.write(`  ANTHROPIC_BASE_URL: ${routerUrl}\n`);
 
   // Step 7: Warn about conflicting env vars
-  if (env.ANTHROPIC_API_KEY) {
-    process.stderr.write('\n⚠ Warning: ANTHROPIC_API_KEY environment variable is set.\n');
-    process.stderr.write('  It takes priority over apiKeyHelper. Unset it to use Monocle authentication.\n');
-  }
-  if (env.ANTHROPIC_AUTH_TOKEN) {
-    process.stderr.write('\n⚠ Warning: ANTHROPIC_AUTH_TOKEN environment variable is set.\n');
-    process.stderr.write('  It takes priority over apiKeyHelper. Unset it to use Monocle authentication.\n');
+  const conflicting = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'].filter(k => env[k]);
+  if (conflicting.length > 0) {
+    process.stderr.write(`\n⚠ Warning: ${conflicting.join(', ')} environment variable is set.\n`);
+    process.stderr.write('  Use `monocle claude` to launch Claude Code — it clears conflicting env vars automatically.\n');
   }
 }
