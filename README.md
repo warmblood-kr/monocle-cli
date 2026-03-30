@@ -32,7 +32,9 @@ monocle login --tenant your-org.monocle-ai.com
 monocle setup
 ```
 
-끝이에요! 이제 평소처럼 `claude`를 실행하시면 됩니다.
+끝이에요! 이제 `monocle claude`를 실행하시면 됩니다.
+
+> **Tip:** `ANTHROPIC_API_KEY` 같은 환경 변수가 설정되어 있어도 `monocle claude`가 자동으로 정리해 줘요.
 
 ## 상태 확인
 
@@ -44,13 +46,14 @@ monocle status
 
 ## 전체 명령어
 
-| 명령어 | 설명 |
-|--------|------|
-| `monocle login --tenant <domain>` | 브라우저로 로그인 |
-| `monocle setup` | Claude Code를 조직 엔드포인트에 연결 |
-| `monocle status` | 로그인/설정 상태 확인 |
-| `monocle token` | 현재 액세스 토큰 출력 (Claude Code가 내부적으로 사용) |
-| `monocle unset` | Claude Code에서 Monocle 설정 제거 |
+| 명령어                            | 설명                                                  |
+|-----------------------------------|-------------------------------------------------------|
+| `monocle login --tenant <domain>` | 브라우저로 로그인                                     |
+| `monocle setup`                   | Claude Code를 조직 엔드포인트에 연결                  |
+| `monocle claude`                  | 환경 변수 충돌을 자동 정리하고 Claude Code 실행        |
+| `monocle status`                  | 로그인/설정 상태 확인                                 |
+| `monocle token`                   | 현재 액세스 토큰 출력 (Claude Code가 내부적으로 사용)  |
+| `monocle unset`                   | Claude Code에서 Monocle 설정 제거                     |
 
 ## 문제가 생겼나요?
 
@@ -61,12 +64,7 @@ monocle status
 → 토큰은 자동으로 갱신돼요. 마지막 로그인 후 30일이 지났다면 `monocle login`을 다시 실행해 주세요.
 
 **Claude Code가 Monocle을 무시해요**
-→ 환경 변수에 `ANTHROPIC_API_KEY`가 설정되어 있으면 Monocle보다 우선 적용돼요. 아래 명령어로 해제해 주세요:
-
-```bash
-unset ANTHROPIC_API_KEY
-unset ANTHROPIC_AUTH_TOKEN
-```
+→ 환경 변수에 `ANTHROPIC_API_KEY`가 설정되어 있으면 Monocle보다 우선 적용돼요. `monocle claude`로 실행하면 자동으로 해결됩니다.
 
 **처음부터 다시 하고 싶어요**
 → `monocle unset` 후 `monocle setup`을 다시 실행하면 돼요.

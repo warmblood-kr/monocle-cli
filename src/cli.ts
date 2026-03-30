@@ -6,6 +6,7 @@ import { tokenCommand } from './commands/token';
 import { setupCommand } from './commands/setup';
 import { unsetCommand } from './commands/unset';
 import { statusCommand } from './commands/status';
+import { claudeCommand } from './commands/claude';
 
 const program = new Command();
 
@@ -69,6 +70,20 @@ program
   .action(async () => {
     try {
       await statusCommand();
+    } catch (err: any) {
+      process.stderr.write(`Error: ${err.message}\n`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('claude')
+  .description('Launch Claude Code with Monocle authentication (clears conflicting env vars)')
+  .allowUnknownOption(true)
+  .helpOption(false)
+  .action(async (_options, cmd) => {
+    try {
+      await claudeCommand(cmd.args);
     } catch (err: any) {
       process.stderr.write(`Error: ${err.message}\n`);
       process.exit(1);

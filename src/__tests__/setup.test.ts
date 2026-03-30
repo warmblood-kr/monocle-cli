@@ -123,6 +123,7 @@ describe('setupCommand', () => {
     });
 
     expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('ANTHROPIC_API_KEY'));
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('monocle claude'));
     stderrSpy.mockRestore();
   });
 
