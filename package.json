@@ -1,5 +1,5 @@
 {
-  "name": "@monocle-ai/cli",
+  "name": "@warmblood/monocle-cli",
   "version": "0.1.0",
   "description": "CLI authentication tool for Claude Code with Stark OIDC PKCE integration",
   "main": "dist/index.js",
