@@ -15,7 +15,7 @@ Monocle CLI를 사용하면 [Claude Code](https://docs.anthropic.com/en/docs/cla
 **Step 1** — Monocle CLI 설치
 
 ```bash
-npm install -g @monocle-ai/cli
+npm install -g @warmblood/monocle-cli
 ```
 
 **Step 2** — 로그인
