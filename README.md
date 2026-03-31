@@ -1,6 +1,6 @@
 # Monocle CLI
 
-Monocle CLI를 사용하면 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)를 우리 조직의 관리형 엔드포인트를 통해 사용할 수 있어요.
+Monocle CLI를 사용하면 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)를 Monocle AI에 연동해 사용할 수 있어요.
 
 한 번만 로그인하고 설정하면 끝! API 키 관리도, 설정 파일 직접 수정도 필요 없어요.
 

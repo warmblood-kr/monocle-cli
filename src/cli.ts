@@ -13,15 +13,16 @@ const program = new Command();
 program
   .name('monocle')
   .description('CLI authentication tool for Claude Code with Stark OIDC integration')
-  .version('0.1.0');
+  .version('0.3.0');
 
 program
   .command('login')
   .description('Authenticate with Stark OIDC provider')
-  .requiredOption('--tenant <domain>', 'Stark tenant domain (e.g., example.stark.com)')
+  .option('--tenant <domain>', 'Stark tenant domain (e.g., example.monocle-ai.com)')
+  .option('--env <environment>', 'Environment: prod, stg, local (default: prod)', 'prod')
   .action(async (options) => {
     try {
-      await loginCommand({ tenantDomain: options.tenant });
+      await loginCommand({ tenantDomain: options.tenant, env: options.env });
     } catch (err: any) {
       process.stderr.write(`Error: ${err.message}\n`);
       process.exit(1);

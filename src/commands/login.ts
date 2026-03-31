@@ -1,7 +1,7 @@
 import * as http from 'http';
 import * as url from 'url';
 import { Credentials, CredentialsData } from '../credentials';
-import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain, OIDCDeps } from '../oidc';
+import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain, STARK_DOMAINS, OIDCDeps } from '../oidc';
 import { decodeIdTokenPayload } from '../refresh';
 
 const CLIENT_ID = 'monocle-cli';
@@ -9,7 +9,8 @@ const SCOPES = 'openid profile email';
 const REFRESH_TOKEN_TTL_DAYS = 30;
 
 export interface LoginOptions {
-  tenantDomain: string;
+  tenantDomain?: string;
+  env?: string;
 }
 
 export interface LoginDeps {
@@ -44,7 +45,10 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
   const createServerFn = deps?.createServer ?? ((handler: any) => http.createServer(handler) as any);
 
   // Step 1: OIDC Discovery
-  const starkDomain = resolveStarkDomain(options.tenantDomain);
+  const env = options.env ?? 'prod';
+  const starkDomain = options.tenantDomain
+    ? resolveStarkDomain(options.tenantDomain)
+    : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
   process.stderr.write(`Discovering OIDC configuration for ${starkDomain}...\n`);
   const oidc = await discoverOIDC(starkDomain, { fetch: fetchFn } as OIDCDeps);
 
@@ -125,12 +129,14 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
 
           // Step 8: Decode ID token
           let email = 'unknown';
-          let tenantName = options.tenantDomain;
+          let tenantDomain = options.tenantDomain ?? '';
+          let tenantName = tenantDomain;
           if (id_token) {
             try {
               const payload = decodeIdTokenPayload(id_token);
               email = payload.email ?? 'unknown';
-              tenantName = payload.tenant_name ?? options.tenantDomain;
+              tenantDomain = payload.tenant_domain ?? tenantDomain;
+              tenantName = payload.tenant_name ?? tenantDomain;
             } catch {
               // Use defaults
             }
@@ -142,7 +148,7 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
           const refreshTokenExpiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
 
           const creds: CredentialsData = {
-            tenant_domain: options.tenantDomain,
+            tenant_domain: tenantDomain,
             tenant_name: tenantName,
             email,
             access_token,
@@ -186,8 +192,10 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
         code_challenge: codeChallenge,
         code_challenge_method: 'S256',
         state: state,
-        tenant: options.tenantDomain,
       });
+      if (options.tenantDomain) {
+        authParams.set('tenant', options.tenantDomain);
+      }
 
       const authUrl = `${oidc.authorization_endpoint}?${authParams.toString()}`;
 

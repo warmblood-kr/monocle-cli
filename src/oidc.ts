@@ -51,6 +51,12 @@ export function generateState(): string {
  *   warmblood.monocle-ai.com           → monocle-ai.com
  *   localhost:8080                      → localhost:8080
  */
+export const STARK_DOMAINS: Record<string, string> = {
+  prod: 'monocle-ai.com',
+  stg: 'stg.monocle-ai.com',
+  local: 'localhost:9000',
+};
+
 export function resolveStarkDomain(tenantDomain: string): string {
   if (tenantDomain.startsWith('localhost') || tenantDomain.startsWith('127.0.0.1')) {
     return tenantDomain;
