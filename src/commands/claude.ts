@@ -1,5 +1,9 @@
 import * as child_process from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { Credentials } from '../credentials';
+import { setupCommand } from './setup';
 
 export interface ClaudeDeps {
   credentials?: Credentials;
@@ -17,6 +21,20 @@ export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<
     process.stderr.write('Not logged in. Run `monocle login --tenant <domain>` first.\n');
     process.exit(1);
     return;
+  }
+
+  // Ensure Claude Code is configured (auto-setup if needed)
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+  let needsSetup = true;
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+    needsSetup = settings.apiKeyHelper !== 'monocle token';
+  } catch {
+    // File doesn't exist or invalid JSON
+  }
+  if (needsSetup) {
+    process.stderr.write('Claude Code not configured for Monocle. Running setup...\n');
+    await setupCommand();
   }
 
   // Build clean env — remove vars that override apiKeyHelper

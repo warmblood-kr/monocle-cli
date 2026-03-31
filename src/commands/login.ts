@@ -3,6 +3,7 @@ import * as url from 'url';
 import { Credentials, CredentialsData } from '../credentials';
 import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain, STARK_DOMAINS, OIDCDeps } from '../oidc';
 import { decodeIdTokenPayload } from '../refresh';
+import { setupCommand } from './setup';
 
 const CLIENT_ID = 'monocle-cli';
 const SCOPES = 'openid profile email';
@@ -168,6 +169,13 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
 
           // Step 11: Terminal output
           process.stderr.write(`Logged in as ${email} (${tenantName})\n`);
+
+          // Step 12: Auto-setup Claude Code
+          process.stderr.write('\nConfiguring Claude Code...\n');
+          setupCommand().catch(() => {
+            process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
+          });
+
           resolve();
         })
         .catch((err: Error) => {
