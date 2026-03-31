@@ -13,7 +13,7 @@ const program = new Command();
 program
   .name('monocle')
   .description('CLI authentication tool for Claude Code with Stark OIDC integration')
-  .version('0.3.0');
+  .version('0.4.0');
 
 program
   .command('login')
