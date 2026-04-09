@@ -112,7 +112,7 @@ model
 model
   .command('chat')
   .description('Chat with LLM via Monocle router (interactive REPL or pipe from stdin)')
-  .option('--model <model>', 'Model ID to use', 'claude-sonnet-4-5-20250514')
+  .option('--model <model>', 'Model ID to use', 'claude-sonnet-4-6')
   .option('--system-prompt <text>', 'System prompt text')
   .option('--system-prompt-file <path>', 'Load system prompt from file')
   .option('--max-tokens <n>', 'Maximum output tokens', '4096')

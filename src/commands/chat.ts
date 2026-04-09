@@ -21,7 +21,7 @@ export interface ChatDeps {
 }
 
 const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
-const DEFAULT_MODEL = 'claude-sonnet-4-5-20250514';
+const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_MAX_TOKENS = 4096;
 
 async function getAccessToken(
