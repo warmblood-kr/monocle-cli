@@ -141,6 +141,28 @@ export async function chatCommand(
 
   // Get auth
   const { token, routerUrl } = await getAccessToken(credentials, deps);
+  const fetchFn = deps?.fetch ?? globalThis.fetch;
+
+  // Validate model ID against available models
+  try {
+    const modelsResp = await fetchFn(`${routerUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (modelsResp.ok) {
+      const modelsData = (await modelsResp.json()) as { data: Array<{ id: string }> };
+      const availableIds = modelsData.data.map((m) => m.id);
+      if (!availableIds.includes(model)) {
+        stderr.write(`Error: Model "${model}" not found.\n`);
+        stderr.write(`Available models:\n`);
+        for (const id of availableIds) {
+          stderr.write(`  ${id}\n`);
+        }
+        process.exit(1);
+      }
+    }
+  } catch {
+    // Non-fatal — proceed even if model list fails
+  }
 
   // Check if stdin is piped (non-interactive)
   if (!process.stdin.isTTY) {
@@ -174,7 +196,7 @@ export async function chatCommand(
 
   rl.prompt();
 
-  rl.on('line', async (line: string) => {
+  rl.on('line', (line: string) => {
     const trimmed = line.trim();
     if (!trimmed) {
       rl.prompt();
@@ -186,19 +208,29 @@ export async function chatCommand(
       return;
     }
 
-    try {
-      stderr.write('\n');
-      const result = await callChat(routerUrl, token, model, systemPrompt, trimmed, maxTokens, deps);
-      stdout.write(result);
-      stdout.write('\n\n');
-    } catch (err: any) {
-      stderr.write(`Error: ${err.message}\n`);
-    }
+    // Pause input while waiting for API response
+    rl.pause();
+    stderr.write('\n');
 
-    rl.prompt();
+    callChat(routerUrl, token, model, systemPrompt, trimmed, maxTokens, deps)
+      .then((result) => {
+        stdout.write(result);
+        stdout.write('\n\n');
+      })
+      .catch((err: any) => {
+        stderr.write(`Error: ${err.message}\n\n`);
+      })
+      .finally(() => {
+        rl.resume();
+        rl.prompt();
+      });
   });
 
-  rl.on('close', () => {
-    stderr.write('\nBye.\n');
+  // Keep process alive until REPL closes
+  await new Promise<void>((resolve) => {
+    rl.on('close', () => {
+      stderr.write('\nBye.\n');
+      resolve();
+    });
   });
 }
