@@ -20,9 +20,10 @@ program
   .description('Authenticate with Stark OIDC provider')
   .option('--tenant <domain>', 'Stark tenant domain (e.g., example.monocle-ai.com)')
   .option('--env <environment>', 'Environment: prod, stg, local (default: prod)', 'prod')
+  .option('--device-code', 'Use Device Authorization Grant (for headless/SSH environments)')
   .action(async (options) => {
     try {
-      await loginCommand({ tenantDomain: options.tenant, env: options.env });
+      await loginCommand({ tenantDomain: options.tenant, env: options.env, deviceCode: options.deviceCode });
     } catch (err: any) {
       process.stderr.write(`Error: ${err.message}\n`);
       process.exit(1);
