@@ -58,6 +58,7 @@ describe('loginCommand', () => {
       {
         credentials: instance,
         fetch: createMockFetch() as any,
+        skipSetup: true,
         openBrowser: async (url: string) => {
           capturedAuthUrl = url;
           // Simulate callback
@@ -141,6 +142,7 @@ describe('loginCommand', () => {
       {
         credentials: instance,
         fetch: mockFetch as any,
+        skipSetup: true,
         openBrowser: async (url: string) => {
           const urlObj = new URL(url);
           const redirectUri = urlObj.searchParams.get('redirect_uri')!;
@@ -170,6 +172,7 @@ describe('loginCommand', () => {
       {
         credentials: instance,
         fetch: createMockFetch() as any,
+        skipSetup: true,
         openBrowser: async (url: string) => {
           const urlObj = new URL(url);
           const redirectUri = urlObj.searchParams.get('redirect_uri')!;

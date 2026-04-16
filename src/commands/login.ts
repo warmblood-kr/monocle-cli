@@ -24,6 +24,7 @@ export interface LoginDeps {
     close: (cb?: () => void) => void;
     address: () => { port: number } | null;
   };
+  skipSetup?: boolean;
 }
 
 const SUCCESS_HTML = `<!DOCTYPE html>
@@ -93,7 +94,7 @@ export async function pollForToken(
   throw new Error('인증 시간이 만료되었습니다.');
 }
 
-async function deviceCodeLogin(options: {tenantDomain?: string; env?: string}): Promise<void> {
+async function deviceCodeLogin(options: {tenantDomain?: string; env?: string}, deps?: LoginDeps): Promise<void> {
   const credentials = new Credentials();
 
   // Resolve Stark domain + discover OIDC
@@ -180,17 +181,19 @@ async function deviceCodeLogin(options: {tenantDomain?: string; env?: string}): 
   process.stderr.write(`Logged in as ${email} (${tenantName})\n`);
 
   // Auto-setup Claude Code
-  process.stderr.write('\nConfiguring Claude Code...\n');
-  setupCommand().catch(() => {
-    process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
-  });
+  if (!deps?.skipSetup) {
+    process.stderr.write('\nConfiguring Claude Code...\n');
+    setupCommand().catch(() => {
+      process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
+    });
+  }
 }
 
 export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Promise<void> {
   // Headless detection
   const isHeadless = options.deviceCode || !!process.env.SSH_CLIENT || !!process.env.SSH_TTY || !!process.env.SSH_CONNECTION;
   if (isHeadless) {
-    return deviceCodeLogin(options);
+    return deviceCodeLogin(options, deps);
   }
 
   const credentials = deps?.credentials ?? new Credentials();
@@ -324,10 +327,12 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
           process.stderr.write(`Logged in as ${email} (${tenantName})\n`);
 
           // Step 12: Auto-setup Claude Code
-          process.stderr.write('\nConfiguring Claude Code...\n');
-          setupCommand().catch(() => {
-            process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
-          });
+          if (!deps?.skipSetup) {
+            process.stderr.write('\nConfiguring Claude Code...\n');
+            setupCommand().catch(() => {
+              process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
+            });
+          }
 
           resolve();
         })
