@@ -33,6 +33,10 @@ That's it! Run `monocle claude` to get started.
 > **Tip:** To specify a tenant explicitly, use `monocle login --tenant your-org.monocle-ai.com`
 >
 > **Tip:** If you have `ANTHROPIC_API_KEY` set in your environment, `monocle claude` will automatically clear it to avoid conflicts.
+>
+> **Headless / SSH / CI?** `monocle login` auto-detects these environments and switches to
+> the device code flow — a URL and short code you enter on another machine. If auto-detection
+> misses your environment, force it with `monocle login --device-code`.
 
 ## Check Status
 
@@ -46,7 +50,7 @@ All green (**Valid** and **Configured**) means you're good to go!
 
 | Command | Description |
 |---------|-------------|
-| `monocle login [--tenant <domain>] [--env <env>]` | Sign in via browser (auto-configures Claude Code) |
+| `monocle login [--tenant <domain>] [--env <env>] [--device-code]` | Sign in — browser by default, device code on headless/SSH/CI (auto-configures Claude Code) |
 | `monocle setup` | Manually configure Claude Code (usually handled by login) |
 | `monocle claude` | Launch Claude Code with conflicting env vars cleared |
 | `monocle status` | Show login and configuration status |

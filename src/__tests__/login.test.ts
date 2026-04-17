@@ -1,7 +1,22 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { loginCommand } from '../commands/login';
 import { Credentials, CredentialsData } from '../credentials';
 import * as http from 'http';
+
+// These tests exercise the browser flow. Make sure the environment doesn't
+// trigger headless auto-detection (SSH, Emacs, CI, linux-without-DISPLAY).
+const originalEnv = { ...process.env };
+beforeEach(() => {
+  delete process.env.SSH_CLIENT;
+  delete process.env.SSH_TTY;
+  delete process.env.SSH_CONNECTION;
+  delete process.env.INSIDE_EMACS;
+  delete process.env.CI;
+  process.env.DISPLAY = ':0';
+});
+afterEach(() => {
+  process.env = { ...originalEnv };
+});
 
 function createMockCredentials() {
   let stored: CredentialsData | null = null;

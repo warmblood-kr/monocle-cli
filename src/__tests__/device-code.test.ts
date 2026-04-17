@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { loginCommand, pollForToken } from '../commands/login';
 import { Credentials, CredentialsData } from '../credentials';
 
@@ -155,6 +155,112 @@ describe('SSH environment detection', () => {
     expect(getStored()!.access_token).toBe('at_device');
     expect(getStored()!.email).toBe('user@test.com');
     expect(getStored()!.tenant_name).toBe('Test Org');
+
+    stderrSpy.mockRestore();
+  });
+
+  it('detects INSIDE_EMACS and uses device code flow', async () => {
+    process.env.INSIDE_EMACS = 'vterm';
+    const { instance, getStored } = createMockCredentials();
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await loginCommand(
+      { tenantDomain: 'test.stark.com' },
+      {
+        credentials: instance,
+        fetch: createDeviceCodeMockFetch() as any,
+        skipSetup: true,
+      },
+    );
+
+    expect(getStored()).not.toBeNull();
+    expect(getStored()!.access_token).toBe('at_device');
+
+    stderrSpy.mockRestore();
+  });
+
+  it('detects CI env and uses device code flow', async () => {
+    process.env.CI = 'true';
+    const { instance, getStored } = createMockCredentials();
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await loginCommand(
+      { tenantDomain: 'test.stark.com' },
+      {
+        credentials: instance,
+        fetch: createDeviceCodeMockFetch() as any,
+        skipSetup: true,
+      },
+    );
+
+    expect(getStored()).not.toBeNull();
+    expect(getStored()!.access_token).toBe('at_device');
+
+    stderrSpy.mockRestore();
+  });
+});
+
+describe('browser flow fallback', () => {
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    // Start from a 'non-headless' baseline so we exercise the browser flow
+    delete process.env.SSH_CLIENT;
+    delete process.env.SSH_TTY;
+    delete process.env.SSH_CONNECTION;
+    delete process.env.INSIDE_EMACS;
+    delete process.env.CI;
+    process.env.DISPLAY = ':0';
+  });
+
+  afterEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  it('falls back to device code when openBrowser fails', async () => {
+    const { instance, getStored } = createMockCredentials();
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await loginCommand(
+      { tenantDomain: 'test.stark.com' },
+      {
+        credentials: instance,
+        fetch: createDeviceCodeMockFetch() as any,
+        skipSetup: true,
+        openBrowser: async () => {
+          throw new Error('xdg-open: command not found');
+        },
+      },
+    );
+
+    expect(getStored()).not.toBeNull();
+    expect(getStored()!.access_token).toBe('at_device');
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('Falling back to device code'));
+
+    stderrSpy.mockRestore();
+  });
+
+  it('falls back to device code when no callback arrives before timeout', async () => {
+    const { instance, getStored } = createMockCredentials();
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    await loginCommand(
+      { tenantDomain: 'test.stark.com' },
+      {
+        credentials: instance,
+        fetch: createDeviceCodeMockFetch() as any,
+        skipSetup: true,
+        browserCallbackTimeoutMs: 50, // force quick timeout for tests
+        openBrowser: async () => {
+          // Simulate the OS command "succeeding" (e.g., xdg-open returns 0)
+          // but the user's browser never actually reaches the callback URL.
+        },
+      },
+    );
+
+    expect(getStored()).not.toBeNull();
+    expect(getStored()!.access_token).toBe('at_device');
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('no callback received'));
 
     stderrSpy.mockRestore();
   });

@@ -33,6 +33,8 @@ monocle login
 > **Tip:** 특정 테넌트를 지정하려면 `monocle login --tenant your-org.monocle-ai.com`으로 실행하세요.
 >
 > **Tip:** `ANTHROPIC_API_KEY` 같은 환경 변수가 설정되어 있어도 `monocle claude`가 자동으로 정리해 줘요.
+>
+> **헤드리스 / SSH / CI 환경이신가요?** `monocle login`이 자동으로 감지해서 device code 방식으로 전환합니다 — 다른 기기의 브라우저에서 URL을 열고 짧은 코드를 입력하는 방식이에요. 자동 감지가 안 되는 환경이면 `monocle login --device-code`로 강제할 수 있어요.
 
 ## 상태 확인
 
@@ -46,7 +48,7 @@ monocle status
 
 | 명령어 | 설명 |
 |--------|------|
-| `monocle login [--tenant <domain>] [--env <env>]` | 브라우저로 로그인 (Claude Code 자동 설정 포함) |
+| `monocle login [--tenant <domain>] [--env <env>] [--device-code]` | 로그인 — 기본은 브라우저, 헤드리스/SSH/CI에서는 device code 방식 (Claude Code 자동 설정 포함) |
 | `monocle setup` | Claude Code를 수동으로 설정 (보통은 login이 자동 처리) |
 | `monocle claude` | 환경 변수 충돌을 자동 정리하고 Claude Code 실행 |
 | `monocle status` | 로그인/설정 상태 확인 |

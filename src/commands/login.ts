@@ -8,6 +8,7 @@ import { setupCommand } from './setup';
 const CLIENT_ID = 'monocle-cli';
 const SCOPES = 'openid profile email';
 const REFRESH_TOKEN_TTL_DAYS = 30;
+const BROWSER_CALLBACK_TIMEOUT_MS = 90_000;
 
 export interface LoginOptions {
   tenantDomain?: string;
@@ -25,6 +26,7 @@ export interface LoginDeps {
     address: () => { port: number } | null;
   };
   skipSetup?: boolean;
+  browserCallbackTimeoutMs?: number;
 }
 
 const SUCCESS_HTML = `<!DOCTYPE html>
@@ -41,16 +43,56 @@ const ERROR_HTML = (msg: string) => `<!DOCTYPE html>
 h1{color:#ef4444;margin-bottom:0.5rem}p{color:#6b7280}</style></head>
 <body><div class="card"><h1>✗ Authentication Failed</h1><p>${msg}</p></div></body></html>`;
 
+/**
+ * Internal sentinel indicating the browser flow is unavailable in this environment
+ * and the caller should fall back to device code. Not a real user-visible error.
+ */
+class BrowserFlowUnavailableError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'BrowserFlowUnavailableError';
+  }
+}
+
+/**
+ * Detect environments where a local browser almost certainly cannot be used:
+ * SSH, Emacs inner shell, CI, and Linux console without DISPLAY.
+ * When any of these fire, skip browser flow entirely and go to device code.
+ */
+function detectHeadless(options: LoginOptions): boolean {
+  if (options.deviceCode) return true;
+  if (process.env.SSH_CLIENT || process.env.SSH_TTY || process.env.SSH_CONNECTION) return true;
+  if (process.env.INSIDE_EMACS) return true;
+  if (process.env.CI) return true;
+  if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return true;
+  return false;
+}
+
 export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Promise<void> {
-  const isHeadless = options.deviceCode || !!process.env.SSH_CLIENT || !!process.env.SSH_TTY || !!process.env.SSH_CONNECTION;
-  if (isHeadless) {
+  if (detectHeadless(options)) {
     return deviceCodeLogin(options, deps);
   }
 
+  // Ambiguous environment: try browser flow, fall back to device code if:
+  //   - openBrowser exec fails (command not found, non-zero exit)
+  //   - callback not received within BROWSER_CALLBACK_TIMEOUT_MS
+  try {
+    return await browserCodeLogin(options, deps);
+  } catch (err) {
+    if (err instanceof BrowserFlowUnavailableError) {
+      process.stderr.write(`\nBrowser flow unavailable: ${err.message}\nFalling back to device code...\n\n`);
+      return deviceCodeLogin(options, deps);
+    }
+    throw err;
+  }
+}
+
+async function browserCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise<void> {
   const credentials = deps?.credentials ?? new Credentials();
   const fetchFn = deps?.fetch ?? globalThis.fetch;
   const openBrowser = deps?.openBrowser ?? defaultOpenBrowser;
   const createServerFn = deps?.createServer ?? ((handler: any) => http.createServer(handler) as any);
+  const timeoutMs = deps?.browserCallbackTimeoutMs ?? BROWSER_CALLBACK_TIMEOUT_MS;
 
   // Step 1: OIDC Discovery
   const env = options.env ?? 'prod';
@@ -67,6 +109,16 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
 
   // Step 3: Start local HTTP server on random port
   return new Promise<void>((resolve, reject) => {
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      fn();
+    };
+
     const server = createServerFn((req: http.IncomingMessage, res: http.ServerResponse) => {
       const parsed = url.parse(req.url ?? '', true);
 
@@ -83,7 +135,7 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(ERROR_HTML(String(query.error_description || query.error)));
         server.close();
-        reject(new Error(`Authorization failed: ${query.error_description || query.error}`));
+        settle(() => reject(new Error(`Authorization failed: ${query.error_description || query.error}`)));
         return;
       }
 
@@ -92,7 +144,7 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(ERROR_HTML('State mismatch - possible CSRF attack'));
         server.close();
-        reject(new Error('State mismatch - possible CSRF attack'));
+        settle(() => reject(new Error('State mismatch - possible CSRF attack')));
         return;
       }
 
@@ -101,7 +153,7 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(ERROR_HTML('No authorization code received'));
         server.close();
-        reject(new Error('No authorization code received'));
+        settle(() => reject(new Error('No authorization code received')));
         return;
       }
 
@@ -185,13 +237,13 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
             });
           }
 
-          resolve();
+          settle(() => resolve());
         })
         .catch((err: Error) => {
           res.writeHead(200, { 'Content-Type': 'text/html' });
           res.end(ERROR_HTML(err.message));
           server.close();
-          reject(err);
+          settle(() => reject(err));
         });
     });
 
@@ -219,8 +271,20 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
       process.stderr.write(`Opening browser for authentication...\n`);
       process.stderr.write(`If the browser doesn't open, visit: ${authUrl}\n`);
 
-      openBrowser(authUrl).catch(() => {
-        // Browser open failed, URL already printed above
+      // Timeout: no callback → browser flow isn't working, signal fallback
+      timeoutHandle = setTimeout(() => {
+        server.close();
+        settle(() => reject(new BrowserFlowUnavailableError(
+          `no callback received within ${Math.round(timeoutMs / 1000)}s`
+        )));
+      }, timeoutMs);
+
+      // If opening the browser fails at the OS level, signal fallback immediately
+      openBrowser(authUrl).catch((err: Error) => {
+        server.close();
+        settle(() => reject(new BrowserFlowUnavailableError(
+          `failed to launch browser: ${err.message}`
+        )));
       });
     });
   });
