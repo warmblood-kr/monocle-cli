@@ -41,156 +41,7 @@ const ERROR_HTML = (msg: string) => `<!DOCTYPE html>
 h1{color:#ef4444;margin-bottom:0.5rem}p{color:#6b7280}</style></head>
 <body><div class="card"><h1>✗ Authentication Failed</h1><p>${msg}</p></div></body></html>`;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-export async function pollForToken(
-  tokenEndpoint: string,
-  deviceCode: string,
-  clientId: string,
-  interval: number,
-  expiresIn: number,
-): Promise<{access_token: string; refresh_token: string; id_token: string; expires_in: number}> {
-  const deadline = Date.now() + expiresIn * 1000;
-
-  while (Date.now() < deadline) {
-    await sleep(interval * 1000);
-
-    const body = new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-      device_code: deviceCode,
-      client_id: clientId,
-    });
-
-    const response = await globalThis.fetch(tokenEndpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body.toString(),
-    });
-
-    if (response.ok) {
-      return await response.json() as any;
-    }
-
-    const error = await response.json() as any;
-
-    switch (error.error) {
-      case 'authorization_pending':
-        process.stderr.write('.');
-        continue;
-      case 'slow_down':
-        interval += 5;
-        continue;
-      case 'expired_token':
-        throw new Error('인증 시간이 만료되었습니다.');
-      case 'access_denied':
-        throw new Error('인증이 거부되었습니다.');
-      default:
-        throw new Error(error.error_description || error.error);
-    }
-  }
-
-  throw new Error('인증 시간이 만료되었습니다.');
-}
-
-async function deviceCodeLogin(options: {tenantDomain?: string; env?: string}, deps?: LoginDeps): Promise<void> {
-  const credentials = new Credentials();
-
-  // Resolve Stark domain + discover OIDC
-  const env = options.env ?? 'prod';
-  const starkDomain = options.tenantDomain
-    ? resolveStarkDomain(options.tenantDomain)
-    : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
-  process.stderr.write(`Discovering OIDC configuration for ${starkDomain}...\n`);
-  const oidc = await discoverOIDC(starkDomain);
-
-  if (!oidc.device_authorization_endpoint) {
-    throw new Error('이 OIDC 프로바이더는 Device Authorization Grant를 지원하지 않습니다.');
-  }
-
-  // Request device code
-  const body = new URLSearchParams({
-    client_id: CLIENT_ID,
-    scope: SCOPES,
-  });
-
-  const deviceResponse = await globalThis.fetch(oidc.device_authorization_endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
-
-  if (!deviceResponse.ok) {
-    throw new Error(`Device authorization request failed (HTTP ${deviceResponse.status})`);
-  }
-
-  const deviceData = await deviceResponse.json() as any;
-  const { device_code, user_code, verification_uri, expires_in, interval } = deviceData;
-
-  process.stderr.write(`\n아래 URL을 브라우저에서 열고 코드를 입력하세요:\n`);
-  process.stderr.write(`  URL:  ${verification_uri}\n`);
-  process.stderr.write(`  코드: ${user_code}\n\n`);
-  process.stderr.write(`인증 대기 중`);
-
-  // Poll for token
-  const tokenData = await pollForToken(
-    oidc.token_endpoint,
-    device_code,
-    CLIENT_ID,
-    interval ?? 5,
-    expires_in ?? 600,
-  );
-
-  process.stderr.write('\n');
-
-  // Decode ID token
-  let email = 'unknown';
-  let tenantDomain = options.tenantDomain ?? '';
-  let tenantName = tenantDomain;
-  if (tokenData.id_token) {
-    try {
-      const payload = decodeIdTokenPayload(tokenData.id_token);
-      email = payload.email ?? 'unknown';
-      tenantDomain = payload.tenant_domain ?? tenantDomain;
-      tenantName = payload.tenant_name ?? tenantDomain;
-    } catch {
-      // Use defaults
-    }
-  }
-
-  // Save credentials
-  const now = new Date();
-  const accessTokenExpiresAt = new Date(now.getTime() + (tokenData.expires_in ?? 3600) * 1000);
-  const refreshTokenExpiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
-
-  const creds: CredentialsData = {
-    tenant_domain: tenantDomain,
-    tenant_name: tenantName,
-    email,
-    access_token: tokenData.access_token,
-    refresh_token: tokenData.refresh_token ?? '',
-    id_token: tokenData.id_token ?? '',
-    access_token_expires_at: accessTokenExpiresAt.toISOString(),
-    refresh_token_expires_at: refreshTokenExpiresAt.toISOString(),
-    router_url: oidc.router_url,
-  };
-
-  credentials.write(creds);
-
-  process.stderr.write(`Logged in as ${email} (${tenantName})\n`);
-
-  // Auto-setup Claude Code
-  if (!deps?.skipSetup) {
-    process.stderr.write('\nConfiguring Claude Code...\n');
-    setupCommand().catch(() => {
-      process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
-    });
-  }
-}
-
 export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Promise<void> {
-  // Headless detection
   const isHeadless = options.deviceCode || !!process.env.SSH_CLIENT || !!process.env.SSH_TTY || !!process.env.SSH_CONNECTION;
   if (isHeadless) {
     return deviceCodeLogin(options, deps);
@@ -392,4 +243,175 @@ async function defaultOpenBrowser(url: string): Promise<void> {
       else resolve();
     });
   });
+}
+
+export interface DeviceAuthResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete?: string;
+  expires_in: number;
+  interval?: number;
+}
+
+export interface TokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  id_token?: string;
+  expires_in?: number;
+  token_type?: string;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function pollForToken(
+  tokenEndpoint: string,
+  deviceCode: string,
+  interval: number,
+  expiresIn: number,
+  clientId: string,
+  fetchFn: (url: string, init?: any) => Promise<{ ok: boolean; status: number; json: () => Promise<any> }>,
+): Promise<TokenResponse> {
+  const deadline = Date.now() + expiresIn * 1000;
+  let currentInterval = interval;
+
+  while (Date.now() < deadline) {
+    await sleep(currentInterval * 1000);
+
+    const body = new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      device_code: deviceCode,
+      client_id: clientId,
+    });
+
+    const response = await fetchFn(tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+
+    if (response.ok) {
+      return await response.json() as TokenResponse;
+    }
+
+    const errorData = await response.json().catch(() => ({ error: 'unknown' }));
+    const error = errorData.error;
+
+    if (error === 'authorization_pending') {
+      continue;
+    } else if (error === 'slow_down') {
+      currentInterval += 5;
+      continue;
+    } else if (error === 'expired_token') {
+      throw new Error('Device code expired. Please run login again.');
+    } else if (error === 'access_denied') {
+      throw new Error('Authorization request was denied by the user.');
+    } else {
+      throw new Error(`Token polling failed: ${error} - ${errorData.error_description ?? ''}`);
+    }
+  }
+
+  throw new Error('Device code expired. Please run login again.');
+}
+
+async function deviceCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise<void> {
+  const credentials = deps?.credentials ?? new Credentials();
+  const fetchFn = deps?.fetch ?? globalThis.fetch;
+
+  // Step 1: OIDC Discovery
+  const env = options.env ?? 'prod';
+  const starkDomain = options.tenantDomain
+    ? resolveStarkDomain(options.tenantDomain)
+    : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
+  process.stderr.write(`Discovering OIDC configuration for ${starkDomain}...\n`);
+  const oidc = await discoverOIDC(starkDomain, { fetch: fetchFn } as OIDCDeps);
+
+  if (!oidc.device_authorization_endpoint) {
+    throw new Error(
+      'This OIDC provider does not support the Device Authorization Grant. ' +
+      'Remove --device-code flag or use a browser-capable environment.'
+    );
+  }
+
+  // Step 2: Request device code
+  const deviceBody = new URLSearchParams({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+  });
+
+  const deviceResponse = await fetchFn(oidc.device_authorization_endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: deviceBody.toString(),
+  });
+
+  if (!deviceResponse.ok) {
+    throw new Error(`Device authorization request failed (HTTP ${deviceResponse.status})`);
+  }
+
+  const deviceData: DeviceAuthResponse = await deviceResponse.json();
+
+  // Step 3: Display verification instructions
+  process.stderr.write('\n');
+  process.stderr.write('To authenticate, visit the following URL in a browser:\n\n');
+  process.stderr.write(`  ${deviceData.verification_uri}\n\n`);
+  process.stderr.write(`Enter the code: ${deviceData.user_code}\n\n`);
+  if (deviceData.verification_uri_complete) {
+    process.stderr.write(`Or open this URL directly:\n  ${deviceData.verification_uri_complete}\n\n`);
+  }
+  process.stderr.write('Waiting for authorization...\n');
+
+  // Step 4: Poll for token
+  const tokenData = await pollForToken(
+    oidc.token_endpoint,
+    deviceData.device_code,
+    deviceData.interval ?? 5,
+    deviceData.expires_in,
+    CLIENT_ID,
+    fetchFn,
+  );
+
+  // Step 5: Decode ID token and save credentials
+  let email = 'unknown';
+  let tenantDomain = options.tenantDomain ?? '';
+  let tenantName = tenantDomain;
+  if (tokenData.id_token) {
+    try {
+      const payload = decodeIdTokenPayload(tokenData.id_token);
+      email = payload.email ?? 'unknown';
+      tenantDomain = payload.tenant_domain ?? tenantDomain;
+      tenantName = payload.tenant_name ?? tenantDomain;
+    } catch {
+      // Use defaults
+    }
+  }
+
+  const now = new Date();
+  const accessTokenExpiresAt = new Date(now.getTime() + (tokenData.expires_in ?? 3600) * 1000);
+  const refreshTokenExpiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+
+  const creds: CredentialsData = {
+    tenant_domain: tenantDomain,
+    tenant_name: tenantName,
+    email,
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token ?? '',
+    id_token: tokenData.id_token ?? '',
+    access_token_expires_at: accessTokenExpiresAt.toISOString(),
+    refresh_token_expires_at: refreshTokenExpiresAt.toISOString(),
+    router_url: oidc.router_url,
+  };
+
+  credentials.write(creds);
+  process.stderr.write(`\nLogged in as ${email} (${tenantName})\n`);
+
+  // Auto-setup Claude Code
+  if (!deps?.skipSetup) {
+    process.stderr.write('\nConfiguring Claude Code...\n');
+    setupCommand().catch(() => {
+      process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
+    });
+  }
 }
