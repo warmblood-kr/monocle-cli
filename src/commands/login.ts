@@ -296,7 +296,20 @@ export async function pollForToken(
       return await response.json() as TokenResponse;
     }
 
-    const errorData = await response.json().catch(() => ({ error: 'unknown' }));
+    // Clone so we can fall back to text() for diagnostic if json() fails
+    // (real Response body can only be read once — see whatwg/fetch)
+    const cloned = (response as any).clone?.() ?? response;
+    let rawBody = '';
+    let errorData: { error?: string; error_description?: string } = {};
+    try {
+      errorData = await response.json();
+    } catch {
+      try {
+        rawBody = await (cloned as any).text?.() ?? '';
+      } catch {
+        // Body unavailable
+      }
+    }
     const error = errorData.error;
 
     if (error === 'authorization_pending') {
@@ -308,8 +321,14 @@ export async function pollForToken(
       throw new Error('Device code expired. Please run login again.');
     } else if (error === 'access_denied') {
       throw new Error('Authorization request was denied by the user.');
-    } else {
+    } else if (error) {
       throw new Error(`Token polling failed: ${error} - ${errorData.error_description ?? ''}`);
+    } else {
+      const snippet = rawBody.slice(0, 200).replace(/\s+/g, ' ').trim();
+      throw new Error(
+        `Token polling failed: server returned HTTP ${response.status} with non-OAuth response. ` +
+        `Body: ${snippet || '(empty)'}`
+      );
     }
   }
 

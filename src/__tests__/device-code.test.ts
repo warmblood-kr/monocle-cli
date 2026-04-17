@@ -303,4 +303,26 @@ describe('pollForToken', () => {
       ),
     ).rejects.toThrow('Authorization request was denied');
   });
+
+  it('surfaces HTTP status and raw body when server returns non-OAuth error', async () => {
+    const htmlBody = '<!doctype html><html><head><title>Server Error (500)</title></head><body>oops</body></html>';
+    const mockFetch = async () => ({
+      ok: false,
+      status: 500,
+      json: async () => { throw new Error('not json'); },
+      text: async () => htmlBody,
+      clone: function() { return this; },
+    });
+
+    await expect(
+      pollForToken(
+        'https://test.stark.com/oauth/token',
+        'dev_code',
+        0.01,
+        600,
+        'monocle-cli',
+        mockFetch as any,
+      ),
+    ).rejects.toThrow(/HTTP 500.*non-OAuth.*Server Error/);
+  });
 });
