@@ -4,6 +4,7 @@ import { Credentials, CredentialsData } from '../credentials';
 import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain, STARK_DOMAINS, OIDCDeps } from '../oidc';
 import { decodeIdTokenPayload } from '../refresh';
 import { setupCommand } from './setup';
+import { c } from '../colors';
 
 const CLIENT_ID = 'monocle-cli';
 const SCOPES = 'openid profile email';
@@ -99,7 +100,7 @@ async function browserCodeLogin(options: LoginOptions, deps?: LoginDeps): Promis
   const starkDomain = options.tenantDomain
     ? resolveStarkDomain(options.tenantDomain)
     : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
-  process.stderr.write(`Discovering OIDC configuration for ${starkDomain}...\n`);
+  process.stderr.write(`${c.dim(`Discovering OIDC configuration for ${starkDomain}...`)}\n`);
   const oidc = await discoverOIDC(starkDomain, { fetch: fetchFn } as OIDCDeps);
 
   // Step 2: Generate PKCE + state
@@ -227,13 +228,13 @@ async function browserCodeLogin(options: LoginOptions, deps?: LoginDeps): Promis
           server.close();
 
           // Step 11: Terminal output
-          process.stderr.write(`Logged in as ${email} (${tenantName})\n`);
+          process.stderr.write(`${c.green('✓')} Logged in as ${c.bold(email)} ${c.dim(`(${tenantName})`)}\n`);
 
           // Step 12: Auto-setup Claude Code
           if (!deps?.skipSetup) {
-            process.stderr.write('\nConfiguring Claude Code...\n');
+            process.stderr.write(`\n${c.dim('Configuring Claude Code...')}\n`);
             setupCommand().catch(() => {
-              process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
+              process.stderr.write(`${c.yellow('⚠')} Auto-setup failed. Run ${c.bold('monocle setup')} manually.\n`);
             });
           }
 
@@ -408,7 +409,7 @@ async function deviceCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise
   const starkDomain = options.tenantDomain
     ? resolveStarkDomain(options.tenantDomain)
     : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
-  process.stderr.write(`Discovering OIDC configuration for ${starkDomain}...\n`);
+  process.stderr.write(`${c.dim(`Discovering OIDC configuration for ${starkDomain}...`)}\n`);
   const oidc = await discoverOIDC(starkDomain, { fetch: fetchFn } as OIDCDeps);
 
   if (!oidc.device_authorization_endpoint) {
@@ -438,13 +439,13 @@ async function deviceCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise
 
   // Step 3: Display verification instructions
   process.stderr.write('\n');
-  process.stderr.write('To authenticate, visit the following URL in a browser:\n\n');
-  process.stderr.write(`  ${deviceData.verification_uri}\n\n`);
-  process.stderr.write(`Enter the code: ${deviceData.user_code}\n\n`);
+  process.stderr.write(`${c.bold('To authenticate, visit:')}\n\n`);
+  process.stderr.write(`  ${c.cyan(deviceData.verification_uri)}\n\n`);
+  process.stderr.write(`  ${c.dim('Code:')} ${c.bold(deviceData.user_code)}\n\n`);
   if (deviceData.verification_uri_complete) {
-    process.stderr.write(`Or open this URL directly:\n  ${deviceData.verification_uri_complete}\n\n`);
+    process.stderr.write(`${c.dim('Or open this URL directly:')}\n  ${c.cyan(deviceData.verification_uri_complete)}\n\n`);
   }
-  process.stderr.write('Waiting for authorization...\n');
+  process.stderr.write(`${c.dim('Waiting for authorization...')}\n`);
 
   // Step 4: Poll for token
   const tokenData = await pollForToken(
@@ -488,13 +489,13 @@ async function deviceCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise
   };
 
   credentials.write(creds);
-  process.stderr.write(`\nLogged in as ${email} (${tenantName})\n`);
+  process.stderr.write(`\n${c.green('✓')} Logged in as ${c.bold(email)} ${c.dim(`(${tenantName})`)}\n`);
 
   // Auto-setup Claude Code
   if (!deps?.skipSetup) {
-    process.stderr.write('\nConfiguring Claude Code...\n');
+    process.stderr.write(`\n${c.dim('Configuring Claude Code...')}\n`);
     setupCommand().catch(() => {
-      process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
+      process.stderr.write(`${c.yellow('⚠')} Auto-setup failed. Run ${c.bold('monocle setup')} manually.\n`);
     });
   }
 }
