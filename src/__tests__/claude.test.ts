@@ -62,7 +62,7 @@ describe('claudeCommand', () => {
       HOME: '/home/user',
     };
 
-    await claudeCommand([], { credentials: createMockCredentials(makeCredentials()), env, spawn: spawnFn });
+    await claudeCommand([], { credentials: createMockCredentials(makeCredentials()), env, spawn: spawnFn, skipSetup: true });
 
     const childEnv = spawnFn.mock.calls[0][2].env;
     expect(childEnv.ANTHROPIC_API_KEY).toBeUndefined();
@@ -78,6 +78,7 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials({ router_url: 'https://warmblood.krmonocle-ai.com' })),
       env: { PATH: '/usr/bin' },
       spawn: spawnFn,
+      skipSetup: true,
     });
 
     const childEnv = spawnFn.mock.calls[0][2].env;
@@ -91,6 +92,7 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials({ router_url: undefined })),
       env: {},
       spawn: spawnFn,
+      skipSetup: true,
     });
 
     const childEnv = spawnFn.mock.calls[0][2].env;
@@ -104,6 +106,7 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials()),
       env: {},
       spawn: spawnFn,
+      skipSetup: true,
     });
 
     expect(spawnFn).toHaveBeenCalledWith(
@@ -120,6 +123,7 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials()),
       env: {},
       spawn: spawnFn,
+      skipSetup: true,
     });
 
     expect(spawnFn.mock.calls[0][2].stdio).toBe('inherit');
@@ -132,6 +136,7 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials()),
       env: {},
       spawn: spawnFn,
+      skipSetup: true,
     });
 
     const error = new Error('spawn claude ENOENT') as NodeJS.ErrnoException;

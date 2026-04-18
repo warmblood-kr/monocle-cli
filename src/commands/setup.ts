@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { Credentials } from '../credentials';
+import { c } from '../colors';
 
 export interface SetupDeps {
   credentials?: Credentials;
@@ -67,14 +68,17 @@ export async function setupCommand(deps?: SetupDeps): Promise<void> {
   writeFileSyncFn(settingsPath, JSON.stringify(settings, null, 2));
 
   // Step 6: Success message
-  process.stderr.write('Claude Code configured to use Monocle authentication.\n');
-  process.stderr.write(`  apiKeyHelper: monocle token\n`);
-  process.stderr.write(`  ANTHROPIC_BASE_URL: ${routerUrl}\n`);
+  process.stderr.write(`${c.green('✓')} Claude Code configured to use Monocle authentication\n`);
+  process.stderr.write(`  ${c.dim('apiKeyHelper:')}       monocle token\n`);
+  process.stderr.write(`  ${c.dim('ANTHROPIC_BASE_URL:')} ${routerUrl}\n`);
 
   // Step 7: Warn about conflicting env vars
   const conflicting = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'].filter(k => env[k]);
   if (conflicting.length > 0) {
-    process.stderr.write(`\n⚠ Warning: ${conflicting.join(', ')} environment variable is set.\n`);
-    process.stderr.write('  Use `monocle claude` to launch Claude Code — it clears conflicting env vars automatically.\n');
+    process.stderr.write(`\n${c.yellow('⚠')} ${c.yellow(conflicting.join(', '))} environment variable is set.\n`);
+    process.stderr.write(`  Use ${c.bold('monocle claude')} to launch Claude Code — it clears conflicting env vars automatically.\n`);
   }
+
+  // Step 8: Tip — how to disconnect (red-family: signals undo/remove without alarm)
+  process.stderr.write(`\n${c.red(c.dim('To disconnect Claude Code from Monocle, run:'))} ${c.red(c.bold('monocle unset'))}\n`);
 }

@@ -9,6 +9,7 @@ export interface ClaudeDeps {
   credentials?: Credentials;
   env?: Record<string, string | undefined>;
   spawn?: typeof child_process.spawn;
+  skipSetup?: boolean;
 }
 
 export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<void> {
@@ -24,17 +25,19 @@ export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<
   }
 
   // Ensure Claude Code is configured (auto-setup if needed)
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
-  let needsSetup = true;
-  try {
-    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-    needsSetup = settings.apiKeyHelper !== 'monocle token';
-  } catch {
-    // File doesn't exist or invalid JSON
-  }
-  if (needsSetup) {
-    process.stderr.write('Claude Code not configured for Monocle. Running setup...\n');
-    await setupCommand();
+  if (!deps?.skipSetup) {
+    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+    let needsSetup = true;
+    try {
+      const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      needsSetup = settings.apiKeyHelper !== 'monocle token';
+    } catch {
+      // File doesn't exist or invalid JSON
+    }
+    if (needsSetup) {
+      process.stderr.write('Claude Code not configured for Monocle. Running setup...\n');
+      await setupCommand();
+    }
   }
 
   // Build clean env — remove vars that override apiKeyHelper
