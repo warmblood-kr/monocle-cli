@@ -1,0 +1,16 @@
+# CODEOWNERS
+#
+# 이 파일에 나열된 경로는 PR에서 해당 owner의 리뷰가 필수입니다.
+# 공급망 공격 방어를 위해 배포 파이프라인과 의존성 파일을 보호합니다.
+# 참고: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# 배포 워크플로우 및 GitHub 설정 전반
+/.github/               @smartbosslee
+
+# npm 배포에 직접 영향을 주는 파일
+/package.json           @smartbosslee
+/package-lock.json      @smartbosslee
+/tsconfig.json          @smartbosslee
+
+# CLI entry point (버전 문자열 포함)
+/src/cli.ts             @smartbosslee
