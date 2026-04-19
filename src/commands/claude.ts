@@ -1,15 +1,10 @@
 import * as child_process from 'child_process';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { Credentials } from '../credentials';
-import { setupCommand } from './setup';
 
 export interface ClaudeDeps {
   credentials?: Credentials;
   env?: Record<string, string | undefined>;
   spawn?: typeof child_process.spawn;
-  skipSetup?: boolean;
 }
 
 export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<void> {
@@ -24,39 +19,31 @@ export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<
     return;
   }
 
-  // Ensure Claude Code is configured (auto-setup if needed)
-  if (!deps?.skipSetup) {
-    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
-    let needsSetup = true;
-    try {
-      const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-      needsSetup = settings.apiKeyHelper !== 'monocle token';
-    } catch {
-      // File doesn't exist or invalid JSON
-    }
-    if (needsSetup) {
-      process.stderr.write('Claude Code not configured for Monocle. Running setup...\n');
-      await setupCommand();
-    }
+  // Resolve router URL (base URL for the Chat Proxy)
+  let routerUrl: string;
+  if (creds.router_url) {
+    routerUrl = creds.router_url;
+  } else {
+    const isLocal = creds.tenant_domain.startsWith('localhost') || creds.tenant_domain.startsWith('127.0.0.1');
+    routerUrl = `${isLocal ? 'http' : 'https'}://${creds.tenant_domain}`;
   }
 
-  // Build clean env — remove vars that override apiKeyHelper
+  // Inline settings scoped to this child only — avoids mutating ~/.claude/settings.json.
+  // `apiKeyHelper` keeps tokens fresh across long sessions by re-invoking `monocle token`.
+  const inlineSettings = JSON.stringify({
+    apiKeyHelper: 'monocle token',
+  });
+
+  // Build child env — strip conflicting vars, inject base URL.
   const childEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(parentEnv)) {
     if (value !== undefined && key !== 'ANTHROPIC_API_KEY' && key !== 'ANTHROPIC_AUTH_TOKEN') {
       childEnv[key] = value;
     }
   }
+  childEnv.ANTHROPIC_BASE_URL = routerUrl;
 
-  // Set base URL to Chat Proxy
-  if (creds.router_url) {
-    childEnv.ANTHROPIC_BASE_URL = creds.router_url;
-  } else {
-    const isLocal = creds.tenant_domain.startsWith('localhost') || creds.tenant_domain.startsWith('127.0.0.1');
-    childEnv.ANTHROPIC_BASE_URL = `${isLocal ? 'http' : 'https'}://${creds.tenant_domain}`;
-  }
-
-  const child = spawnFn('claude', args, {
+  const child = spawnFn('claude', ['--settings', inlineSettings, ...args], {
     env: childEnv,
     stdio: 'inherit',
   });

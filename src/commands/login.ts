@@ -3,7 +3,6 @@ import * as url from 'url';
 import { Credentials, CredentialsData } from '../credentials';
 import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain, STARK_DOMAINS, OIDCDeps } from '../oidc';
 import { decodeIdTokenPayload } from '../refresh';
-import { setupCommand } from './setup';
 import { c } from '../colors';
 
 const CLIENT_ID = 'monocle-cli';
@@ -26,7 +25,6 @@ export interface LoginDeps {
     close: (cb?: () => void) => void;
     address: () => { port: number } | null;
   };
-  skipSetup?: boolean;
   browserCallbackTimeoutMs?: number;
 }
 
@@ -229,14 +227,8 @@ async function browserCodeLogin(options: LoginOptions, deps?: LoginDeps): Promis
 
           // Step 11: Terminal output
           process.stderr.write(`${c.green('✓')} Logged in as ${c.bold(email)} ${c.dim(`(${tenantName})`)}\n`);
-
-          // Step 12: Auto-setup Claude Code
-          if (!deps?.skipSetup) {
-            process.stderr.write(`\n${c.dim('Configuring Claude Code...')}\n`);
-            setupCommand().catch(() => {
-              process.stderr.write(`${c.yellow('⚠')} Auto-setup failed. Run ${c.bold('monocle setup')} manually.\n`);
-            });
-          }
+          process.stderr.write(`\n${c.dim('Launch Claude Code through Monocle with:')} ${c.bold('monocle claude')}\n`);
+          process.stderr.write(`${c.dim('(To route plain')} ${c.bold('claude')} ${c.dim('globally through Monocle, run')} ${c.bold('monocle setup')}${c.dim('.)')}\n`);
 
           settle(() => resolve());
         })
@@ -490,12 +482,6 @@ async function deviceCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise
 
   credentials.write(creds);
   process.stderr.write(`\n${c.green('✓')} Logged in as ${c.bold(email)} ${c.dim(`(${tenantName})`)}\n`);
-
-  // Auto-setup Claude Code
-  if (!deps?.skipSetup) {
-    process.stderr.write(`\n${c.dim('Configuring Claude Code...')}\n`);
-    setupCommand().catch(() => {
-      process.stderr.write(`${c.yellow('⚠')} Auto-setup failed. Run ${c.bold('monocle setup')} manually.\n`);
-    });
-  }
+  process.stderr.write(`\n${c.dim('Launch Claude Code through Monocle with:')} ${c.bold('monocle claude')}\n`);
+  process.stderr.write(`${c.dim('(To route plain')} ${c.bold('claude')} ${c.dim('globally through Monocle, run')} ${c.bold('monocle setup')}${c.dim('.)')}\n`);
 }
