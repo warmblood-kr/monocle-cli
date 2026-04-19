@@ -10,12 +10,14 @@ import { claudeCommand } from './commands/claude';
 import { chatCommand } from './commands/chat';
 import { modelListCommand } from './commands/model-list';
 
+const { version } = require('../package.json') as { version: string };
+
 const program = new Command();
 
 program
   .name('monocle')
   .description('CLI authentication tool for Claude Code with Stark OIDC integration')
-  .version('0.4.1');
+  .version(version);
 
 program
   .command('login')
