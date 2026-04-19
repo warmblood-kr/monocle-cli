@@ -26,10 +26,21 @@ monocle login
 ```
 
 브라우저가 열리면 평소 사용하시는 회사 계정으로 로그인해 주세요.
-로그인이 완료되면 Claude Code 설정도 자동으로 진행됩니다.
 
-끝이에요! 이제 `monocle claude`를 실행하시면 됩니다.
+**Step 3** — Monocle 경유로 Claude Code 실행
 
+```bash
+monocle claude
+```
+
+`monocle claude`는 Monocle 설정을 **이 실행에만** 적용한 상태로 Claude
+Code를 띄워요. 전역 Claude Code 설정은 전혀 건드리지 않아서, 다른 터미널이나
+IDE 연동의 `claude`는 그대로예요.
+
+> **Tip:** 다른 터미널이나 IDE 연동의 일반 `claude`도 Monocle을 거치게
+> 하고 싶다면 `monocle setup`을 한 번 실행하시면 돼요. 해제할 땐
+> `monocle unset`.
+>
 > **Tip:** 특정 테넌트를 지정하려면 `monocle login --tenant your-org.monocle-ai.com`으로 실행하세요.
 >
 > **Tip:** `ANTHROPIC_API_KEY` 같은 환경 변수가 설정되어 있어도 `monocle claude`가 자동으로 정리해 줘요.
@@ -48,9 +59,9 @@ monocle status
 
 | 명령어 | 설명 |
 |--------|------|
-| `monocle login [--tenant <domain>] [--env <env>] [--device-code]` | 로그인 — 기본은 브라우저, 헤드리스/SSH/CI에서는 device code 방식 (Claude Code 자동 설정 포함) |
-| `monocle setup` | Claude Code를 수동으로 설정 (보통은 login이 자동 처리) |
-| `monocle claude` | 환경 변수 충돌을 자동 정리하고 Claude Code 실행 |
+| `monocle login [--tenant <domain>] [--env <env>] [--device-code]` | 로그인 — 기본은 브라우저, 헤드리스/SSH/CI에서는 device code 방식 |
+| `monocle claude` | Monocle 설정을 **이 실행에만** 적용해서 Claude Code 실행 (전역 설정 변경 없음) |
+| `monocle setup` | 전역 라우팅 opt-in — 다른 터미널/IDE 연동의 일반 `claude`도 Monocle을 거치게 설정 |
 | `monocle status` | 로그인/설정 상태 확인 |
 | `monocle token` | 현재 액세스 토큰 출력 (Claude Code가 내부적으로 사용) |
 | `monocle unset` | Claude Code에서 Monocle 설정 제거 |
@@ -63,14 +74,14 @@ monocle status
 **토큰이 만료됐대요**
 → 토큰은 자동으로 갱신돼요. 마지막 로그인 후 30일이 지났다면 `monocle login`을 다시 실행해 주세요.
 
-**자동 설정이 실패했대요**
-→ `monocle setup`을 수동으로 실행해 주세요.
-
 **Claude Code가 Monocle을 무시해요**
 → 환경 변수에 `ANTHROPIC_API_KEY`가 설정되어 있으면 Monocle보다 우선 적용돼요. `monocle claude`로 실행하면 자동으로 해결됩니다.
 
+**일반 `claude`가 Monocle을 안 쓰네요**
+→ 의도된 동작이에요. `monocle claude`는 자기 실행에만 Monocle을 적용해요. 일반 `claude`도 Monocle로 향하게 하려면 `monocle setup`을 한 번 실행해 주세요.
+
 **처음부터 다시 하고 싶어요**
-→ `monocle unset` 후 `monocle setup`을 다시 실행하면 돼요.
+→ `monocle unset`으로 전역 라우팅을 제거하시고, 필요하면 `monocle setup`을 다시 실행하시면 돼요.
 
 ## 도움이 필요하신가요?
 

@@ -62,7 +62,7 @@ describe('claudeCommand', () => {
       HOME: '/home/user',
     };
 
-    await claudeCommand([], { credentials: createMockCredentials(makeCredentials()), env, spawn: spawnFn, skipSetup: true });
+    await claudeCommand([], { credentials: createMockCredentials(makeCredentials()), env, spawn: spawnFn });
 
     const childEnv = spawnFn.mock.calls[0][2].env;
     expect(childEnv.ANTHROPIC_API_KEY).toBeUndefined();
@@ -78,7 +78,6 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials({ router_url: 'https://warmblood.krmonocle-ai.com' })),
       env: { PATH: '/usr/bin' },
       spawn: spawnFn,
-      skipSetup: true,
     });
 
     const childEnv = spawnFn.mock.calls[0][2].env;
@@ -92,28 +91,26 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials({ router_url: undefined })),
       env: {},
       spawn: spawnFn,
-      skipSetup: true,
     });
 
     const childEnv = spawnFn.mock.calls[0][2].env;
     expect(childEnv.ANTHROPIC_BASE_URL).toBe('https://example.stark.com');
   });
 
-  it('should pass arguments through to claude', async () => {
+  it('should pass --settings with apiKeyHelper and forward user args', async () => {
     const { spawnFn } = makeMockSpawn();
 
     await claudeCommand(['--model', 'opus'], {
       credentials: createMockCredentials(makeCredentials()),
       env: {},
       spawn: spawnFn,
-      skipSetup: true,
     });
 
-    expect(spawnFn).toHaveBeenCalledWith(
-      'claude',
-      ['--model', 'opus'],
-      expect.any(Object)
-    );
+    const callArgs = spawnFn.mock.calls[0][1] as string[];
+    expect(callArgs[0]).toBe('--settings');
+    const parsed = JSON.parse(callArgs[1]);
+    expect(parsed.apiKeyHelper).toBe('monocle token');
+    expect(callArgs.slice(2)).toEqual(['--model', 'opus']);
   });
 
   it('should spawn claude with stdio inherit', async () => {
@@ -123,7 +120,6 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials()),
       env: {},
       spawn: spawnFn,
-      skipSetup: true,
     });
 
     expect(spawnFn.mock.calls[0][2].stdio).toBe('inherit');
@@ -136,7 +132,6 @@ describe('claudeCommand', () => {
       credentials: createMockCredentials(makeCredentials()),
       env: {},
       spawn: spawnFn,
-      skipSetup: true,
     });
 
     const error = new Error('spawn claude ENOENT') as NodeJS.ErrnoException;
