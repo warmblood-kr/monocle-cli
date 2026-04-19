@@ -72,6 +72,12 @@ monocle status
 **처음부터 다시 하고 싶어요**
 → `monocle unset` 후 `monocle setup`을 다시 실행하면 돼요.
 
+## 직접 만든 앱에서 Monocle 쓰기
+
+Python, Node.js, `curl` 같은 도구로 Monocle의 OpenAI 호환 API를 호출하고
+싶으신가요? **OpenAI SDK로 Monocle 사용하기** 가이드를 참고해 주세요
+— [한국어](./openai-sdk.ko.md) · [English](./openai-sdk.md).
+
 ## 도움이 필요하신가요?
 
 조직의 관리자에게 문의하시거나 이 저장소에 이슈를 등록해 주세요.

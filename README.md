@@ -74,6 +74,12 @@ All green (**Valid** and **Configured**) means you're good to go!
 **Want to start fresh?**
 → Run `monocle unset`, then `monocle setup`.
 
+## Using Monocle from your own app
+
+Want to call Monocle's OpenAI-compatible API from your own code (Python,
+Node.js, `curl`)? See **Using Monocle with the OpenAI SDK**
+— [English](./docs/openai-sdk.md) · [한국어](./docs/openai-sdk.ko.md).
+
 ## Help
 
 Contact your organization admin or open an issue in this repository.
