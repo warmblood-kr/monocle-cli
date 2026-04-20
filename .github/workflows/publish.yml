@@ -19,7 +19,36 @@ permissions:
   id-token: write
 
 jobs:
+  dry-run:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+      - name: Publish to npm (dry run)
+        run: npm publish --access public --provenance --dry-run
+
   publish:
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
     runs-on: ubuntu-latest
     environment: npm-production
     steps:
@@ -57,10 +86,5 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Publish to npm (dry run)
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true'
-        run: npm publish --access public --provenance --dry-run
-
       - name: Publish to npm
-        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
         run: npm publish --access public --provenance
