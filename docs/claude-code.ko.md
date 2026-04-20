@@ -6,7 +6,7 @@ Monocle CLI로 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)를 
 
 ## 시작하기 전에
 
-- `monocle login`이 먼저 완료되어 있어야 해요 ([메인 README](../README.md#설정-30초면-충분해요) 참고)
+- `monocle login`이 먼저 완료되어 있어야 해요 ([메인 README](../README.md#-설정) 참고)
 - **Claude Code** 설치 — [여기서 설치](https://docs.anthropic.com/en/docs/claude-code/getting-started)
 
 ## 이 실행에만 적용: `monocle claude`

@@ -6,7 +6,7 @@ Monocle CLI lets you run [Claude Code](https://docs.anthropic.com/en/docs/claude
 
 ## Prerequisites
 
-- `monocle login` has completed successfully (see the [main README](../README.md#setup-takes-about-30-seconds))
+- `monocle login` has completed successfully (see the [main README](../README.md#-setup))
 - **Claude Code** installed — [install here](https://docs.anthropic.com/en/docs/claude-code/getting-started)
 
 ## Invocation-scoped: `monocle claude`
