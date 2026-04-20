@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { c } from '../colors';
 
 export interface UnsetDeps {
   homedir?: () => string;
@@ -19,7 +20,7 @@ export async function unsetCommand(deps?: UnsetDeps): Promise<void> {
   const settingsPath = path.join(homedir(), '.claude', 'settings.json');
 
   if (!existsSyncFn(settingsPath)) {
-    process.stderr.write('Monocle configuration removed. Claude Code will use Anthropic directly.\n');
+    process.stderr.write(`${c.green('✓')} Monocle configuration removed. ${c.dim('Claude Code will use Anthropic directly.')}\n`);
     return;
   }
 
@@ -28,7 +29,7 @@ export async function unsetCommand(deps?: UnsetDeps): Promise<void> {
     const content = readFileSyncFn(settingsPath, 'utf-8');
     settings = JSON.parse(content);
   } catch {
-    process.stderr.write('Monocle configuration removed. Claude Code will use Anthropic directly.\n');
+    process.stderr.write(`${c.green('✓')} Monocle configuration removed. ${c.dim('Claude Code will use Anthropic directly.')}\n`);
     return;
   }
 
@@ -49,5 +50,5 @@ export async function unsetCommand(deps?: UnsetDeps): Promise<void> {
   writeFileSyncFn(settingsPath, JSON.stringify(settings, null, 2));
 
   // Step 5: Success message
-  process.stderr.write('Monocle configuration removed. Claude Code will use Anthropic directly.\n');
+  process.stderr.write(`${c.green('✓')} Monocle configuration removed. ${c.dim('Claude Code will use Anthropic directly.')}\n`);
 }

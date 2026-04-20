@@ -3,15 +3,17 @@ import * as url from 'url';
 import { Credentials, CredentialsData } from '../credentials';
 import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain, STARK_DOMAINS, OIDCDeps } from '../oidc';
 import { decodeIdTokenPayload } from '../refresh';
-import { setupCommand } from './setup';
+import { c } from '../colors';
 
 const CLIENT_ID = 'monocle-cli';
 const SCOPES = 'openid profile email';
 const REFRESH_TOKEN_TTL_DAYS = 30;
+const BROWSER_CALLBACK_TIMEOUT_MS = 90_000;
 
 export interface LoginOptions {
   tenantDomain?: string;
   env?: string;
+  deviceCode?: boolean;
 }
 
 export interface LoginDeps {
@@ -23,6 +25,7 @@ export interface LoginDeps {
     close: (cb?: () => void) => void;
     address: () => { port: number } | null;
   };
+  browserCallbackTimeoutMs?: number;
 }
 
 const SUCCESS_HTML = `<!DOCTYPE html>
@@ -39,18 +42,63 @@ const ERROR_HTML = (msg: string) => `<!DOCTYPE html>
 h1{color:#ef4444;margin-bottom:0.5rem}p{color:#6b7280}</style></head>
 <body><div class="card"><h1>✗ Authentication Failed</h1><p>${msg}</p></div></body></html>`;
 
+/**
+ * Internal sentinel indicating the browser flow is unavailable in this environment
+ * and the caller should fall back to device code. Not a real user-visible error.
+ */
+class BrowserFlowUnavailableError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'BrowserFlowUnavailableError';
+  }
+}
+
+/**
+ * Detect environments where a local browser almost certainly cannot be used:
+ * SSH, Emacs inner shell, CI, and Linux console without DISPLAY.
+ * When any of these fire, skip browser flow entirely and go to device code.
+ */
+function detectHeadless(options: LoginOptions): boolean {
+  if (options.deviceCode) return true;
+  if (process.env.SSH_CLIENT || process.env.SSH_TTY || process.env.SSH_CONNECTION) return true;
+  if (process.env.INSIDE_EMACS) return true;
+  if (process.env.CI) return true;
+  if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) return true;
+  return false;
+}
+
 export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Promise<void> {
+  if (detectHeadless(options)) {
+    return deviceCodeLogin(options, deps);
+  }
+
+  // Ambiguous environment: try browser flow, fall back to device code if:
+  //   - openBrowser exec fails (command not found, non-zero exit)
+  //   - callback not received within BROWSER_CALLBACK_TIMEOUT_MS
+  try {
+    return await browserCodeLogin(options, deps);
+  } catch (err) {
+    if (err instanceof BrowserFlowUnavailableError) {
+      process.stderr.write(`\nBrowser flow unavailable: ${err.message}\nFalling back to device code...\n\n`);
+      return deviceCodeLogin(options, deps);
+    }
+    throw err;
+  }
+}
+
+async function browserCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise<void> {
   const credentials = deps?.credentials ?? new Credentials();
   const fetchFn = deps?.fetch ?? globalThis.fetch;
   const openBrowser = deps?.openBrowser ?? defaultOpenBrowser;
   const createServerFn = deps?.createServer ?? ((handler: any) => http.createServer(handler) as any);
+  const timeoutMs = deps?.browserCallbackTimeoutMs ?? BROWSER_CALLBACK_TIMEOUT_MS;
 
   // Step 1: OIDC Discovery
   const env = options.env ?? 'prod';
   const starkDomain = options.tenantDomain
     ? resolveStarkDomain(options.tenantDomain)
     : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
-  process.stderr.write(`Discovering OIDC configuration for ${starkDomain}...\n`);
+  process.stderr.write(`${c.dim(`Discovering OIDC configuration for ${starkDomain}...`)}\n`);
   const oidc = await discoverOIDC(starkDomain, { fetch: fetchFn } as OIDCDeps);
 
   // Step 2: Generate PKCE + state
@@ -60,6 +108,16 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
 
   // Step 3: Start local HTTP server on random port
   return new Promise<void>((resolve, reject) => {
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      fn();
+    };
+
     const server = createServerFn((req: http.IncomingMessage, res: http.ServerResponse) => {
       const parsed = url.parse(req.url ?? '', true);
 
@@ -76,7 +134,7 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(ERROR_HTML(String(query.error_description || query.error)));
         server.close();
-        reject(new Error(`Authorization failed: ${query.error_description || query.error}`));
+        settle(() => reject(new Error(`Authorization failed: ${query.error_description || query.error}`)));
         return;
       }
 
@@ -85,7 +143,7 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(ERROR_HTML('State mismatch - possible CSRF attack'));
         server.close();
-        reject(new Error('State mismatch - possible CSRF attack'));
+        settle(() => reject(new Error('State mismatch - possible CSRF attack')));
         return;
       }
 
@@ -94,7 +152,7 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(ERROR_HTML('No authorization code received'));
         server.close();
-        reject(new Error('No authorization code received'));
+        settle(() => reject(new Error('No authorization code received')));
         return;
       }
 
@@ -168,21 +226,17 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
           server.close();
 
           // Step 11: Terminal output
-          process.stderr.write(`Logged in as ${email} (${tenantName})\n`);
+          process.stderr.write(`${c.green('✓')} Logged in as ${c.bold(email)} ${c.dim(`(${tenantName})`)}\n`);
+          process.stderr.write(`\n${c.dim('Launch Claude Code through Monocle with:')} ${c.bold('monocle claude')}\n`);
+          process.stderr.write(`${c.dim('(To route plain')} ${c.bold('claude')} ${c.dim('globally through Monocle, run')} ${c.bold('monocle setup')}${c.dim('.)')}\n`);
 
-          // Step 12: Auto-setup Claude Code
-          process.stderr.write('\nConfiguring Claude Code...\n');
-          setupCommand().catch(() => {
-            process.stderr.write('Warning: Auto-setup failed. Run `monocle setup` manually.\n');
-          });
-
-          resolve();
+          settle(() => resolve());
         })
         .catch((err: Error) => {
           res.writeHead(200, { 'Content-Type': 'text/html' });
           res.end(ERROR_HTML(err.message));
           server.close();
-          reject(err);
+          settle(() => reject(err));
         });
     });
 
@@ -210,8 +264,20 @@ export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Pro
       process.stderr.write(`Opening browser for authentication...\n`);
       process.stderr.write(`If the browser doesn't open, visit: ${authUrl}\n`);
 
-      openBrowser(authUrl).catch(() => {
-        // Browser open failed, URL already printed above
+      // Timeout: no callback → browser flow isn't working, signal fallback
+      timeoutHandle = setTimeout(() => {
+        server.close();
+        settle(() => reject(new BrowserFlowUnavailableError(
+          `no callback received within ${Math.round(timeoutMs / 1000)}s`
+        )));
+      }, timeoutMs);
+
+      // If opening the browser fails at the OS level, signal fallback immediately
+      openBrowser(authUrl).catch((err: Error) => {
+        server.close();
+        settle(() => reject(new BrowserFlowUnavailableError(
+          `failed to launch browser: ${err.message}`
+        )));
       });
     });
   });
@@ -234,4 +300,188 @@ async function defaultOpenBrowser(url: string): Promise<void> {
       else resolve();
     });
   });
+}
+
+export interface DeviceAuthResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete?: string;
+  expires_in: number;
+  interval?: number;
+}
+
+export interface TokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  id_token?: string;
+  expires_in?: number;
+  token_type?: string;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function pollForToken(
+  tokenEndpoint: string,
+  deviceCode: string,
+  interval: number,
+  expiresIn: number,
+  clientId: string,
+  fetchFn: (url: string, init?: any) => Promise<{ ok: boolean; status: number; json: () => Promise<any> }>,
+): Promise<TokenResponse> {
+  const deadline = Date.now() + expiresIn * 1000;
+  let currentInterval = interval;
+
+  while (Date.now() < deadline) {
+    await sleep(currentInterval * 1000);
+
+    const body = new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      device_code: deviceCode,
+      client_id: clientId,
+    });
+
+    const response = await fetchFn(tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+
+    if (response.ok) {
+      return await response.json() as TokenResponse;
+    }
+
+    // Clone so we can fall back to text() for diagnostic if json() fails
+    // (real Response body can only be read once — see whatwg/fetch)
+    const cloned = (response as any).clone?.() ?? response;
+    let rawBody = '';
+    let errorData: { error?: string; error_description?: string } = {};
+    try {
+      errorData = await response.json();
+    } catch {
+      try {
+        rawBody = await (cloned as any).text?.() ?? '';
+      } catch {
+        // Body unavailable
+      }
+    }
+    const error = errorData.error;
+
+    if (error === 'authorization_pending') {
+      continue;
+    } else if (error === 'slow_down') {
+      currentInterval += 5;
+      continue;
+    } else if (error === 'expired_token') {
+      throw new Error('Device code expired. Please run login again.');
+    } else if (error === 'access_denied') {
+      throw new Error('Authorization request was denied by the user.');
+    } else if (error) {
+      throw new Error(`Token polling failed: ${error} - ${errorData.error_description ?? ''}`);
+    } else {
+      const snippet = rawBody.slice(0, 200).replace(/\s+/g, ' ').trim();
+      throw new Error(
+        `Token polling failed: server returned HTTP ${response.status} with non-OAuth response. ` +
+        `Body: ${snippet || '(empty)'}`
+      );
+    }
+  }
+
+  throw new Error('Device code expired. Please run login again.');
+}
+
+async function deviceCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise<void> {
+  const credentials = deps?.credentials ?? new Credentials();
+  const fetchFn = deps?.fetch ?? globalThis.fetch;
+
+  // Step 1: OIDC Discovery
+  const env = options.env ?? 'prod';
+  const starkDomain = options.tenantDomain
+    ? resolveStarkDomain(options.tenantDomain)
+    : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
+  process.stderr.write(`${c.dim(`Discovering OIDC configuration for ${starkDomain}...`)}\n`);
+  const oidc = await discoverOIDC(starkDomain, { fetch: fetchFn } as OIDCDeps);
+
+  if (!oidc.device_authorization_endpoint) {
+    throw new Error(
+      'This OIDC provider does not support the Device Authorization Grant. ' +
+      'Remove --device-code flag or use a browser-capable environment.'
+    );
+  }
+
+  // Step 2: Request device code
+  const deviceBody = new URLSearchParams({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+  });
+
+  const deviceResponse = await fetchFn(oidc.device_authorization_endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: deviceBody.toString(),
+  });
+
+  if (!deviceResponse.ok) {
+    throw new Error(`Device authorization request failed (HTTP ${deviceResponse.status})`);
+  }
+
+  const deviceData: DeviceAuthResponse = await deviceResponse.json();
+
+  // Step 3: Display verification instructions
+  process.stderr.write('\n');
+  process.stderr.write(`${c.bold('To authenticate, visit:')}\n\n`);
+  process.stderr.write(`  ${c.cyan(deviceData.verification_uri)}\n\n`);
+  process.stderr.write(`  ${c.dim('Code:')} ${c.bold(deviceData.user_code)}\n\n`);
+  if (deviceData.verification_uri_complete) {
+    process.stderr.write(`${c.dim('Or open this URL directly:')}\n  ${c.cyan(deviceData.verification_uri_complete)}\n\n`);
+  }
+  process.stderr.write(`${c.dim('Waiting for authorization...')}\n`);
+
+  // Step 4: Poll for token
+  const tokenData = await pollForToken(
+    oidc.token_endpoint,
+    deviceData.device_code,
+    deviceData.interval ?? 5,
+    deviceData.expires_in,
+    CLIENT_ID,
+    fetchFn,
+  );
+
+  // Step 5: Decode ID token and save credentials
+  let email = 'unknown';
+  let tenantDomain = options.tenantDomain ?? '';
+  let tenantName = tenantDomain;
+  if (tokenData.id_token) {
+    try {
+      const payload = decodeIdTokenPayload(tokenData.id_token);
+      email = payload.email ?? 'unknown';
+      tenantDomain = payload.tenant_domain ?? tenantDomain;
+      tenantName = payload.tenant_name ?? tenantDomain;
+    } catch {
+      // Use defaults
+    }
+  }
+
+  const now = new Date();
+  const accessTokenExpiresAt = new Date(now.getTime() + (tokenData.expires_in ?? 3600) * 1000);
+  const refreshTokenExpiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+
+  const creds: CredentialsData = {
+    tenant_domain: tenantDomain,
+    tenant_name: tenantName,
+    email,
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token ?? '',
+    id_token: tokenData.id_token ?? '',
+    access_token_expires_at: accessTokenExpiresAt.toISOString(),
+    refresh_token_expires_at: refreshTokenExpiresAt.toISOString(),
+    router_url: oidc.router_url,
+  };
+
+  credentials.write(creds);
+  process.stderr.write(`\n${c.green('✓')} Logged in as ${c.bold(email)} ${c.dim(`(${tenantName})`)}\n`);
+  process.stderr.write(`\n${c.dim('Launch Claude Code through Monocle with:')} ${c.bold('monocle claude')}\n`);
+  process.stderr.write(`${c.dim('(To route plain')} ${c.bold('claude')} ${c.dim('globally through Monocle, run')} ${c.bold('monocle setup')}${c.dim('.)')}\n`);
 }

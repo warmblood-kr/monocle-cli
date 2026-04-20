@@ -97,7 +97,7 @@ describe('claudeCommand', () => {
     expect(childEnv.ANTHROPIC_BASE_URL).toBe('https://example.stark.com');
   });
 
-  it('should pass arguments through to claude', async () => {
+  it('should pass --settings with apiKeyHelper and forward user args', async () => {
     const { spawnFn } = makeMockSpawn();
 
     await claudeCommand(['--model', 'opus'], {
@@ -106,11 +106,11 @@ describe('claudeCommand', () => {
       spawn: spawnFn,
     });
 
-    expect(spawnFn).toHaveBeenCalledWith(
-      'claude',
-      ['--model', 'opus'],
-      expect.any(Object)
-    );
+    const callArgs = spawnFn.mock.calls[0][1] as string[];
+    expect(callArgs[0]).toBe('--settings');
+    const parsed = JSON.parse(callArgs[1]);
+    expect(parsed.apiKeyHelper).toBe('monocle token');
+    expect(callArgs.slice(2)).toEqual(['--model', 'opus']);
   });
 
   it('should spawn claude with stdio inherit', async () => {

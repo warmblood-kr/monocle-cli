@@ -22,7 +22,7 @@ describe('unsetCommand', () => {
     expect(settings.otherSetting).toBe('keep');
     expect(settings.env.ANTHROPIC_BASE_URL).toBeUndefined();
     expect(settings.env.OTHER_VAR).toBe('keep');
-    expect(stderrSpy).toHaveBeenCalledWith('Monocle configuration removed. Claude Code will use Anthropic directly.\n');
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('Monocle configuration removed'));
     stderrSpy.mockRestore();
   });
 
@@ -55,7 +55,7 @@ describe('unsetCommand', () => {
       writeFileSync: () => {},
     });
 
-    expect(stderrSpy).toHaveBeenCalledWith('Monocle configuration removed. Claude Code will use Anthropic directly.\n');
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('Monocle configuration removed'));
     stderrSpy.mockRestore();
   });
 
@@ -69,7 +69,7 @@ describe('unsetCommand', () => {
       writeFileSync: () => {},
     });
 
-    expect(stderrSpy).toHaveBeenCalledWith('Monocle configuration removed. Claude Code will use Anthropic directly.\n');
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('Monocle configuration removed'));
     stderrSpy.mockRestore();
   });
 });

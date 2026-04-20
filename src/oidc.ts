@@ -4,6 +4,7 @@ export interface OIDCConfig {
   issuer: string;
   authorization_endpoint: string;
   token_endpoint: string;
+  device_authorization_endpoint?: string;
   router_url?: string;
 }
 
@@ -111,6 +112,7 @@ export async function discoverOIDC(
     issuer: config.issuer,
     authorization_endpoint: config.authorization_endpoint,
     token_endpoint: config.token_endpoint,
+    device_authorization_endpoint: config.device_authorization_endpoint,
     router_url: config.router_url,
   };
 }

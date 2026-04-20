@@ -7,22 +7,27 @@ import { setupCommand } from './commands/setup';
 import { unsetCommand } from './commands/unset';
 import { statusCommand } from './commands/status';
 import { claudeCommand } from './commands/claude';
+import { chatCommand } from './commands/chat';
+import { modelListCommand } from './commands/model-list';
+
+const { version } = require('../package.json') as { version: string };
 
 const program = new Command();
 
 program
   .name('monocle')
   .description('CLI authentication tool for Claude Code with Stark OIDC integration')
-  .version('0.4.1');
+  .version(version);
 
 program
   .command('login')
   .description('Authenticate with Stark OIDC provider')
   .option('--tenant <domain>', 'Stark tenant domain (e.g., example.monocle-ai.com)')
   .option('--env <environment>', 'Environment: prod, stg, local (default: prod)', 'prod')
+  .option('--device-code', 'Use Device Authorization Grant (for headless/SSH environments)')
   .action(async (options) => {
     try {
-      await loginCommand({ tenantDomain: options.tenant, env: options.env });
+      await loginCommand({ tenantDomain: options.tenant, env: options.env, deviceCode: options.deviceCode });
     } catch (err: any) {
       process.stderr.write(`Error: ${err.message}\n`);
       process.exit(1);
@@ -85,6 +90,38 @@ program
   .action(async (_options, cmd) => {
     try {
       await claudeCommand(cmd.args);
+    } catch (err: any) {
+      process.stderr.write(`Error: ${err.message}\n`);
+      process.exit(1);
+    }
+  });
+
+const model = program
+  .command('model')
+  .description('Manage and interact with LLM models');
+
+model
+  .command('list')
+  .description('List available models from the Monocle router')
+  .action(async () => {
+    try {
+      await modelListCommand();
+    } catch (err: any) {
+      process.stderr.write(`Error: ${err.message}\n`);
+      process.exit(1);
+    }
+  });
+
+model
+  .command('chat')
+  .description('Chat with LLM via Monocle router (interactive REPL or pipe from stdin)')
+  .option('--model <model>', 'Model ID to use', 'claude-sonnet-4-6')
+  .option('--system-prompt <text>', 'System prompt text')
+  .option('--system-prompt-file <path>', 'Load system prompt from file')
+  .option('--max-tokens <n>', 'Maximum output tokens', '4096')
+  .action(async (options) => {
+    try {
+      await chatCommand(options);
     } catch (err: any) {
       process.stderr.write(`Error: ${err.message}\n`);
       process.exit(1);
