@@ -2,94 +2,137 @@
 
 [한국어](./docs/README.ko.md)
 
-Monocle CLI connects [Claude Code](https://docs.anthropic.com/en/docs/claude-code) to [Monocle AI](https://monocle-ai.com).
-
-Log in once and you're done — no API key management, no manual config file editing.
+> Terminal utility to control and use [Monocle AI](https://monocle-ai.com). Log in once, then chat with models, integrate Claude Code, or call Monocle's OpenAI-compatible API from your own apps — all with the same authenticated session.
 
 ## Prerequisites
 
 - **Node.js** 18+ — check with `node -v`
-- **Claude Code** — [install here](https://docs.anthropic.com/en/docs/claude-code/getting-started) if you haven't already
 
-## Setup (takes about 30 seconds)
-
-**Step 1** — Install Monocle CLI
+## 🚀 Setup
 
 ```bash
 npm install -g @warmblood/monocle-cli
-```
-
-**Step 2** — Log in
-
-```bash
 monocle login
 ```
 
-A browser window will open — sign in with your organization account.
+A browser opens — sign in with your organization account.
 
-**Step 3** — Launch Claude Code through Monocle
-
-```bash
-monocle claude
-```
-
-`monocle claude` runs Claude Code with Monocle credentials scoped **only to
-that invocation**. Your global Claude Code configuration is not touched —
-plain `claude` in other terminals or IDE integrations stays unaffected.
-
-> **Tip:** Want plain `claude` (including IDE integrations and other
-> terminals) to also route through Monocle globally? Run `monocle setup`
-> once. Undo with `monocle unset`.
->
-> **Tip:** To specify a tenant explicitly, use `monocle login --tenant your-org.monocle-ai.com`
->
-> **Tip:** If you have `ANTHROPIC_API_KEY` set in your environment, `monocle claude` will automatically clear it to avoid conflicts.
->
-> **Headless / SSH / CI?** `monocle login` auto-detects these environments and switches to
-> the device code flow — a URL and short code you enter on another machine. If auto-detection
-> misses your environment, force it with `monocle login --device-code`.
-
-## Check Status
+## ✅ Check status
 
 ```bash
 monocle status
 ```
 
-All green (**Valid** and **Configured**) means you're good to go!
+Shows your tenant, user, access/refresh token validity, and whether Claude Code is globally configured to route through Monocle. Read-only — it does not refresh tokens.
 
-## Commands
+## 📖 Commands
 
 | Command | Description |
 |---------|-------------|
-| `monocle login [--tenant <domain>] [--env <env>] [--device-code]` | Sign in — browser by default, device code on headless/SSH/CI |
-| `monocle claude` | Launch Claude Code with Monocle scoped **only to this invocation** (no global changes) |
-| `monocle setup` | Opt in to global routing — makes plain `claude` (other terminals, IDE integrations) also use Monocle |
-| `monocle status` | Show login and configuration status |
-| `monocle token` | Print current access token (used internally by Claude Code) |
-| `monocle unset` | Remove Monocle configuration from Claude Code |
+| `monocle login [--tenant <domain>] [--device-code]` | Sign in |
+| `monocle status` | Show login, token, and Claude Code configuration status |
+| `monocle token` | Print current access token (auto-refreshed when near expiry) |
+| `monocle model list` | List available models |
+| `monocle model chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | Chat with a model (REPL or stdin) |
+| `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
+| `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
+| `monocle unset` | Remove the global `claude` routing |
 
-## Troubleshooting
+## 💬 Chat with models
+
+List what your tenant has:
+
+```console
+$ monocle model list
+MODEL ID              NAME                  OWNER       CONTEXT
+────────────────────  ────────────────────  ──────────  ─────────
+claude-sonnet-4-6     Claude Sonnet 4.6     anthropic   200k
+claude-opus-4-7       Claude Opus 4.7       anthropic   200k
+gpt-4o                GPT-4o                openai      128k
+
+3 model(s) available.
+```
+
+Interactive REPL:
+
+```console
+$ monocle model chat --model claude-sonnet-4-6
+Monocle Chat (model: claude-sonnet-4-6)
+Router: https://api.monocle-ai.com
+Type your message. Press Ctrl+D to exit.
+---
+> Hello
+Hello! How can I help you today?
+
+> /quit
+Bye.
+```
+
+One-shot via stdin:
+
+```console
+$ echo "Summarize OAuth 2.0 in one sentence." | monocle model chat
+Using model: claude-sonnet-4-6
+Router: https://api.monocle-ai.com
+OAuth 2.0 is an authorization framework that lets applications access a user's resources on another service without sharing the user's password.
+```
+
+With a system prompt from a file:
+
+```bash
+monocle model chat --system-prompt-file ./persona.md --model claude-opus-4-7
+```
+
+## 🤖 Claude Code integration
+
+```bash
+monocle claude
+```
+
+Other terminals and IDE integrations running plain `claude` are unaffected. To globally route plain `claude` through Monocle, run `monocle setup` once; undo with `monocle unset`.
+
+> [!NOTE]
+> See **[Claude Code integration details](./docs/claude-code.md)** for `ANTHROPIC_API_KEY` handling, global setup, and troubleshooting.
+
+## 🔌 Using Monocle from your own app (OpenAI-compatible SDK)
+
+Monocle exposes an OpenAI-compatible Chat Completions API, so any OpenAI client works with two env vars. Export them once:
+
+```bash
+export MONOCLE_API_KEY="$(monocle token)"
+export MONOCLE_BASE_URL="$(jq -r .router_url ~/.monocle/credentials.json)/v1"
+```
+
+Then from Python:
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["MONOCLE_API_KEY"],
+    base_url=os.environ["MONOCLE_BASE_URL"],
+)
+
+resp = client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(resp.choices[0].message.content)
+```
+
+> [!NOTE]
+> See **[Using Monocle with the OpenAI SDK](./docs/openai-sdk.md)** for Node.js, `curl`, streaming, token-refresh patterns for long-running apps, and troubleshooting.
+
+## 🆘 Troubleshooting
 
 **"Not logged in" error**
 → Run `monocle login` first.
 
 **Token expired**
-→ Tokens are refreshed automatically. If it's been more than 30 days since your last login, run `monocle login` again.
+→ `monocle token` auto-refreshes when near expiry. If it's been more than 30 days since your last login, run `monocle login` again.
 
-**Claude Code is ignoring Monocle**
-→ An `ANTHROPIC_API_KEY` environment variable takes precedence over Monocle. Use `monocle claude` to launch Claude Code — it clears the conflict automatically.
-
-**Plain `claude` doesn't use Monocle**
-→ By design. `monocle claude` is isolated to its own invocation. Run `monocle setup` if you want plain `claude` to also route through Monocle.
-
-**Want to start fresh?**
-→ Run `monocle unset` to remove global routing, then re-run `monocle setup` if needed.
-
-## Using Monocle from your own app
-
-Want to call Monocle's OpenAI-compatible API from your own code (Python,
-Node.js, `curl`)? See **Using Monocle with the OpenAI SDK**
-— [English](./docs/openai-sdk.md) · [한국어](./docs/openai-sdk.ko.md).
+For Claude Code and OpenAI SDK specific issues, see the linked guides above.
 
 ## Help
 
