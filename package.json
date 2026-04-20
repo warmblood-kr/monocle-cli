@@ -17,6 +17,14 @@
   },
   "keywords": ["claude", "monocle", "oidc", "pkce", "cli"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/warmblood-kr/monocle-cli.git"
+  },
+  "homepage": "https://github.com/warmblood-kr/monocle-cli#readme",
+  "bugs": {
+    "url": "https://github.com/warmblood-kr/monocle-cli/issues"
+  },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "typescript": "^5.3.0",
