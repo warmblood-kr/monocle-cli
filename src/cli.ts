@@ -9,6 +9,7 @@ import { statusCommand } from './commands/status';
 import { claudeCommand } from './commands/claude';
 import { chatCommand } from './commands/chat';
 import { modelListCommand } from './commands/model-list';
+import { audioTranscribeCommand } from './commands/audio-transcribe';
 
 const { version } = require('../package.json') as { version: string };
 
@@ -118,6 +119,30 @@ program
   .action(async (options) => {
     try {
       await chatCommand(options);
+    } catch (err: any) {
+      process.stderr.write(`Error: ${err.message}\n`);
+      process.exit(1);
+    }
+  });
+
+const audio = program
+  .command('audio')
+  .description('Call audio (STT / TTS) endpoints directly for debugging');
+
+audio
+  .command('transcribe [file]')
+  .description('Transcribe audio via /v1/audio/transcriptions (file path or stdin)')
+  .option('--model <id>', 'Model ID (e.g., gpt-4o-mini-transcribe, whisper-1)')
+  .option('--language <code>', 'ISO-639-1 language hint')
+  .option('--prompt <text>', 'Optional prompt to guide the transcription')
+  .option('--response-format <fmt>', 'json | text | srt | verbose_json | vtt')
+  .option('--temperature <n>', 'Sampling temperature (0-1)')
+  .option('--filename <name>', 'Filename to send (required when piping stdin without extension)')
+  .option('--content-type <mime>', 'Override MIME type (e.g., audio/wav)')
+  .option('--azure-fast', 'Use Azure Fast endpoint /v1/speechtotext/transcriptions:transcribe instead')
+  .action(async (file: string | undefined, options) => {
+    try {
+      await audioTranscribeCommand(file, options);
     } catch (err: any) {
       process.stderr.write(`Error: ${err.message}\n`);
       process.exit(1);
