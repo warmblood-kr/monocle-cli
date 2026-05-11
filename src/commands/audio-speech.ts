@@ -1,7 +1,14 @@
-import * as fs from 'fs';
 import { Credentials } from '../credentials';
 import { RefreshDeps } from '../refresh';
 import { getAccessToken } from '../auth';
+import {
+  BinaryOutputDeps,
+  ensureNotWritingBinaryToTTY,
+  readStdinText,
+  writeApiErrorAndExit,
+  writeBinaryOutput,
+} from '../audio-io';
+import { ENDPOINTS } from '../endpoints';
 
 export interface AudioSpeechOptions {
   model?: string;
@@ -12,33 +19,17 @@ export interface AudioSpeechOptions {
   output?: string;
 }
 
-export interface AudioSpeechDeps {
+export interface AudioSpeechDeps extends BinaryOutputDeps {
   credentials?: Credentials;
   refreshDeps?: RefreshDeps;
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
   stdin?: NodeJS.ReadableStream;
-  stdout?: NodeJS.WritableStream;
-  stderr?: NodeJS.WritableStream;
-  writeFile?: (path: string, data: Buffer) => void;
-  stdoutIsTTY?: boolean;
 }
 
 const DEFAULT_MODEL = 'gpt-4o-mini-tts';
 const DEFAULT_VOICE = 'alloy';
 const DEFAULT_FORMAT = 'mp3';
-
-function readStdin(stdin: NodeJS.ReadableStream): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    stdin.setEncoding?.('utf-8');
-    stdin.on('data', (chunk: string | Buffer) => {
-      data += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
-    });
-    stdin.on('end', () => resolve(data));
-    stdin.on('error', reject);
-  });
-}
 
 export async function audioSpeechCommand(
   textArg: string | undefined,
@@ -46,27 +37,17 @@ export async function audioSpeechCommand(
   deps?: AudioSpeechDeps,
 ): Promise<void> {
   const fetchFn = deps?.fetch ?? globalThis.fetch;
-  const stdout = deps?.stdout ?? process.stdout;
   const stderr = deps?.stderr ?? process.stderr;
-  const writeFile = deps?.writeFile ?? ((p: string, d: Buffer) => fs.writeFileSync(p, d));
-  const stdoutIsTTY =
-    deps?.stdoutIsTTY ?? Boolean((process.stdout as any).isTTY);
 
   let text = textArg ?? '';
   if (!text || text === '-') {
-    text = (await readStdin(deps?.stdin ?? process.stdin)).trim();
+    text = (await readStdinText(deps?.stdin ?? process.stdin)).trim();
   }
   if (!text) {
-    throw new Error(
-      'No input text. Pass text as an argument or pipe it via stdin.',
-    );
+    throw new Error('No input text. Pass text as an argument or pipe it via stdin.');
   }
 
-  if (!options.output && stdoutIsTTY) {
-    throw new Error(
-      'Refusing to write binary audio to a terminal. Use `-o <path>` or pipe stdout to a file.',
-    );
-  }
+  ensureNotWritingBinaryToTTY(options.output, deps ?? {});
 
   const { token, routerUrl } = await getAccessToken(deps);
 
@@ -79,28 +60,17 @@ export async function audioSpeechCommand(
   if (options.speed) payload.speed = parseFloat(options.speed);
   if (options.instructions) payload.instructions = options.instructions;
 
-  const response = (await fetchFn(`${routerUrl}/v1/audio/speech`, {
+  const response = await fetchFn(`${routerUrl}${ENDPOINTS.audioSpeech}`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
-  })) as Response;
+  });
 
-  if (!response.ok) {
-    const body = await response.text();
-    stderr.write(`API error ${response.status} ${response.statusText}\n`);
-    stderr.write(body);
-    if (!body.endsWith('\n')) stderr.write('\n');
-    process.exit(1);
-  }
+  if (!response.ok) await writeApiErrorAndExit(response as any, stderr);
 
   const buffer = Buffer.from(await response.arrayBuffer());
-  if (options.output) {
-    writeFile(options.output, buffer);
-    stderr.write(`Wrote ${buffer.length} bytes to ${options.output}\n`);
-  } else {
-    stdout.write(buffer);
-  }
+  writeBinaryOutput(buffer, options.output, deps ?? {});
 }

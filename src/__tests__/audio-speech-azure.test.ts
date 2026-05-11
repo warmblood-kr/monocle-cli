@@ -1,51 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Readable } from 'stream';
 import { audioSpeechAzureCommand } from '../commands/audio-speech-azure';
-import { Credentials, CredentialsData } from '../credentials';
-
-function makeCreds(): CredentialsData {
-  return {
-    tenant_domain: 'tenant.example.com',
-    tenant_name: 'Tenant',
-    email: 'user@tenant.com',
-    access_token: 'access-abc',
-    refresh_token: 'refresh-abc',
-    id_token: 'id-abc',
-    access_token_expires_at: '2099-01-01T00:00:00.000Z',
-    refresh_token_expires_at: '2099-01-31T00:00:00.000Z',
-    router_url: 'https://router.example.com',
-  };
-}
-
-function makeCredentialsStub() {
-  let stored: CredentialsData | null = makeCreds();
-  return {
-    read: () => stored,
-    write: (d: CredentialsData) => {
-      stored = d;
-    },
-    delete: () => {
-      stored = null;
-    },
-    getCredentialsPath: () => '/fake/.monocle/credentials.json',
-    getCredentialsDir: () => '/fake/.monocle',
-    getFileMode: () => 0o600,
-  } as unknown as Credentials;
-}
-
-function makeStream() {
-  const chunks: Buffer[] = [];
-  return {
-    out: {
-      write: (chunk: any) => {
-        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-        return true;
-      },
-    } as any,
-    text: () => Buffer.concat(chunks).toString('utf-8'),
-    bytes: () => Buffer.concat(chunks),
-  };
-}
+import { makeCredentialsStub } from './helpers/credentials-stub';
+import { makeStream } from './helpers/streams';
 
 describe('audioSpeechAzureCommand', () => {
   it('posts SSML body with application/ssml+xml and X-Microsoft-OutputFormat', async () => {

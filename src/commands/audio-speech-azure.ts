@@ -1,38 +1,29 @@
-import * as fs from 'fs';
 import { Credentials } from '../credentials';
 import { RefreshDeps } from '../refresh';
 import { getAccessToken } from '../auth';
+import {
+  BinaryOutputDeps,
+  ensureNotWritingBinaryToTTY,
+  readStdinText,
+  writeApiErrorAndExit,
+  writeBinaryOutput,
+} from '../audio-io';
+import { ENDPOINTS } from '../endpoints';
 
 export interface AudioSpeechAzureOptions {
   format?: string;
   output?: string;
 }
 
-export interface AudioSpeechAzureDeps {
+export interface AudioSpeechAzureDeps extends BinaryOutputDeps {
   credentials?: Credentials;
   refreshDeps?: RefreshDeps;
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
   stdin?: NodeJS.ReadableStream;
-  stdout?: NodeJS.WritableStream;
-  stderr?: NodeJS.WritableStream;
-  writeFile?: (path: string, data: Buffer) => void;
-  stdoutIsTTY?: boolean;
 }
 
 const DEFAULT_FORMAT = 'audio-24khz-48kbitrate-mono-mp3';
-
-function readStdin(stdin: NodeJS.ReadableStream): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    stdin.setEncoding?.('utf-8');
-    stdin.on('data', (chunk: string | Buffer) => {
-      data += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
-    });
-    stdin.on('end', () => resolve(data));
-    stdin.on('error', reject);
-  });
-}
 
 export async function audioSpeechAzureCommand(
   bodyArg: string | undefined,
@@ -40,21 +31,15 @@ export async function audioSpeechAzureCommand(
   deps?: AudioSpeechAzureDeps,
 ): Promise<void> {
   const fetchFn = deps?.fetch ?? globalThis.fetch;
-  const stdout = deps?.stdout ?? process.stdout;
   const stderr = deps?.stderr ?? process.stderr;
-  const writeFile = deps?.writeFile ?? ((p: string, d: Buffer) => fs.writeFileSync(p, d));
-  const stdoutIsTTY =
-    deps?.stdoutIsTTY ?? Boolean((process.stdout as any).isTTY);
 
   let body = bodyArg ?? '';
   if (!body || body === '-') {
-    body = await readStdin(deps?.stdin ?? process.stdin);
+    body = await readStdinText(deps?.stdin ?? process.stdin);
   }
   body = body.trim();
   if (!body) {
-    throw new Error(
-      'No input. Pass an SSML document as an argument or pipe it via stdin.',
-    );
+    throw new Error('No input. Pass an SSML document as an argument or pipe it via stdin.');
   }
 
   if (!body.startsWith('<speak')) {
@@ -65,40 +50,22 @@ export async function audioSpeechAzureCommand(
     );
   }
 
-  if (!options.output && stdoutIsTTY) {
-    throw new Error(
-      'Refusing to write binary audio to a terminal. Use `-o <path>` or pipe stdout to a file.',
-    );
-  }
+  ensureNotWritingBinaryToTTY(options.output, deps ?? {});
 
   const { token, routerUrl } = await getAccessToken(deps);
 
-  const response = (await fetchFn(
-    `${routerUrl}/v1/azure/texttospeech/cognitiveservices/v1`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/ssml+xml',
-        'X-Microsoft-OutputFormat': options.format ?? DEFAULT_FORMAT,
-      },
-      body,
+  const response = await fetchFn(`${routerUrl}${ENDPOINTS.azureTextToSpeech}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/ssml+xml',
+      'X-Microsoft-OutputFormat': options.format ?? DEFAULT_FORMAT,
     },
-  )) as Response;
+    body,
+  });
 
-  if (!response.ok) {
-    const errBody = await response.text();
-    stderr.write(`API error ${response.status} ${response.statusText}\n`);
-    stderr.write(errBody);
-    if (!errBody.endsWith('\n')) stderr.write('\n');
-    process.exit(1);
-  }
+  if (!response.ok) await writeApiErrorAndExit(response as any, stderr);
 
   const buffer = Buffer.from(await response.arrayBuffer());
-  if (options.output) {
-    writeFile(options.output, buffer);
-    stderr.write(`Wrote ${buffer.length} bytes to ${options.output}\n`);
-  } else {
-    stdout.write(buffer);
-  }
+  writeBinaryOutput(buffer, options.output, deps ?? {});
 }

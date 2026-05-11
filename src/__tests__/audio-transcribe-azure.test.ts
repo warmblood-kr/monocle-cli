@@ -1,45 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Readable } from 'stream';
 import { audioTranscribeAzureCommand } from '../commands/audio-transcribe-azure';
-import { Credentials, CredentialsData } from '../credentials';
-
-function makeCreds(): CredentialsData {
-  return {
-    tenant_domain: 'tenant.example.com',
-    tenant_name: 'Tenant',
-    email: 'user@tenant.com',
-    access_token: 'access-abc',
-    refresh_token: 'refresh-abc',
-    id_token: 'id-abc',
-    access_token_expires_at: '2099-01-01T00:00:00.000Z',
-    refresh_token_expires_at: '2099-01-31T00:00:00.000Z',
-    router_url: 'https://router.example.com',
-  };
-}
-
-function makeCredentialsStub() {
-  let stored: CredentialsData | null = makeCreds();
-  return {
-    read: () => stored,
-    write: (d: CredentialsData) => {
-      stored = d;
-    },
-    delete: () => {
-      stored = null;
-    },
-    getCredentialsPath: () => '/fake/.monocle/credentials.json',
-    getCredentialsDir: () => '/fake/.monocle',
-    getFileMode: () => 0o600,
-  } as unknown as Credentials;
-}
-
-function makeStream() {
-  let buf = '';
-  return {
-    out: { write: (chunk: string) => (buf += chunk, true) },
-    flushed: () => buf,
-  };
-}
+import { makeCredentialsStub } from './helpers/credentials-stub';
+import { makeStream } from './helpers/streams';
 
 describe('audioTranscribeAzureCommand', () => {
   it('POSTs to the Azure Fast endpoint with audio + definition parts', async () => {
@@ -92,7 +55,7 @@ describe('audioTranscribeAzureCommand', () => {
       profanityFilterMode: 'Masked',
       channels: [0, 1],
     });
-    expect(stdout.flushed()).toContain('combinedRecognizedPhrases');
+    expect(stdout.text()).toContain('combinedRecognizedPhrases');
   });
 
   it('refuses to send when no Azure-specific options are given', async () => {
@@ -187,8 +150,8 @@ describe('audioTranscribeAzureCommand', () => {
         },
       ),
     ).rejects.toThrow('exit:1');
-    expect(stderr.flushed()).toContain('415');
-    expect(stderr.flushed()).toContain('unsupported audio');
+    expect(stderr.text()).toContain('415');
+    expect(stderr.text()).toContain('unsupported audio');
     exitSpy.mockRestore();
   });
 });

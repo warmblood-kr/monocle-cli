@@ -3,6 +3,7 @@ import * as readline from 'readline';
 import { Credentials } from '../credentials';
 import { RefreshDeps } from '../refresh';
 import { getAccessToken } from '../auth';
+import { ENDPOINTS } from '../endpoints';
 
 export interface ChatOptions {
   model?: string;
@@ -41,7 +42,7 @@ async function callChat(
   }
   messages.push({ role: 'user', content: userMessage });
 
-  const response = await fetchFn(`${routerUrl}/v1/chat/completions`, {
+  const response = await fetchFn(`${routerUrl}${ENDPOINTS.chatCompletions}`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -104,7 +105,7 @@ export async function chatCommand(
 
   // Validate model ID against available models
   try {
-    const modelsResp = await fetchFn(`${routerUrl}/v1/models`, {
+    const modelsResp = await fetchFn(`${routerUrl}${ENDPOINTS.models}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (modelsResp.ok) {

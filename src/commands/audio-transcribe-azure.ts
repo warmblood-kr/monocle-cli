@@ -1,8 +1,12 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import { Credentials } from '../credentials';
 import { RefreshDeps } from '../refresh';
 import { getAccessToken } from '../auth';
+import {
+  AudioInputDeps,
+  resolveAudioInput,
+  writeApiErrorAndExit,
+} from '../audio-io';
+import { ENDPOINTS } from '../endpoints';
 
 export interface AudioTranscribeAzureOptions {
   locales?: string[];
@@ -14,80 +18,18 @@ export interface AudioTranscribeAzureOptions {
   contentType?: string;
 }
 
-export interface AudioTranscribeAzureDeps {
+export interface AudioTranscribeAzureDeps extends AudioInputDeps {
   credentials?: Credentials;
   refreshDeps?: RefreshDeps;
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
-  stdin?: NodeJS.ReadableStream;
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
-  readFile?: (path: string) => Buffer;
-  fileExists?: (path: string) => boolean;
-}
-
-const MIME_BY_EXT: Record<string, string> = {
-  '.wav': 'audio/wav',
-  '.mp3': 'audio/mpeg',
-  '.mp4': 'audio/mp4',
-  '.m4a': 'audio/mp4',
-  '.aac': 'audio/aac',
-  '.flac': 'audio/flac',
-  '.ogg': 'audio/ogg',
-  '.oga': 'audio/ogg',
-  '.opus': 'audio/ogg',
-  '.webm': 'audio/webm',
-};
-
-function readStdin(stdin: NodeJS.ReadableStream): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    stdin.on('data', (chunk: Buffer | string) => {
-      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
-    });
-    stdin.on('end', () => resolve(Buffer.concat(chunks)));
-    stdin.on('error', reject);
-  });
-}
-
-function resolveAudio(
-  fileArg: string | undefined,
-  opts: AudioTranscribeAzureOptions,
-  deps: AudioTranscribeAzureDeps,
-): Promise<{ data: Buffer; filename: string; contentType: string }> {
-  const readFile = deps.readFile ?? ((p: string) => fs.readFileSync(p));
-  const fileExists = deps.fileExists ?? ((p: string) => fs.existsSync(p));
-  const stdin = deps.stdin ?? process.stdin;
-
-  if (fileArg && fileArg !== '-') {
-    if (!fileExists(fileArg)) {
-      throw new Error(`Audio file not found: ${fileArg}`);
-    }
-    const ext = path.extname(fileArg).toLowerCase();
-    const filename = opts.filename ?? path.basename(fileArg);
-    const contentType =
-      opts.contentType ?? MIME_BY_EXT[ext] ?? 'application/octet-stream';
-    return Promise.resolve({ data: readFile(fileArg), filename, contentType });
-  }
-
-  return readStdin(stdin).then((data) => {
-    if (data.length === 0) {
-      throw new Error(
-        'No audio input. Pass a file path or pipe audio to stdin (`--filename` recommended when piping).',
-      );
-    }
-    const filename = opts.filename ?? 'audio.wav';
-    const ext = path.extname(filename).toLowerCase();
-    const contentType =
-      opts.contentType ?? MIME_BY_EXT[ext] ?? 'application/octet-stream';
-    return { data, filename, contentType };
-  });
 }
 
 function buildDefinition(opts: AudioTranscribeAzureOptions): string | null {
   if (opts.definition) {
-    // User-provided raw JSON wins — we still validate it parses to fail fast.
-    JSON.parse(opts.definition);
+    JSON.parse(opts.definition); // fail fast on bad JSON
     return opts.definition;
   }
   const def: Record<string, unknown> = {};
@@ -126,7 +68,7 @@ export async function audioTranscribeAzureCommand(
 
   const { token, routerUrl } = await getAccessToken(deps);
 
-  const { data, filename, contentType } = await resolveAudio(
+  const { data, filename, contentType } = await resolveAudioInput(
     fileArg,
     options,
     deps ?? {},
@@ -134,28 +76,19 @@ export async function audioTranscribeAzureCommand(
 
   const form = new FormData();
   form.append('audio', new Blob([data], { type: contentType }), filename);
-  // The server expects `definition` as a plain string form field (Starlette
-  // parses Blob parts as UploadFile and fails the `isinstance(..., str)`
-  // check), so we append it directly without wrapping in a Blob.
+  // Server-side handler expects `definition` as a plain string form field;
+  // Starlette parses Blob parts as UploadFile and rejects them as not-a-string.
   form.append('definition', definition);
 
-  const response = await fetchFn(
-    `${routerUrl}/v1/speechtotext/transcriptions:transcribe`,
-    {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: form,
-    },
-  );
+  const response = await fetchFn(`${routerUrl}${ENDPOINTS.azureSpeechToText}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+
+  if (!response.ok) await writeApiErrorAndExit(response as any, stderr);
 
   const body = await response.text();
-  if (!response.ok) {
-    stderr.write(`API error ${response.status} ${response.statusText}\n`);
-    stderr.write(body);
-    if (!body.endsWith('\n')) stderr.write('\n');
-    process.exit(1);
-  }
-
   stdout.write(body);
   if (!body.endsWith('\n')) stdout.write('\n');
 }

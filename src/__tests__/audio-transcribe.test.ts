@@ -1,54 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Readable } from 'stream';
 import { audioTranscribeCommand } from '../commands/audio-transcribe';
-import { Credentials, CredentialsData } from '../credentials';
-
-function makeCreds(overrides: Partial<CredentialsData> = {}): CredentialsData {
-  return {
-    tenant_domain: 'tenant.example.com',
-    tenant_name: 'Tenant',
-    email: 'user@tenant.com',
-    access_token: 'access-abc',
-    refresh_token: 'refresh-abc',
-    id_token: 'id-abc',
-    access_token_expires_at: '2099-01-01T00:00:00.000Z',
-    refresh_token_expires_at: '2099-01-31T00:00:00.000Z',
-    router_url: 'https://router.example.com',
-    ...overrides,
-  };
-}
-
-function makeCredentialsStub(initial: CredentialsData | null = makeCreds()) {
-  let stored = initial;
-  return {
-    read: () => stored,
-    write: (d: CredentialsData) => {
-      stored = d;
-    },
-    delete: () => {
-      stored = null;
-    },
-    getCredentialsPath: () => '/fake/.monocle/credentials.json',
-    getCredentialsDir: () => '/fake/.monocle',
-    getFileMode: () => 0o600,
-  } as unknown as Credentials;
-}
-
-function makeStream(): {
-  out: { write: (chunk: string) => boolean };
-  flushed: () => string;
-} {
-  let buf = '';
-  return {
-    out: {
-      write: (chunk: string) => {
-        buf += chunk;
-        return true;
-      },
-    },
-    flushed: () => buf,
-  };
-}
+import { makeCredentialsStub } from './helpers/credentials-stub';
+import { makeStream } from './helpers/streams';
 
 describe('audioTranscribeCommand', () => {
   it('POSTs multipart to /v1/audio/transcriptions and writes body to stdout', async () => {
@@ -90,8 +44,8 @@ describe('audioTranscribeCommand', () => {
     expect(capturedBody.get('language')).toBe('en');
     const filePart = capturedBody.get('file') as File | Blob;
     expect((filePart as any).type).toBe('audio/wav');
-    expect(stdout.flushed()).toContain('hello world');
-    expect(stderr.flushed()).toBe('');
+    expect(stdout.text()).toContain('hello world');
+    expect(stderr.text()).toBe('');
   });
 
   it('reads from a file path argument with inferred content-type', async () => {
@@ -117,7 +71,7 @@ describe('audioTranscribeCommand', () => {
 
     const filePart = capturedBody.get('file') as Blob;
     expect((filePart as any).type).toBe('audio/mpeg');
-    expect((filePart as any).name ?? 'sample.mp3').toContain('sample.mp3');
+    expect((filePart as any).name).toBe('sample.mp3');
   });
 
   it('prints status + body to stderr and exits non-zero on API error', async () => {
@@ -152,9 +106,9 @@ describe('audioTranscribeCommand', () => {
       ),
     ).rejects.toThrow('exit:1');
 
-    expect(stderr.flushed()).toContain('400');
-    expect(stderr.flushed()).toContain('invalid model');
-    expect(stdout.flushed()).toBe('');
+    expect(stderr.text()).toContain('400');
+    expect(stderr.text()).toContain('invalid model');
+    expect(stdout.text()).toBe('');
     exitSpy.mockRestore();
   });
 

@@ -23,110 +23,84 @@ program
   .description('CLI authentication tool for Claude Code with Stark OIDC integration')
   .version(version);
 
+function runAction<A extends any[]>(
+  fn: (...args: A) => Promise<unknown>,
+): (...args: A) => Promise<void> {
+  return async (...args: A) => {
+    try {
+      await fn(...args);
+    } catch (err: any) {
+      process.stderr.write(`Error: ${err.message}\n`);
+      process.exit(1);
+    }
+  };
+}
+
+function addChatOptions(cmd: Command): Command {
+  return cmd
+    .option('--model <model>', 'Model ID to use', 'claude-sonnet-4-6')
+    .option('--system-prompt <text>', 'System prompt text')
+    .option('--system-prompt-file <path>', 'Load system prompt from file')
+    .option('--max-tokens <n>', 'Maximum output tokens', '4096');
+}
+
 program
   .command('login')
   .description('Authenticate with Stark OIDC provider')
   .option('--tenant <domain>', 'Stark tenant domain (e.g., example.monocle-ai.com)')
   .option('--env <environment>', 'Environment: prod, stg, local (default: prod)', 'prod')
   .option('--device-code', 'Use Device Authorization Grant (for headless/SSH environments)')
-  .action(async (options) => {
-    try {
-      await loginCommand({ tenantDomain: options.tenant, env: options.env, deviceCode: options.deviceCode });
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(
+    runAction(async (options) => {
+      await loginCommand({
+        tenantDomain: options.tenant,
+        env: options.env,
+        deviceCode: options.deviceCode,
+      });
+    }),
+  );
 
 program
   .command('token')
   .description('Output access token to stdout (for apiKeyHelper)')
-  .action(async () => {
-    try {
-      await tokenCommand();
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(runAction(tokenCommand));
 
 program
   .command('setup')
   .description('Configure Claude Code to use Monocle authentication')
-  .action(async () => {
-    try {
-      await setupCommand();
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(runAction(setupCommand));
 
 program
   .command('unset')
   .description('Remove Monocle configuration from Claude Code')
-  .action(async () => {
-    try {
-      await unsetCommand();
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(runAction(unsetCommand));
 
 program
   .command('status')
   .description('Show authentication and configuration status')
-  .action(async () => {
-    try {
-      await statusCommand();
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(runAction(statusCommand));
 
 program
   .command('claude')
   .description('Launch Claude Code with Monocle authentication (clears conflicting env vars)')
   .allowUnknownOption(true)
   .helpOption(false)
-  .action(async (_options, cmd) => {
-    try {
+  .action(
+    runAction(async (_options, cmd) => {
       await claudeCommand(cmd.args);
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+    }),
+  );
 
 program
   .command('models')
   .description('List available models from the Monocle router')
-  .action(async () => {
-    try {
-      await modelListCommand();
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(runAction(modelListCommand));
 
-program
-  .command('chat')
-  .description('Chat with LLM via Monocle router (interactive REPL or pipe from stdin)')
-  .option('--model <model>', 'Model ID to use', 'claude-sonnet-4-6')
-  .option('--system-prompt <text>', 'System prompt text')
-  .option('--system-prompt-file <path>', 'Load system prompt from file')
-  .option('--max-tokens <n>', 'Maximum output tokens', '4096')
-  .action(async (options) => {
-    try {
-      await chatCommand(options);
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+addChatOptions(
+  program
+    .command('chat')
+    .description('Chat with LLM via Monocle router (interactive REPL or pipe from stdin)'),
+).action(runAction(chatCommand));
 
 const audio = program
   .command('audio')
@@ -142,14 +116,7 @@ audio
   .option('--temperature <n>', 'Sampling temperature (0-1)')
   .option('--filename <name>', 'Filename to send (required when piping stdin without extension)')
   .option('--content-type <mime>', 'Override MIME type (e.g., audio/wav)')
-  .action(async (file: string | undefined, options) => {
-    try {
-      await audioTranscribeCommand(file, options);
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(runAction(audioTranscribeCommand));
 
 audio
   .command('transcribe-azure [file]')
@@ -161,8 +128,8 @@ audio
   .option('--definition <json>', 'Raw definition JSON (escape hatch; overrides individual flags)')
   .option('--filename <name>', 'Filename to send (required when piping stdin without extension)')
   .option('--content-type <mime>', 'Override MIME type (e.g., audio/wav)')
-  .action(async (file: string | undefined, options) => {
-    try {
+  .action(
+    runAction(async (file: string | undefined, options) => {
       await audioTranscribeAzureCommand(file, {
         locales: options.locale,
         diarization: options.diarization,
@@ -172,11 +139,8 @@ audio
         filename: options.filename,
         contentType: options.contentType,
       });
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+    }),
+  );
 
 audio
   .command('speech [text]')
@@ -187,28 +151,14 @@ audio
   .option('--speed <n>', 'Speech speed (0.25-4.0)')
   .option('--instructions <text>', 'Style/delivery instructions (model-dependent)')
   .option('-o, --output <path>', 'Write audio to this path instead of stdout')
-  .action(async (text: string | undefined, options) => {
-    try {
-      await audioSpeechCommand(text, options);
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(runAction(audioSpeechCommand));
 
 audio
   .command('speech-azure [ssml]')
   .description('Synthesize speech via Azure /v1/azure/texttospeech/cognitiveservices/v1 (SSML body)')
   .option('--format <fmt>', 'X-Microsoft-OutputFormat (e.g., audio-24khz-48kbitrate-mono-mp3)')
   .option('-o, --output <path>', 'Write audio to this path instead of stdout')
-  .action(async (ssml: string | undefined, options) => {
-    try {
-      await audioSpeechAzureCommand(ssml, options);
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+  .action(runAction(audioSpeechAzureCommand));
 
 // Deprecated aliases — kept for one release while users migrate.
 const model = program
@@ -218,31 +168,22 @@ const model = program
 model
   .command('list')
   .description('[Deprecated] Use `monocle models` instead')
-  .action(async () => {
-    try {
+  .action(
+    runAction(async () => {
       process.stderr.write('Warning: `monocle model list` is deprecated. Use `monocle models` instead.\n');
       await modelListCommand();
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+    }),
+  );
 
-model
-  .command('chat')
-  .description('[Deprecated] Use `monocle chat` instead')
-  .option('--model <model>', 'Model ID to use', 'claude-sonnet-4-6')
-  .option('--system-prompt <text>', 'System prompt text')
-  .option('--system-prompt-file <path>', 'Load system prompt from file')
-  .option('--max-tokens <n>', 'Maximum output tokens', '4096')
-  .action(async (options) => {
-    try {
-      process.stderr.write('Warning: `monocle model chat` is deprecated. Use `monocle chat` instead.\n');
-      await chatCommand(options);
-    } catch (err: any) {
-      process.stderr.write(`Error: ${err.message}\n`);
-      process.exit(1);
-    }
-  });
+addChatOptions(
+  model
+    .command('chat')
+    .description('[Deprecated] Use `monocle chat` instead'),
+).action(
+  runAction(async (options) => {
+    process.stderr.write('Warning: `monocle model chat` is deprecated. Use `monocle chat` instead.\n');
+    await chatCommand(options);
+  }),
+);
 
 program.parse(process.argv);
