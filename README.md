@@ -34,8 +34,10 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
 | `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | Chat with a model (REPL or stdin) |
-| `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>] [--azure-fast]` | Transcribe audio (file or stdin) |
-| `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>] [--azure]` | Synthesize speech (text arg or stdin) |
+| `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
+| `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
+| `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
+| `monocle audio speech-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML TTS |
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
@@ -92,9 +94,11 @@ monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
 
 ## 🔊 Audio (STT / TTS)
 
-`monocle audio …` calls the audio endpoints directly so you can iterate on parameters and isolate API-level issues without going through a frontend.
+`monocle audio …` calls the audio endpoints directly so you can iterate on parameters and isolate API-level issues without going through a frontend. The OpenAI-compatible and Azure variants are separate subcommands because their parameter schemas don't overlap.
 
-Transcribe a file (OpenAI-compatible `/v1/audio/transcriptions`):
+### Transcribe
+
+OpenAI-compatible (`/v1/audio/transcriptions`):
 
 ```bash
 monocle audio transcribe meeting.wav --model gpt-4o-mini-transcribe --language en
@@ -106,13 +110,24 @@ Pipe audio from another tool:
 ffmpeg -i talk.m4a -f wav - | monocle audio transcribe --filename talk.wav --model gpt-4o-mini-transcribe
 ```
 
-Use the Azure Fast endpoint instead (keeps diarization and longer file uploads):
+Azure Fast (`/v1/speechtotext/transcriptions:transcribe`) — for diarization and longer file uploads:
 
 ```bash
-monocle audio transcribe meeting.wav --azure-fast
+monocle audio transcribe-azure meeting.wav \
+  --locale en-US --locale ko-KR \
+  --diarization \
+  --profanity Masked
 ```
 
-Synthesize speech to a file (OpenAI-compatible `/v1/audio/speech`):
+Need an Azure parameter we haven't exposed yet? Use the escape hatch:
+
+```bash
+monocle audio transcribe-azure meeting.wav --definition '{"locales":["ja-JP"],"customSetting":true}'
+```
+
+### Speech
+
+OpenAI-compatible (`/v1/audio/speech`):
 
 ```bash
 monocle audio speech "Hello from Monocle" --voice nova --format mp3 -o hello.mp3
@@ -124,10 +139,10 @@ Pipe text in and audio out:
 echo "the quick brown fox" | monocle audio speech --voice alloy > sample.mp3
 ```
 
-Azure SSML passthrough (`/v1/azure/text-to-speech/cognitiveservices/v1`):
+Azure SSML (`/v1/azure/text-to-speech/cognitiveservices/v1`):
 
 ```bash
-monocle audio speech --azure \
+monocle audio speech-azure \
   --format audio-24khz-48kbitrate-mono-mp3 \
   -o jenny.mp3 \
   '<speak version="1.0" xml:lang="en-US"><voice name="en-US-JennyNeural">Hello there.</voice></speak>'

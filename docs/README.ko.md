@@ -34,8 +34,10 @@ monocle status
 | `monocle token` | 현재 액세스 토큰 출력 (만료 임박 시 자동 갱신) |
 | `monocle models` | 사용 가능한 모델 목록 (modality 포함) |
 | `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | 모델과 채팅 (REPL 또는 stdin) |
-| `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>] [--azure-fast]` | 음성 인식 (파일 또는 stdin) |
-| `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>] [--azure]` | 음성 합성 (text 인자 또는 stdin) |
+| `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI 호환 음성 인식 |
+| `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast 음성 인식 |
+| `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI 호환 음성 합성 |
+| `monocle audio speech-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML 음성 합성 |
 | `monocle claude [...args]` | Claude Code를 Monocle에 연결해서 실행 (인자 그대로 전달) |
 | `monocle setup` | 일반 `claude`도 전역으로 Monocle을 거치게 설정 (opt-in) |
 | `monocle unset` | 전역 `claude` 라우팅 제거 |
@@ -92,9 +94,11 @@ monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
 
 ## 🔊 오디오 (STT / TTS)
 
-`monocle audio …`는 오디오 엔드포인트를 직접 호출해서 파라미터를 바꿔가며 시험하거나 API 레이어의 문제를 격리해서 보기 위한 명령이에요. 프론트엔드를 거치지 않아요.
+`monocle audio …`는 오디오 엔드포인트를 직접 호출해서 파라미터를 바꿔가며 시험하거나 API 레이어의 문제를 격리해서 보기 위한 명령이에요. 프론트엔드를 거치지 않아요. OpenAI 호환과 Azure는 파라미터 스키마가 겹치지 않아서 서브커맨드를 분리했어요.
 
-파일로 transcribe (OpenAI 호환 `/v1/audio/transcriptions`):
+### Transcribe
+
+OpenAI 호환 (`/v1/audio/transcriptions`):
 
 ```bash
 monocle audio transcribe meeting.wav --model gpt-4o-mini-transcribe --language ko
@@ -106,13 +110,24 @@ monocle audio transcribe meeting.wav --model gpt-4o-mini-transcribe --language k
 ffmpeg -i talk.m4a -f wav - | monocle audio transcribe --filename talk.wav --model gpt-4o-mini-transcribe
 ```
 
-Azure Fast 엔드포인트로 (diarization, 긴 파일 업로드 유지):
+Azure Fast (`/v1/speechtotext/transcriptions:transcribe`) — diarization과 긴 파일 업로드 지원:
 
 ```bash
-monocle audio transcribe meeting.wav --azure-fast
+monocle audio transcribe-azure meeting.wav \
+  --locale ko-KR --locale en-US \
+  --diarization \
+  --profanity Masked
 ```
 
-음성 합성을 파일로 저장 (OpenAI 호환 `/v1/audio/speech`):
+플래그로 노출 안 된 Azure 파라미터를 쓰려면:
+
+```bash
+monocle audio transcribe-azure meeting.wav --definition '{"locales":["ja-JP"],"customSetting":true}'
+```
+
+### Speech
+
+OpenAI 호환 (`/v1/audio/speech`):
 
 ```bash
 monocle audio speech "안녕하세요 Monocle입니다" --voice nova --format mp3 -o hello.mp3
@@ -124,10 +139,10 @@ stdin으로 텍스트, stdout으로 오디오:
 echo "더 빠른 갈색 여우" | monocle audio speech --voice alloy > sample.mp3
 ```
 
-Azure SSML passthrough (`/v1/azure/text-to-speech/cognitiveservices/v1`):
+Azure SSML (`/v1/azure/text-to-speech/cognitiveservices/v1`):
 
 ```bash
-monocle audio speech --azure \
+monocle audio speech-azure \
   --format audio-24khz-48kbitrate-mono-mp3 \
   -o jenny.mp3 \
   '<speak version="1.0" xml:lang="en-US"><voice name="en-US-JennyNeural">Hello there.</voice></speak>'
