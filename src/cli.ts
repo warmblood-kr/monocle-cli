@@ -201,7 +201,6 @@ audio
   .description('Synthesize speech via Azure /v1/azure/texttospeech/cognitiveservices/v1 (SSML body)')
   .option('--format <fmt>', 'X-Microsoft-OutputFormat (e.g., audio-24khz-48kbitrate-mono-mp3)')
   .option('-o, --output <path>', 'Write audio to this path instead of stdout')
-  .option('--plain', 'Send body as text/plain even when it starts with `<`')
   .action(async (ssml: string | undefined, options) => {
     try {
       await audioSpeechAzureCommand(ssml, options);

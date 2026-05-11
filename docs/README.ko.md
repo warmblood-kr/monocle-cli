@@ -139,13 +139,19 @@ stdin으로 텍스트, stdout으로 오디오:
 echo "더 빠른 갈색 여우" | monocle audio speech --voice alloy > sample.mp3
 ```
 
-Azure SSML (`/v1/azure/texttospeech/cognitiveservices/v1`):
+Azure SSML (`/v1/azure/texttospeech/cognitiveservices/v1`) — body는 반드시 `<speak …>`로 시작하는 SSML이어야 해요. 쉘에서 escape 하다 보면 실수하기 쉬우니 파일에 두고 파이프하는 게 안전합니다:
 
 ```bash
+cat > /tmp/jenny.ssml <<'EOF'
+<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">
+  <voice name="en-US-JennyNeural">Hello there.</voice>
+</speak>
+EOF
+
 monocle audio speech-azure \
   --format audio-24khz-48kbitrate-mono-mp3 \
   -o jenny.mp3 \
-  '<speak version="1.0" xml:lang="en-US"><voice name="en-US-JennyNeural">Hello there.</voice></speak>'
+  < /tmp/jenny.ssml
 ```
 
 실패 시 HTTP 상태 코드와 응답 본문을 stderr로 출력하고 종료 코드 1로 끝나요. 잘못된 파라미터나 백엔드 에러를 바로 알아볼 수 있어요.

@@ -6,7 +6,6 @@ import { getAccessToken } from '../auth';
 export interface AudioSpeechAzureOptions {
   format?: string;
   output?: string;
-  plain?: boolean;
 }
 
 export interface AudioSpeechAzureDeps {
@@ -54,7 +53,15 @@ export async function audioSpeechAzureCommand(
   body = body.trim();
   if (!body) {
     throw new Error(
-      'No input. Pass SSML (or plain text with --plain) as an argument or pipe it via stdin.',
+      'No input. Pass an SSML document as an argument or pipe it via stdin.',
+    );
+  }
+
+  if (!body.startsWith('<speak')) {
+    throw new Error(
+      'Azure TTS requires SSML. Body must start with `<speak …>`. ' +
+        'Tip: keep SSML in a file and pipe it in to avoid shell-escaping issues:\n' +
+        '  monocle audio speech-azure -o out.mp3 < my.ssml',
     );
   }
 
@@ -64,14 +71,6 @@ export async function audioSpeechAzureCommand(
     );
   }
 
-  // Azure expects application/ssml+xml for SSML; text/plain works for raw text
-  // when the deployment supports it. We sniff a leading `<` so users can pipe
-  // SSML without thinking about the header, while `--plain` forces text/plain
-  // even if the body starts with `<` for some reason.
-  const looksLikeSsml = body.startsWith('<');
-  const contentType =
-    options.plain || !looksLikeSsml ? 'text/plain' : 'application/ssml+xml';
-
   const { token, routerUrl } = await getAccessToken(deps);
 
   const response = (await fetchFn(
@@ -80,7 +79,7 @@ export async function audioSpeechAzureCommand(
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
-        'Content-Type': contentType,
+        'Content-Type': 'application/ssml+xml',
         'X-Microsoft-OutputFormat': options.format ?? DEFAULT_FORMAT,
       },
       body,

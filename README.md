@@ -139,13 +139,19 @@ Pipe text in and audio out:
 echo "the quick brown fox" | monocle audio speech --voice alloy > sample.mp3
 ```
 
-Azure SSML (`/v1/azure/texttospeech/cognitiveservices/v1`):
+Azure SSML (`/v1/azure/texttospeech/cognitiveservices/v1`) — body must be SSML (start with `<speak …>`), so it's safer to keep it in a file than to escape it on the shell:
 
 ```bash
+cat > /tmp/jenny.ssml <<'EOF'
+<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">
+  <voice name="en-US-JennyNeural">Hello there.</voice>
+</speak>
+EOF
+
 monocle audio speech-azure \
   --format audio-24khz-48kbitrate-mono-mp3 \
   -o jenny.mp3 \
-  '<speak version="1.0" xml:lang="en-US"><voice name="en-US-JennyNeural">Hello there.</voice></speak>'
+  < /tmp/jenny.ssml
 ```
 
 On failure each command prints the HTTP status and response body to stderr and exits non-zero, which makes it easy to spot bad parameters or backend errors.

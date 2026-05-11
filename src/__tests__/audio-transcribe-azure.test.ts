@@ -95,28 +95,21 @@ describe('audioTranscribeAzureCommand', () => {
     expect(stdout.flushed()).toContain('combinedRecognizedPhrases');
   });
 
-  it('omits definition part when no Azure-specific options are given', async () => {
-    let capturedBody: any = null;
-    const fetchFn = (async (_url: string, init: any) => {
-      capturedBody = init.body;
-      return { ok: true, status: 200, statusText: 'OK', text: async () => '{}' };
-    }) as any;
-
-    await audioTranscribeAzureCommand(
-      undefined,
-      { filename: 'a.wav' },
-      {
-        credentials: makeCredentialsStub(),
-        now: () => new Date('2026-05-11T00:00:00.000Z'),
-        fetch: fetchFn,
-        stdin: Readable.from([Buffer.from('x')]) as any,
-        stdout: makeStream().out as any,
-        stderr: makeStream().out as any,
-      },
-    );
-
-    expect(capturedBody.get('definition')).toBeNull();
-    expect(capturedBody.get('audio')).toBeTruthy();
+  it('refuses to send when no Azure-specific options are given', async () => {
+    await expect(
+      audioTranscribeAzureCommand(
+        undefined,
+        { filename: 'a.wav' },
+        {
+          credentials: makeCredentialsStub(),
+          now: () => new Date('2026-05-11T00:00:00.000Z'),
+          fetch: (async () => ({ ok: true, status: 200, statusText: 'OK', text: async () => '{}' })) as any,
+          stdin: Readable.from([Buffer.from('x')]) as any,
+          stdout: makeStream().out as any,
+          stderr: makeStream().out as any,
+        },
+      ),
+    ).rejects.toThrow(/requires a `definition` JSON/);
   });
 
   it('uses raw --definition JSON verbatim when provided', async () => {
@@ -183,7 +176,7 @@ describe('audioTranscribeAzureCommand', () => {
     await expect(
       audioTranscribeAzureCommand(
         undefined,
-        { filename: 'a.wav' },
+        { filename: 'a.wav', locales: ['en-US'] },
         {
           credentials: makeCredentialsStub(),
           now: () => new Date('2026-05-11T00:00:00.000Z'),

@@ -112,6 +112,18 @@ export async function audioTranscribeAzureCommand(
   const stdout = deps?.stdout ?? process.stdout;
   const stderr = deps?.stderr ?? process.stderr;
 
+  const definition = buildDefinition(options);
+  if (!definition) {
+    throw new Error(
+      'Azure Fast Transcription requires a `definition` JSON. Pass at least one of:\n' +
+        '  --locale <code>   (repeatable, e.g. --locale en-US --locale ko-KR)\n' +
+        '  --diarization\n' +
+        '  --profanity <None|Removed|Masked|Tags>\n' +
+        '  --channels <0,1>\n' +
+        '  --definition <raw JSON>',
+    );
+  }
+
   const { token, routerUrl } = await getAccessToken(deps);
 
   const { data, filename, contentType } = await resolveAudio(
@@ -122,13 +134,10 @@ export async function audioTranscribeAzureCommand(
 
   const form = new FormData();
   form.append('audio', new Blob([data], { type: contentType }), filename);
-  const definition = buildDefinition(options);
-  if (definition) {
-    form.append(
-      'definition',
-      new Blob([definition], { type: 'application/json' }),
-    );
-  }
+  form.append(
+    'definition',
+    new Blob([definition], { type: 'application/json' }),
+  );
 
   const response = await fetchFn(
     `${routerUrl}/v1/speechtotext/transcriptions:transcribe`,

@@ -96,50 +96,38 @@ describe('audioSpeechAzureCommand', () => {
     expect(writtenBytes.equals(Buffer.from([1, 2, 3]))).toBe(true);
   });
 
-  it('uses text/plain when body does not look like SSML', async () => {
-    let capturedHeaders: any = null;
-    const fetchFn = (async (_url: string, init: any) => {
-      capturedHeaders = init.headers;
-      return { ok: true, status: 200, statusText: 'OK', arrayBuffer: async () => new ArrayBuffer(0) };
-    }) as any;
-
-    await audioSpeechAzureCommand(
-      'plain text body',
-      { output: '/tmp/o.mp3' },
-      {
-        credentials: makeCredentialsStub(),
-        now: () => new Date('2026-05-11T00:00:00.000Z'),
-        fetch: fetchFn,
-        writeFile: () => {},
-        stdoutIsTTY: false,
-        stderr: makeStream().out,
-      },
-    );
-
-    expect(capturedHeaders['Content-Type']).toBe('text/plain');
+  it('rejects bodies that do not start with `<speak`', async () => {
+    await expect(
+      audioSpeechAzureCommand(
+        'plain text body',
+        { output: '/tmp/o.mp3' },
+        {
+          credentials: makeCredentialsStub(),
+          now: () => new Date('2026-05-11T00:00:00.000Z'),
+          fetch: (async () => ({ ok: true, status: 200, statusText: 'OK', arrayBuffer: async () => new ArrayBuffer(0) })) as any,
+          writeFile: () => {},
+          stdoutIsTTY: false,
+          stderr: makeStream().out,
+        },
+      ),
+    ).rejects.toThrow(/requires SSML/);
   });
 
-  it('--plain forces text/plain even when body starts with `<`', async () => {
-    let capturedHeaders: any = null;
-    const fetchFn = (async (_url: string, init: any) => {
-      capturedHeaders = init.headers;
-      return { ok: true, status: 200, statusText: 'OK', arrayBuffer: async () => new ArrayBuffer(0) };
-    }) as any;
-
-    await audioSpeechAzureCommand(
-      '<not-really-ssml>',
-      { plain: true, output: '/tmp/o.mp3' },
-      {
-        credentials: makeCredentialsStub(),
-        now: () => new Date('2026-05-11T00:00:00.000Z'),
-        fetch: fetchFn,
-        writeFile: () => {},
-        stdoutIsTTY: false,
-        stderr: makeStream().out,
-      },
-    );
-
-    expect(capturedHeaders['Content-Type']).toBe('text/plain');
+  it('rejects bodies that look like XML but are not `<speak …>`', async () => {
+    await expect(
+      audioSpeechAzureCommand(
+        '<not-really-ssml/>',
+        { output: '/tmp/o.mp3' },
+        {
+          credentials: makeCredentialsStub(),
+          now: () => new Date('2026-05-11T00:00:00.000Z'),
+          fetch: (async () => ({ ok: true, status: 200, statusText: 'OK', arrayBuffer: async () => new ArrayBuffer(0) })) as any,
+          writeFile: () => {},
+          stdoutIsTTY: false,
+          stderr: makeStream().out,
+        },
+      ),
+    ).rejects.toThrow(/requires SSML/);
   });
 
   it('falls back to the default X-Microsoft-OutputFormat', async () => {
@@ -225,7 +213,7 @@ describe('audioSpeechAzureCommand', () => {
 
     await expect(
       audioSpeechAzureCommand(
-        '<bad/>',
+        '<speak><bad/></speak>',
         { output: '/tmp/o.mp3' },
         {
           credentials: makeCredentialsStub(),
