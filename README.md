@@ -32,8 +32,10 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle login [--tenant <domain>] [--device-code]` | Sign in |
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
-| `monocle model list` | List available models |
-| `monocle model chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | Chat with a model (REPL or stdin) |
+| `monocle models` | List available models (with modality) |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | Chat with a model (REPL or stdin) |
+| `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>] [--azure-fast]` | Transcribe audio (file or stdin) |
+| `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>] [--azure]` | Synthesize speech (text arg or stdin) |
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
@@ -43,20 +45,22 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 List what your tenant has:
 
 ```console
-$ monocle model list
-MODEL ID              NAME                  OWNER       CONTEXT
-────────────────────  ────────────────────  ──────────  ─────────
-claude-sonnet-4-6     Claude Sonnet 4.6     anthropic   200k
-claude-opus-4-7       Claude Opus 4.7       anthropic   200k
-gpt-4o                GPT-4o                openai      128k
+$ monocle models
+MODEL ID                  NAME                  MODALITY  OWNER       CONTEXT
+────────────────────────  ────────────────────  ────────  ──────────  ───────
+claude-sonnet-4-6         Claude Sonnet 4.6     chat      anthropic   200k
+claude-opus-4-7           Claude Opus 4.7       chat      anthropic   200k
+gpt-4o                    GPT-4o                chat      openai      128k
+gpt-4o-mini-transcribe    GPT-4o mini STT       stt       openai      -
+gpt-4o-mini-tts           GPT-4o mini TTS       tts       openai      -
 
-3 model(s) available.
+5 model(s) available.
 ```
 
 Interactive REPL:
 
 ```console
-$ monocle model chat --model claude-sonnet-4-6
+$ monocle chat --model claude-sonnet-4-6
 Monocle Chat (model: claude-sonnet-4-6)
 Router: https://api.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
@@ -71,7 +75,7 @@ Bye.
 One-shot via stdin:
 
 ```console
-$ echo "Summarize OAuth 2.0 in one sentence." | monocle model chat
+$ echo "Summarize OAuth 2.0 in one sentence." | monocle chat
 Using model: claude-sonnet-4-6
 Router: https://api.monocle-ai.com
 OAuth 2.0 is an authorization framework that lets applications access a user's resources on another service without sharing the user's password.
@@ -80,8 +84,56 @@ OAuth 2.0 is an authorization framework that lets applications access a user's r
 With a system prompt from a file:
 
 ```bash
-monocle model chat --system-prompt-file ./persona.md --model claude-opus-4-7
+monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
 ```
+
+> [!NOTE]
+> `monocle model chat` / `monocle model list` still work but are deprecated and will be removed in a future release.
+
+## 🔊 Audio (STT / TTS)
+
+`monocle audio …` calls the audio endpoints directly so you can iterate on parameters and isolate API-level issues without going through a frontend.
+
+Transcribe a file (OpenAI-compatible `/v1/audio/transcriptions`):
+
+```bash
+monocle audio transcribe meeting.wav --model gpt-4o-mini-transcribe --language en
+```
+
+Pipe audio from another tool:
+
+```bash
+ffmpeg -i talk.m4a -f wav - | monocle audio transcribe --filename talk.wav --model gpt-4o-mini-transcribe
+```
+
+Use the Azure Fast endpoint instead (keeps diarization and longer file uploads):
+
+```bash
+monocle audio transcribe meeting.wav --azure-fast
+```
+
+Synthesize speech to a file (OpenAI-compatible `/v1/audio/speech`):
+
+```bash
+monocle audio speech "Hello from Monocle" --voice nova --format mp3 -o hello.mp3
+```
+
+Pipe text in and audio out:
+
+```bash
+echo "the quick brown fox" | monocle audio speech --voice alloy > sample.mp3
+```
+
+Azure SSML passthrough (`/v1/azure/text-to-speech/cognitiveservices/v1`):
+
+```bash
+monocle audio speech --azure \
+  --format audio-24khz-48kbitrate-mono-mp3 \
+  -o jenny.mp3 \
+  '<speak version="1.0" xml:lang="en-US"><voice name="en-US-JennyNeural">Hello there.</voice></speak>'
+```
+
+On failure each command prints the HTTP status and response body to stderr and exits non-zero, which makes it easy to spot bad parameters or backend errors.
 
 ## 🤖 Claude Code integration
 
