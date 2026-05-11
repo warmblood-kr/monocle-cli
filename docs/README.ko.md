@@ -139,7 +139,7 @@ stdin으로 텍스트, stdout으로 오디오:
 echo "더 빠른 갈색 여우" | monocle audio speech --voice alloy > sample.mp3
 ```
 
-Azure SSML (`/v1/azure/text-to-speech/cognitiveservices/v1`):
+Azure SSML (`/v1/azure/texttospeech/cognitiveservices/v1`):
 
 ```bash
 monocle audio speech-azure \

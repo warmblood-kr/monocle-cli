@@ -84,7 +84,7 @@ describe('audioSpeechAzureCommand', () => {
     );
 
     expect(capturedUrl).toBe(
-      'https://router.example.com/v1/azure/text-to-speech/cognitiveservices/v1',
+      'https://router.example.com/v1/azure/texttospeech/cognitiveservices/v1',
     );
     expect(capturedHeaders.Authorization).toBe('Bearer access-abc');
     expect(capturedHeaders['Content-Type']).toBe('application/ssml+xml');

@@ -75,7 +75,7 @@ export async function audioSpeechAzureCommand(
   const { token, routerUrl } = await getAccessToken(deps);
 
   const response = (await fetchFn(
-    `${routerUrl}/v1/azure/text-to-speech/cognitiveservices/v1`,
+    `${routerUrl}/v1/azure/texttospeech/cognitiveservices/v1`,
     {
       method: 'POST',
       headers: {

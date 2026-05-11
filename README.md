@@ -139,7 +139,7 @@ Pipe text in and audio out:
 echo "the quick brown fox" | monocle audio speech --voice alloy > sample.mp3
 ```
 
-Azure SSML (`/v1/azure/text-to-speech/cognitiveservices/v1`):
+Azure SSML (`/v1/azure/texttospeech/cognitiveservices/v1`):
 
 ```bash
 monocle audio speech-azure \
