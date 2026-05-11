@@ -4,17 +4,17 @@ import { Credentials } from '../credentials';
 import { RefreshDeps } from '../refresh';
 import { getAccessToken } from '../auth';
 
-export interface AudioTranscribeOptions {
-  model?: string;
-  language?: string;
-  prompt?: string;
-  responseFormat?: string;
-  temperature?: string;
+export interface AudioTranscribeAzureOptions {
+  locales?: string[];
+  diarization?: boolean;
+  profanity?: string;
+  channels?: string;
+  definition?: string;
   filename?: string;
   contentType?: string;
 }
 
-export interface AudioTranscribeDeps {
+export interface AudioTranscribeAzureDeps {
   credentials?: Credentials;
   refreshDeps?: RefreshDeps;
   fetch?: typeof globalThis.fetch;
@@ -52,8 +52,8 @@ function readStdin(stdin: NodeJS.ReadableStream): Promise<Buffer> {
 
 function resolveAudio(
   fileArg: string | undefined,
-  opts: AudioTranscribeOptions,
-  deps: AudioTranscribeDeps,
+  opts: AudioTranscribeAzureOptions,
+  deps: AudioTranscribeAzureDeps,
 ): Promise<{ data: Buffer; filename: string; contentType: string }> {
   const readFile = deps.readFile ?? ((p: string) => fs.readFileSync(p));
   const fileExists = deps.fileExists ?? ((p: string) => fs.existsSync(p));
@@ -67,11 +67,7 @@ function resolveAudio(
     const filename = opts.filename ?? path.basename(fileArg);
     const contentType =
       opts.contentType ?? MIME_BY_EXT[ext] ?? 'application/octet-stream';
-    return Promise.resolve({
-      data: readFile(fileArg),
-      filename,
-      contentType,
-    });
+    return Promise.resolve({ data: readFile(fileArg), filename, contentType });
   }
 
   return readStdin(stdin).then((data) => {
@@ -88,10 +84,29 @@ function resolveAudio(
   });
 }
 
-export async function audioTranscribeCommand(
+function buildDefinition(opts: AudioTranscribeAzureOptions): string | null {
+  if (opts.definition) {
+    // User-provided raw JSON wins — we still validate it parses to fail fast.
+    JSON.parse(opts.definition);
+    return opts.definition;
+  }
+  const def: Record<string, unknown> = {};
+  if (opts.locales && opts.locales.length > 0) def.locales = opts.locales;
+  if (opts.diarization) def.diarizationEnabled = true;
+  if (opts.profanity) def.profanityFilterMode = opts.profanity;
+  if (opts.channels) {
+    def.channels = opts.channels
+      .split(',')
+      .map((c) => parseInt(c.trim(), 10))
+      .filter((n) => !Number.isNaN(n));
+  }
+  return Object.keys(def).length > 0 ? JSON.stringify(def) : null;
+}
+
+export async function audioTranscribeAzureCommand(
   fileArg: string | undefined,
-  options: AudioTranscribeOptions,
-  deps?: AudioTranscribeDeps,
+  options: AudioTranscribeAzureOptions,
+  deps?: AudioTranscribeAzureDeps,
 ): Promise<void> {
   const fetchFn = deps?.fetch ?? globalThis.fetch;
   const stdout = deps?.stdout ?? process.stdout;
@@ -106,19 +121,23 @@ export async function audioTranscribeCommand(
   );
 
   const form = new FormData();
-  // Blob is the platform-portable way to attach a binary part. Node 18+ has it.
-  form.append('file', new Blob([data], { type: contentType }), filename);
-  if (options.model) form.append('model', options.model);
-  if (options.language) form.append('language', options.language);
-  if (options.prompt) form.append('prompt', options.prompt);
-  if (options.responseFormat) form.append('response_format', options.responseFormat);
-  if (options.temperature) form.append('temperature', options.temperature);
+  form.append('audio', new Blob([data], { type: contentType }), filename);
+  const definition = buildDefinition(options);
+  if (definition) {
+    form.append(
+      'definition',
+      new Blob([definition], { type: 'application/json' }),
+    );
+  }
 
-  const response = await fetchFn(`${routerUrl}/v1/audio/transcriptions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
-  });
+  const response = await fetchFn(
+    `${routerUrl}/v1/speechtotext/transcriptions:transcribe`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    },
+  );
 
   const body = await response.text();
   if (!response.ok) {

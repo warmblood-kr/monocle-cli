@@ -94,39 +94,6 @@ describe('audioTranscribeCommand', () => {
     expect(stderr.flushed()).toBe('');
   });
 
-  it('switches endpoint when --azure-fast is set', async () => {
-    let capturedUrl = '';
-    const fetchFn = (async (url: string) => {
-      capturedUrl = url;
-      return {
-        ok: true,
-        status: 200,
-        statusText: 'OK',
-        text: async () => '{}',
-      };
-    }) as any;
-
-    const stdout = makeStream();
-    const stderr = makeStream();
-
-    await audioTranscribeCommand(
-      undefined,
-      { azureFast: true, filename: 'a.wav' },
-      {
-        credentials: makeCredentialsStub(),
-        now: () => new Date('2026-05-11T00:00:00.000Z'),
-        fetch: fetchFn,
-        stdin: Readable.from([Buffer.from('data')]) as any,
-        stdout: stdout.out as any,
-        stderr: stderr.out as any,
-      },
-    );
-
-    expect(capturedUrl).toBe(
-      'https://router.example.com/v1/speechtotext/transcriptions:transcribe',
-    );
-  });
-
   it('reads from a file path argument with inferred content-type', async () => {
     let capturedBody: any = null;
     const fetchFn = (async (_url: string, init: any) => {

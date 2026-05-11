@@ -10,6 +10,7 @@ import { claudeCommand } from './commands/claude';
 import { chatCommand } from './commands/chat';
 import { modelListCommand } from './commands/model-list';
 import { audioTranscribeCommand } from './commands/audio-transcribe';
+import { audioTranscribeAzureCommand } from './commands/audio-transcribe-azure';
 import { audioSpeechCommand } from './commands/audio-speech';
 
 const { version } = require('../package.json') as { version: string };
@@ -132,7 +133,7 @@ const audio = program
 
 audio
   .command('transcribe [file]')
-  .description('Transcribe audio via /v1/audio/transcriptions (file path or stdin)')
+  .description('Transcribe audio via /v1/audio/transcriptions (OpenAI compatible)')
   .option('--model <id>', 'Model ID (e.g., gpt-4o-mini-transcribe, whisper-1)')
   .option('--language <code>', 'ISO-639-1 language hint')
   .option('--prompt <text>', 'Optional prompt to guide the transcription')
@@ -140,10 +141,36 @@ audio
   .option('--temperature <n>', 'Sampling temperature (0-1)')
   .option('--filename <name>', 'Filename to send (required when piping stdin without extension)')
   .option('--content-type <mime>', 'Override MIME type (e.g., audio/wav)')
-  .option('--azure-fast', 'Use Azure Fast endpoint /v1/speechtotext/transcriptions:transcribe instead')
   .action(async (file: string | undefined, options) => {
     try {
       await audioTranscribeCommand(file, options);
+    } catch (err: any) {
+      process.stderr.write(`Error: ${err.message}\n`);
+      process.exit(1);
+    }
+  });
+
+audio
+  .command('transcribe-azure [file]')
+  .description('Transcribe via Azure Fast endpoint /v1/speechtotext/transcriptions:transcribe')
+  .option('--locale <code...>', 'Locale (e.g., en-US, ko-KR) — repeatable')
+  .option('--diarization', 'Enable speaker diarization')
+  .option('--profanity <mode>', 'None | Removed | Masked | Tags')
+  .option('--channels <list>', 'Comma-separated channel indices (e.g., "0,1")')
+  .option('--definition <json>', 'Raw definition JSON (escape hatch; overrides individual flags)')
+  .option('--filename <name>', 'Filename to send (required when piping stdin without extension)')
+  .option('--content-type <mime>', 'Override MIME type (e.g., audio/wav)')
+  .action(async (file: string | undefined, options) => {
+    try {
+      await audioTranscribeAzureCommand(file, {
+        locales: options.locale,
+        diarization: options.diarization,
+        profanity: options.profanity,
+        channels: options.channels,
+        definition: options.definition,
+        filename: options.filename,
+        contentType: options.contentType,
+      });
     } catch (err: any) {
       process.stderr.write(`Error: ${err.message}\n`);
       process.exit(1);
