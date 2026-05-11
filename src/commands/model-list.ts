@@ -1,11 +1,14 @@
 import { Credentials } from '../credentials';
-import { refreshAccessToken, RefreshDeps } from '../refresh';
+import { RefreshDeps } from '../refresh';
+import { getAccessToken } from '../auth';
 
 export interface ModelListDeps {
   credentials?: Credentials;
   refreshDeps?: RefreshDeps;
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
+  stdout?: NodeJS.WritableStream;
+  stderr?: NodeJS.WritableStream;
 }
 
 interface ModelInfo {
@@ -13,49 +16,18 @@ interface ModelInfo {
   name?: string;
   owned_by?: string;
   context_window?: number;
+  modality?: string;
 }
 
-const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
-
 export async function modelListCommand(deps?: ModelListDeps): Promise<void> {
-  const credentials = deps?.credentials ?? new Credentials();
   const fetchFn = deps?.fetch ?? globalThis.fetch;
-  const now = deps?.now ?? (() => new Date());
+  const stdout = deps?.stdout ?? process.stdout;
+  const stderr = deps?.stderr ?? process.stderr;
 
-  const creds = credentials.read();
-  if (!creds) {
-    process.stderr.write('Not logged in. Run `monocle login --tenant <domain>` first.\n');
-    process.exit(1);
-  }
-
-  let activeCreds = creds;
-  const expiresAt = new Date(creds.access_token_expires_at).getTime();
-  if (now().getTime() + EXPIRY_BUFFER_MS > expiresAt) {
-    const result = await refreshAccessToken(creds, {
-      credentials,
-      ...deps?.refreshDeps,
-    });
-    if (!result.success || !result.credentials) {
-      process.stderr.write(`Token refresh failed: ${result.error}\n`);
-      process.exit(1);
-    }
-    activeCreds = result.credentials;
-  }
-
-  let routerUrl: string;
-  if (activeCreds.router_url) {
-    routerUrl = activeCreds.router_url;
-  } else {
-    const isLocal =
-      activeCreds.tenant_domain.startsWith('localhost') ||
-      activeCreds.tenant_domain.startsWith('127.0.0.1');
-    routerUrl = `${isLocal ? 'http' : 'https'}://${activeCreds.tenant_domain}`;
-  }
+  const { token, routerUrl } = await getAccessToken(deps);
 
   const response = await fetchFn(`${routerUrl}/v1/models`, {
-    headers: {
-      Authorization: `Bearer ${activeCreds.access_token}`,
-    },
+    headers: { Authorization: `Bearer ${token}` },
   });
 
   if (!response.ok) {
@@ -67,25 +39,27 @@ export async function modelListCommand(deps?: ModelListDeps): Promise<void> {
   const models = data.data ?? [];
 
   if (models.length === 0) {
-    process.stderr.write('No models available.\n');
+    stderr.write('No models available.\n');
     return;
   }
 
-  // Table output
-  const idWidth = Math.max(10, ...models.map((m) => m.id.length));
-  const nameWidth = Math.max(6, ...models.map((m) => (m.name ?? '').length));
+  const idWidth = Math.max(8, ...models.map((m) => m.id.length));
+  const nameWidth = Math.max(4, ...models.map((m) => (m.name ?? '').length));
+  const modalityWidth = Math.max(8, ...models.map((m) => (m.modality ?? '').length));
 
-  process.stdout.write(
-    `${'MODEL ID'.padEnd(idWidth)}  ${'NAME'.padEnd(nameWidth)}  ${'OWNER'.padEnd(10)}  CONTEXT\n`,
+  stdout.write(
+    `${'MODEL ID'.padEnd(idWidth)}  ${'NAME'.padEnd(nameWidth)}  ${'MODALITY'.padEnd(modalityWidth)}  ${'OWNER'.padEnd(10)}  CONTEXT\n`,
   );
-  process.stdout.write(`${'─'.repeat(idWidth)}  ${'─'.repeat(nameWidth)}  ${'─'.repeat(10)}  ${'─'.repeat(9)}\n`);
+  stdout.write(
+    `${'─'.repeat(idWidth)}  ${'─'.repeat(nameWidth)}  ${'─'.repeat(modalityWidth)}  ${'─'.repeat(10)}  ${'─'.repeat(7)}\n`,
+  );
 
   for (const model of models) {
     const ctx = model.context_window ? `${(model.context_window / 1000).toFixed(0)}k` : '-';
-    process.stdout.write(
-      `${model.id.padEnd(idWidth)}  ${(model.name ?? '').padEnd(nameWidth)}  ${(model.owned_by ?? '').padEnd(10)}  ${ctx}\n`,
+    stdout.write(
+      `${model.id.padEnd(idWidth)}  ${(model.name ?? '').padEnd(nameWidth)}  ${(model.modality ?? '-').padEnd(modalityWidth)}  ${(model.owned_by ?? '').padEnd(10)}  ${ctx}\n`,
     );
   }
 
-  process.stderr.write(`\n${models.length} model(s) available.\n`);
+  stderr.write(`\n${models.length} model(s) available.\n`);
 }
