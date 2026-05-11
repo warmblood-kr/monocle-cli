@@ -3,16 +3,13 @@ import { Credentials } from '../credentials';
 import { RefreshDeps } from '../refresh';
 import { getAccessToken } from '../auth';
 
-export interface AudioSpeechOptions {
-  model?: string;
-  voice?: string;
+export interface AudioSpeechAzureOptions {
   format?: string;
-  speed?: string;
-  instructions?: string;
   output?: string;
+  plain?: boolean;
 }
 
-export interface AudioSpeechDeps {
+export interface AudioSpeechAzureDeps {
   credentials?: Credentials;
   refreshDeps?: RefreshDeps;
   fetch?: typeof globalThis.fetch;
@@ -24,9 +21,7 @@ export interface AudioSpeechDeps {
   stdoutIsTTY?: boolean;
 }
 
-const DEFAULT_MODEL = 'gpt-4o-mini-tts';
-const DEFAULT_VOICE = 'alloy';
-const DEFAULT_FORMAT = 'mp3';
+const DEFAULT_FORMAT = 'audio-24khz-48kbitrate-mono-mp3';
 
 function readStdin(stdin: NodeJS.ReadableStream): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -40,10 +35,10 @@ function readStdin(stdin: NodeJS.ReadableStream): Promise<string> {
   });
 }
 
-export async function audioSpeechCommand(
-  textArg: string | undefined,
-  options: AudioSpeechOptions,
-  deps?: AudioSpeechDeps,
+export async function audioSpeechAzureCommand(
+  bodyArg: string | undefined,
+  options: AudioSpeechAzureOptions,
+  deps?: AudioSpeechAzureDeps,
 ): Promise<void> {
   const fetchFn = deps?.fetch ?? globalThis.fetch;
   const stdout = deps?.stdout ?? process.stdout;
@@ -52,13 +47,14 @@ export async function audioSpeechCommand(
   const stdoutIsTTY =
     deps?.stdoutIsTTY ?? Boolean((process.stdout as any).isTTY);
 
-  let text = textArg ?? '';
-  if (!text || text === '-') {
-    text = (await readStdin(deps?.stdin ?? process.stdin)).trim();
+  let body = bodyArg ?? '';
+  if (!body || body === '-') {
+    body = await readStdin(deps?.stdin ?? process.stdin);
   }
-  if (!text) {
+  body = body.trim();
+  if (!body) {
     throw new Error(
-      'No input text. Pass text as an argument or pipe it via stdin.',
+      'No input. Pass SSML (or plain text with --plain) as an argument or pipe it via stdin.',
     );
   }
 
@@ -68,31 +64,34 @@ export async function audioSpeechCommand(
     );
   }
 
+  // Azure expects application/ssml+xml for SSML; text/plain works for raw text
+  // when the deployment supports it. We sniff a leading `<` so users can pipe
+  // SSML without thinking about the header, while `--plain` forces text/plain
+  // even if the body starts with `<` for some reason.
+  const looksLikeSsml = body.startsWith('<');
+  const contentType =
+    options.plain || !looksLikeSsml ? 'text/plain' : 'application/ssml+xml';
+
   const { token, routerUrl } = await getAccessToken(deps);
 
-  const payload: Record<string, unknown> = {
-    model: options.model ?? DEFAULT_MODEL,
-    voice: options.voice ?? DEFAULT_VOICE,
-    input: text,
-    response_format: options.format ?? DEFAULT_FORMAT,
-  };
-  if (options.speed) payload.speed = parseFloat(options.speed);
-  if (options.instructions) payload.instructions = options.instructions;
-
-  const response = (await fetchFn(`${routerUrl}/v1/audio/speech`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
+  const response = (await fetchFn(
+    `${routerUrl}/v1/azure/text-to-speech/cognitiveservices/v1`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': contentType,
+        'X-Microsoft-OutputFormat': options.format ?? DEFAULT_FORMAT,
+      },
+      body,
     },
-    body: JSON.stringify(payload),
-  })) as Response;
+  )) as Response;
 
   if (!response.ok) {
-    const body = await response.text();
+    const errBody = await response.text();
     stderr.write(`API error ${response.status} ${response.statusText}\n`);
-    stderr.write(body);
-    if (!body.endsWith('\n')) stderr.write('\n');
+    stderr.write(errBody);
+    if (!errBody.endsWith('\n')) stderr.write('\n');
     process.exit(1);
   }
 

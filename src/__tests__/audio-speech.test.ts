@@ -173,40 +173,6 @@ describe('audioSpeechCommand', () => {
     expect(JSON.parse(capturedBody).input).toBe('piped input');
   });
 
-  it('with --azure, posts raw SSML and sets X-Microsoft-OutputFormat', async () => {
-    let capturedUrl = '';
-    let capturedHeaders: any = null;
-    let capturedBody: any = null;
-    const fetchFn = (async (url: string, init: any) => {
-      capturedUrl = url;
-      capturedHeaders = init.headers;
-      capturedBody = init.body;
-      return { ok: true, status: 200, statusText: 'OK', arrayBuffer: async () => new ArrayBuffer(0) };
-    }) as any;
-
-    await audioSpeechCommand(
-      '<speak version="1.0"><voice name="en-US-Jenny">hi</voice></speak>',
-      { azure: true, format: 'audio-16khz-32kbitrate-mono-mp3', output: '/tmp/o.mp3' },
-      {
-        credentials: makeCredentialsStub(),
-        now: () => new Date('2026-05-11T00:00:00.000Z'),
-        fetch: fetchFn,
-        writeFile: () => {},
-        stdoutIsTTY: false,
-        stderr: makeStream().out,
-      },
-    );
-
-    expect(capturedUrl).toBe(
-      'https://router.example.com/v1/azure/text-to-speech/cognitiveservices/v1',
-    );
-    expect(capturedHeaders['Content-Type']).toBe('application/ssml+xml');
-    expect(capturedHeaders['X-Microsoft-OutputFormat']).toBe(
-      'audio-16khz-32kbitrate-mono-mp3',
-    );
-    expect(capturedBody).toContain('<speak');
-  });
-
   it('prints status + body to stderr and exits non-zero on API error', async () => {
     const fetchFn = (async () => ({
       ok: false,

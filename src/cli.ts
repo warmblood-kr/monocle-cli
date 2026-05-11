@@ -12,6 +12,7 @@ import { modelListCommand } from './commands/model-list';
 import { audioTranscribeCommand } from './commands/audio-transcribe';
 import { audioTranscribeAzureCommand } from './commands/audio-transcribe-azure';
 import { audioSpeechCommand } from './commands/audio-speech';
+import { audioSpeechAzureCommand } from './commands/audio-speech-azure';
 
 const { version } = require('../package.json') as { version: string };
 
@@ -179,17 +180,31 @@ audio
 
 audio
   .command('speech [text]')
-  .description('Synthesize speech via /v1/audio/speech (text arg or stdin, binary output)')
+  .description('Synthesize speech via /v1/audio/speech (OpenAI compatible)')
   .option('--model <id>', 'Model ID (e.g., gpt-4o-mini-tts)')
   .option('--voice <name>', 'Voice ID (e.g., alloy, echo, fable, onyx, nova, shimmer)')
   .option('--format <fmt>', 'Output format (mp3 | opus | aac | flac | wav | pcm)')
   .option('--speed <n>', 'Speech speed (0.25-4.0)')
   .option('--instructions <text>', 'Style/delivery instructions (model-dependent)')
   .option('-o, --output <path>', 'Write audio to this path instead of stdout')
-  .option('--azure', 'Use Azure /v1/azure/text-to-speech/cognitiveservices/v1 (SSML passthrough)')
   .action(async (text: string | undefined, options) => {
     try {
       await audioSpeechCommand(text, options);
+    } catch (err: any) {
+      process.stderr.write(`Error: ${err.message}\n`);
+      process.exit(1);
+    }
+  });
+
+audio
+  .command('speech-azure [ssml]')
+  .description('Synthesize speech via Azure /v1/azure/text-to-speech/cognitiveservices/v1 (SSML body)')
+  .option('--format <fmt>', 'X-Microsoft-OutputFormat (e.g., audio-24khz-48kbitrate-mono-mp3)')
+  .option('-o, --output <path>', 'Write audio to this path instead of stdout')
+  .option('--plain', 'Send body as text/plain even when it starts with `<`')
+  .action(async (ssml: string | undefined, options) => {
+    try {
+      await audioSpeechAzureCommand(ssml, options);
     } catch (err: any) {
       process.stderr.write(`Error: ${err.message}\n`);
       process.exit(1);
