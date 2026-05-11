@@ -83,9 +83,9 @@ describe('audioTranscribeAzureCommand', () => {
     );
     expect(capturedBody).toBeInstanceOf(FormData);
     expect(capturedBody.get('audio')).toBeTruthy();
-    const definitionPart = capturedBody.get('definition') as Blob;
-    expect(definitionPart).toBeTruthy();
-    const definition = JSON.parse(await definitionPart.text());
+    const definitionPart = capturedBody.get('definition');
+    expect(typeof definitionPart).toBe('string');
+    const definition = JSON.parse(definitionPart as string);
     expect(definition).toMatchObject({
       locales: ['en-US', 'ko-KR'],
       diarizationEnabled: true,
@@ -136,7 +136,7 @@ describe('audioTranscribeAzureCommand', () => {
       },
     );
 
-    const def = JSON.parse(await (capturedBody.get('definition') as Blob).text());
+    const def = JSON.parse(capturedBody.get('definition') as string);
     expect(def).toEqual({ locales: ['ja-JP'], customProperty: true });
   });
 

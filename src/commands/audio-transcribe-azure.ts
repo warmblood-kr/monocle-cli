@@ -134,10 +134,10 @@ export async function audioTranscribeAzureCommand(
 
   const form = new FormData();
   form.append('audio', new Blob([data], { type: contentType }), filename);
-  form.append(
-    'definition',
-    new Blob([definition], { type: 'application/json' }),
-  );
+  // The server expects `definition` as a plain string form field (Starlette
+  // parses Blob parts as UploadFile and fails the `isinstance(..., str)`
+  // check), so we append it directly without wrapping in a Blob.
+  form.append('definition', definition);
 
   const response = await fetchFn(
     `${routerUrl}/v1/speechtotext/transcriptions:transcribe`,
