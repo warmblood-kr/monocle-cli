@@ -6,3 +6,11 @@ dist/
 
 # IDE
 .idea/
+
+# Audio artifacts from `monocle audio …` experiments
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.opus
+*.webm

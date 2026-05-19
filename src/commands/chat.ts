@@ -1,7 +1,9 @@
 import * as fs from 'fs';
 import * as readline from 'readline';
 import { Credentials } from '../credentials';
-import { refreshAccessToken, RefreshDeps } from '../refresh';
+import { RefreshDeps } from '../refresh';
+import { getAccessToken } from '../auth';
+import { ENDPOINTS } from '../endpoints';
 
 export interface ChatOptions {
   model?: string;
@@ -20,49 +22,8 @@ export interface ChatDeps {
   stderr?: NodeJS.WritableStream;
 }
 
-const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_MAX_TOKENS = 4096;
-
-async function getAccessToken(
-  credentials: Credentials,
-  deps?: ChatDeps,
-): Promise<{ token: string; routerUrl: string }> {
-  const now = deps?.now ?? (() => new Date());
-  const stderr = deps?.stderr ?? process.stderr;
-
-  const creds = credentials.read();
-  if (!creds) {
-    stderr.write('Not logged in. Run `monocle login --tenant <domain>` first.\n');
-    process.exit(1);
-  }
-
-  let activeCreds = creds;
-  const expiresAt = new Date(creds.access_token_expires_at).getTime();
-  if (now().getTime() + EXPIRY_BUFFER_MS > expiresAt) {
-    const result = await refreshAccessToken(creds, {
-      credentials,
-      ...deps?.refreshDeps,
-    });
-    if (!result.success || !result.credentials) {
-      stderr.write(`Token refresh failed: ${result.error}\n`);
-      process.exit(1);
-    }
-    activeCreds = result.credentials;
-  }
-
-  let routerUrl: string;
-  if (activeCreds.router_url) {
-    routerUrl = activeCreds.router_url;
-  } else {
-    const isLocal =
-      activeCreds.tenant_domain.startsWith('localhost') ||
-      activeCreds.tenant_domain.startsWith('127.0.0.1');
-    routerUrl = `${isLocal ? 'http' : 'https'}://${activeCreds.tenant_domain}`;
-  }
-
-  return { token: activeCreds.access_token, routerUrl };
-}
 
 async function callChat(
   routerUrl: string,
@@ -81,7 +42,7 @@ async function callChat(
   }
   messages.push({ role: 'user', content: userMessage });
 
-  const response = await fetchFn(`${routerUrl}/v1/chat/completions`, {
+  const response = await fetchFn(`${routerUrl}${ENDPOINTS.chatCompletions}`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -120,7 +81,6 @@ export async function chatCommand(
   options: ChatOptions,
   deps?: ChatDeps,
 ): Promise<void> {
-  const credentials = deps?.credentials ?? new Credentials();
   const stdout = deps?.stdout ?? process.stdout;
   const stderr = deps?.stderr ?? process.stderr;
 
@@ -140,12 +100,12 @@ export async function chatCommand(
   }
 
   // Get auth
-  const { token, routerUrl } = await getAccessToken(credentials, deps);
+  const { token, routerUrl } = await getAccessToken(deps);
   const fetchFn = deps?.fetch ?? globalThis.fetch;
 
   // Validate model ID against available models
   try {
-    const modelsResp = await fetchFn(`${routerUrl}/v1/models`, {
+    const modelsResp = await fetchFn(`${routerUrl}${ENDPOINTS.models}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (modelsResp.ok) {
