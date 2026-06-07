@@ -113,6 +113,34 @@ describe('claudeCommand', () => {
     expect(callArgs.slice(2)).toEqual(['--model', 'opus']);
   });
 
+  it('should default model to sonnet in inline settings', async () => {
+    const { spawnFn } = makeMockSpawn();
+
+    await claudeCommand([], {
+      credentials: createMockCredentials(makeCredentials()),
+      env: {},
+      spawn: spawnFn,
+    });
+
+    const callArgs = spawnFn.mock.calls[0][1] as string[];
+    const parsed = JSON.parse(callArgs[1]);
+    expect(parsed.model).toBe('sonnet');
+  });
+
+  it('should let user --model override the default', async () => {
+    const { spawnFn } = makeMockSpawn();
+
+    await claudeCommand(['--model', 'opus'], {
+      credentials: createMockCredentials(makeCredentials()),
+      env: {},
+      spawn: spawnFn,
+    });
+
+    const callArgs = spawnFn.mock.calls[0][1] as string[];
+    // Default lives in --settings; user's --model is forwarded after it and wins (CLI flag > settings).
+    expect(callArgs.slice(2)).toEqual(['--model', 'opus']);
+  });
+
   it('should spawn claude with stdio inherit', async () => {
     const { spawnFn } = makeMockSpawn();
 
