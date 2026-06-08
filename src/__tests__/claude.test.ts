@@ -153,6 +153,33 @@ describe('claudeCommand', () => {
     expect(spawnFn.mock.calls[0][2].stdio).toBe('inherit');
   });
 
+  it('should set ANTHROPIC_CUSTOM_HEADERS with x-monocle-entrypoint: cli', async () => {
+    const { spawnFn } = makeMockSpawn();
+
+    await claudeCommand([], {
+      credentials: createMockCredentials(makeCredentials()),
+      env: { PATH: '/usr/bin' },
+      spawn: spawnFn,
+    });
+
+    const childEnv = spawnFn.mock.calls[0][2].env;
+    expect(childEnv.ANTHROPIC_CUSTOM_HEADERS).toContain('x-monocle-entrypoint: cli');
+  });
+
+  it('should merge entrypoint header with an existing ANTHROPIC_CUSTOM_HEADERS', async () => {
+    const { spawnFn } = makeMockSpawn();
+
+    await claudeCommand([], {
+      credentials: createMockCredentials(makeCredentials()),
+      env: { PATH: '/usr/bin', ANTHROPIC_CUSTOM_HEADERS: 'X-Existing: value' },
+      spawn: spawnFn,
+    });
+
+    const childEnv = spawnFn.mock.calls[0][2].env;
+    expect(childEnv.ANTHROPIC_CUSTOM_HEADERS).toContain('X-Existing: value');
+    expect(childEnv.ANTHROPIC_CUSTOM_HEADERS).toContain('x-monocle-entrypoint: cli');
+  });
+
   it('should handle claude not found (ENOENT)', async () => {
     const { spawnFn, child } = makeMockSpawn();
 
