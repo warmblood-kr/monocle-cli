@@ -4,6 +4,7 @@ import { Credentials } from '../credentials';
 import { RefreshDeps } from '../refresh';
 import { getAccessToken } from '../auth';
 import { ENDPOINTS } from '../endpoints';
+import { ENTRYPOINT_HEADER } from '../entrypoint';
 
 export interface ChatOptions {
   model?: string;
@@ -47,6 +48,7 @@ async function callChat(
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
+      ...ENTRYPOINT_HEADER,
     },
     body: JSON.stringify({
       model,
@@ -106,7 +108,7 @@ export async function chatCommand(
   // Validate model ID against available models
   try {
     const modelsResp = await fetchFn(`${routerUrl}${ENDPOINTS.models}`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${token}`, ...ENTRYPOINT_HEADER },
     });
     if (modelsResp.ok) {
       const modelsData = (await modelsResp.json()) as { data: Array<{ id: string }> };
