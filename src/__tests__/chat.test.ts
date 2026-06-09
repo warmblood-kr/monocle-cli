@@ -4,8 +4,8 @@ import { chatCommand } from '../commands/chat';
 import { makeCredentialsStub } from './helpers/credentials-stub';
 import { makeStream } from './helpers/streams';
 
-describe('chatCommand entrypoint header', () => {
-  it('sends x-monocle-entrypoint: cli on chat-proxy requests', async () => {
+describe('chatCommand origin header', () => {
+  it('sends x-monocle-origin: cli on chat-proxy requests', async () => {
     const capturedHeaders: any[] = [];
     const fetchFn = (async (_url: string, init: any) => {
       capturedHeaders.push(init?.headers ?? {});
@@ -62,10 +62,10 @@ describe('chatCommand entrypoint header', () => {
     onSpy.mockRestore();
     setEncSpy.mockRestore();
 
-    // Every request to chat-proxy carries the entrypoint header.
+    // Every request to chat-proxy carries the origin header.
     expect(capturedHeaders.length).toBeGreaterThan(0);
     for (const headers of capturedHeaders) {
-      expect(headers['x-monocle-entrypoint']).toBe('cli');
+      expect(headers['x-monocle-origin']).toBe('cli');
     }
   });
 });

@@ -9,7 +9,7 @@ import {
   writeBinaryOutput,
 } from '../audio-io';
 import { ENDPOINTS } from '../endpoints';
-import { ENTRYPOINT_HEADER } from '../entrypoint';
+import { ORIGIN_HEADER } from '../origin';
 
 export interface AudioSpeechAzureOptions {
   format?: string;
@@ -61,7 +61,7 @@ export async function audioSpeechAzureCommand(
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/ssml+xml',
       'X-Microsoft-OutputFormat': options.format ?? DEFAULT_FORMAT,
-      ...ENTRYPOINT_HEADER,
+      ...ORIGIN_HEADER,
     },
     body,
   });

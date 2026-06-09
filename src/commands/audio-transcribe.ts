@@ -7,7 +7,7 @@ import {
   writeApiErrorAndExit,
 } from '../audio-io';
 import { ENDPOINTS } from '../endpoints';
-import { ENTRYPOINT_HEADER } from '../entrypoint';
+import { ORIGIN_HEADER } from '../origin';
 
 export interface AudioTranscribeOptions {
   model?: string;
@@ -55,7 +55,7 @@ export async function audioTranscribeCommand(
 
   const response = await fetchFn(`${routerUrl}${ENDPOINTS.audioTranscriptions}`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, ...ENTRYPOINT_HEADER },
+    headers: { Authorization: `Bearer ${token}`, ...ORIGIN_HEADER },
     body: form,
   });
 
