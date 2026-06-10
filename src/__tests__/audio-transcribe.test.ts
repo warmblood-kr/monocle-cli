@@ -8,10 +8,12 @@ describe('audioTranscribeCommand', () => {
   it('POSTs multipart to /v1/audio/transcriptions and writes body to stdout', async () => {
     let capturedUrl = '';
     let capturedAuth = '';
+    let capturedOrigin = '';
     let capturedBody: any = null;
     const fetchFn = (async (url: string, init: any) => {
       capturedUrl = url;
       capturedAuth = init.headers.Authorization;
+      capturedOrigin = init.headers['x-monocle-origin'];
       capturedBody = init.body;
       return {
         ok: true,
@@ -39,6 +41,7 @@ describe('audioTranscribeCommand', () => {
 
     expect(capturedUrl).toBe('https://router.example.com/v1/audio/transcriptions');
     expect(capturedAuth).toBe('Bearer access-abc');
+    expect(capturedOrigin).toBe('cli');
     expect(capturedBody).toBeInstanceOf(FormData);
     expect(capturedBody.get('model')).toBe('gpt-4o-mini-transcribe');
     expect(capturedBody.get('language')).toBe('en');

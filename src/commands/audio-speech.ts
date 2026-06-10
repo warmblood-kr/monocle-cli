@@ -9,6 +9,7 @@ import {
   writeBinaryOutput,
 } from '../audio-io';
 import { ENDPOINTS } from '../endpoints';
+import { ORIGIN_HEADER } from '../origin';
 
 export interface AudioSpeechOptions {
   model?: string;
@@ -65,6 +66,7 @@ export async function audioSpeechCommand(
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
+      ...ORIGIN_HEADER,
     },
     body: JSON.stringify(payload),
   });

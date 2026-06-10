@@ -2,6 +2,7 @@ import { Credentials } from '../credentials';
 import { RefreshDeps } from '../refresh';
 import { getAccessToken } from '../auth';
 import { ENDPOINTS } from '../endpoints';
+import { ORIGIN_HEADER } from '../origin';
 
 export interface ModelListDeps {
   credentials?: Credentials;
@@ -28,7 +29,7 @@ export async function modelListCommand(deps?: ModelListDeps): Promise<void> {
   const { token, routerUrl } = await getAccessToken(deps);
 
   const response = await fetchFn(`${routerUrl}${ENDPOINTS.models}`, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${token}`, ...ORIGIN_HEADER },
   });
 
   if (!response.ok) {

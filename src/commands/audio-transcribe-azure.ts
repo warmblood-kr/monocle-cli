@@ -7,6 +7,7 @@ import {
   writeApiErrorAndExit,
 } from '../audio-io';
 import { ENDPOINTS } from '../endpoints';
+import { ORIGIN_HEADER } from '../origin';
 
 export interface AudioTranscribeAzureOptions {
   locales?: string[];
@@ -82,7 +83,7 @@ export async function audioTranscribeAzureCommand(
 
   const response = await fetchFn(`${routerUrl}${ENDPOINTS.azureSpeechToText}`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${token}`, ...ORIGIN_HEADER },
     body: form,
   });
 

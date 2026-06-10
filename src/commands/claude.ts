@@ -1,5 +1,6 @@
 import * as child_process from 'child_process';
 import { Credentials } from '../credentials';
+import { MONOCLE_ORIGIN } from '../origin';
 
 export interface ClaudeDeps {
   credentials?: Credentials;
@@ -45,6 +46,15 @@ export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<
     }
   }
   childEnv.ANTHROPIC_BASE_URL = routerUrl;
+
+  // Make the spawned Claude Code attribute its chat-proxy usage to the "cli" surface.
+  // Claude Code reads ANTHROPIC_CUSTOM_HEADERS as newline-separated `Name: Value` lines;
+  // merge so we don't clobber any headers the user already set.
+  const originLine = `x-monocle-origin: ${MONOCLE_ORIGIN}`;
+  const existingHeaders = childEnv.ANTHROPIC_CUSTOM_HEADERS;
+  childEnv.ANTHROPIC_CUSTOM_HEADERS = existingHeaders
+    ? `${existingHeaders}\n${originLine}`
+    : originLine;
 
   const child = spawnFn('claude', ['--settings', inlineSettings, ...args], {
     env: childEnv,
