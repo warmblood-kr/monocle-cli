@@ -7,9 +7,11 @@ import { makeStream } from './helpers/streams';
 describe('audioTranscribeAzureCommand', () => {
   it('POSTs to the Azure Fast endpoint with audio + definition parts', async () => {
     let capturedUrl = '';
+    let capturedOrigin = '';
     let capturedBody: any = null;
     const fetchFn = (async (url: string, init: any) => {
       capturedUrl = url;
+      capturedOrigin = init.headers['x-monocle-origin'];
       capturedBody = init.body;
       return {
         ok: true,
@@ -45,6 +47,7 @@ describe('audioTranscribeAzureCommand', () => {
       'https://router.example.com/v1/speechtotext/transcriptions:transcribe',
     );
     expect(capturedBody).toBeInstanceOf(FormData);
+    expect(capturedOrigin).toBe('cli');
     expect(capturedBody.get('audio')).toBeTruthy();
     const definitionPart = capturedBody.get('definition');
     expect(typeof definitionPart).toBe('string');

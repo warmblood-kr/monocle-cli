@@ -44,6 +44,7 @@ describe('audioSpeechCommand', () => {
     expect(capturedUrl).toBe('https://router.example.com/v1/audio/speech');
     expect(capturedHeaders.Authorization).toBe('Bearer access-abc');
     expect(capturedHeaders['Content-Type']).toBe('application/json');
+    expect(capturedHeaders['x-monocle-origin']).toBe('cli');
     const payload = JSON.parse(capturedBody);
     expect(payload).toMatchObject({
       model: 'gpt-4o-mini-tts',

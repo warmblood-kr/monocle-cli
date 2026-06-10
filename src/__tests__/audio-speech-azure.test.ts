@@ -48,6 +48,7 @@ describe('audioSpeechAzureCommand', () => {
     expect(capturedHeaders['X-Microsoft-OutputFormat']).toBe(
       'audio-16khz-32kbitrate-mono-mp3',
     );
+    expect(capturedHeaders['x-monocle-origin']).toBe('cli');
     expect(capturedBody).toContain('<speak');
     expect(writtenPath).toBe('/tmp/o.mp3');
     expect(writtenBytes.equals(Buffer.from([1, 2, 3]))).toBe(true);
