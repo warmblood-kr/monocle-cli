@@ -6,16 +6,33 @@
 
 ## Prerequisites
 
-- **Node.js** 18+ — check with `node -v`
+None. `monocle` is a single self-contained binary — no Node.js, no npm, no runtime to install.
 
 ## 🚀 Setup
 
+Install with one command (downloads a prebuilt binary from GitHub Releases):
+
+**macOS / Linux**
+
 ```bash
-npm install -g @warmblood/monocle-cli
+curl -fsSL https://raw.githubusercontent.com/warmblood-kr/monocle-cli/main/install.sh | sh
 monocle login
 ```
 
-A browser opens — sign in with your organization account.
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/warmblood-kr/monocle-cli/main/install.ps1 | iex
+monocle login
+```
+
+A browser opens — sign in with your organization account. In headless/SSH
+environments it falls back automatically to device-code login (or force it with
+`monocle login --device-code`).
+
+> Prefer to build from source? With a Rust toolchain installed:
+> `cargo install --git https://github.com/warmblood-kr/monocle-cli` (or
+> `git clone … && cargo build --release` → `target/release/monocle`).
 
 ## ✅ Check status
 

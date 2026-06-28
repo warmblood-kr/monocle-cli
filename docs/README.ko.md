@@ -6,16 +6,31 @@
 
 ## 시작하기 전에
 
-- **Node.js** 18 이상 — `node -v`로 확인해 주세요
+없어요. `monocle`은 단일 실행 파일이라 Node.js·npm·별도 런타임 설치가 필요 없어요.
 
 ## 🚀 설정
 
+명령 한 줄로 설치돼요 (GitHub Releases에서 미리 빌드된 바이너리를 내려받아요):
+
+**macOS / Linux**
+
 ```bash
-npm install -g @warmblood/monocle-cli
+curl -fsSL https://raw.githubusercontent.com/warmblood-kr/monocle-cli/main/install.sh | sh
 monocle login
 ```
 
-브라우저가 열리면 회사 계정으로 로그인해 주세요.
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/warmblood-kr/monocle-cli/main/install.ps1 | iex
+monocle login
+```
+
+브라우저가 열리면 회사 계정으로 로그인해 주세요. SSH·헤드리스 환경에서는
+자동으로 device-code 로그인으로 전환돼요 (`monocle login --device-code`로 강제할 수도 있어요).
+
+> 소스에서 직접 빌드하려면 Rust 툴체인 설치 후
+> `cargo install --git https://github.com/warmblood-kr/monocle-cli` 를 쓰세요.
 
 ## ✅ 상태 확인
 
