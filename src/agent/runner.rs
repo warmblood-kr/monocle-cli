@@ -5,11 +5,11 @@
 //! a real scoped-approval / sandboxing policy plugs in here later). An `Observer`
 //! surfaces the loop's steps (the CLI prints them; tests stay silent).
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::agent::providers::{ChatRequest, LlmProvider, Message};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
-use crate::error::{AppError, Result};
+use crate::error::Result;
 
 /// Decides whether a *side-effecting* tool call may run. Read-only tools are not
 /// gated. (Default policies: [`AllowAll`].)
@@ -82,6 +82,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
         observer: &mut dyn Observer,
     ) -> Result<String> {
         let defs = self.tools.defs();
+        let mut last_text = String::new();
 
         for _step in 0..self.config.max_steps {
             let resp = self.provider.chat(&ChatRequest {
@@ -99,6 +100,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
 
             if !resp.content.is_empty() {
                 observer.on_text(&resp.content);
+                last_text = resp.content.clone();
             }
             // Replay the assistant's tool-call turn before the matching results.
             messages.push(Message::assistant_with_tool_calls(
@@ -107,8 +109,20 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
             ));
 
             for call in &resp.tool_calls {
-                let args: Value =
-                    serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}));
+                // Surface malformed arguments back to the model (as a tool error)
+                // instead of silently running the tool with `{}` — let it self-correct.
+                let args: Value = match serde_json::from_str(&call.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let outcome = ToolOutcome::error(format!(
+                            "invalid arguments for `{}` (not valid JSON): {e}",
+                            call.function.name
+                        ));
+                        observer.on_tool_result(&call.function.name, &outcome);
+                        messages.push(Message::tool(call.id.clone(), outcome.content.clone()));
+                        continue;
+                    }
+                };
                 observer.on_tool_call(&call.function.name, &args);
 
                 let side_effecting = self
@@ -128,9 +142,16 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
             }
         }
 
-        Err(AppError::new(format!(
-            "agent did not finish within {} steps",
+        // Step budget exhausted: don't throw away work — return the best text so
+        // far with a clear notice (graceful stop, not a hard error).
+        let notice = format!(
+            "[agent stopped after {} steps without finishing]",
             self.config.max_steps
-        )))
+        );
+        Ok(if last_text.is_empty() {
+            notice
+        } else {
+            format!("{last_text}\n\n{notice}")
+        })
     }
 }

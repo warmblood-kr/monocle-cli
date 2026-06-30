@@ -136,13 +136,50 @@ fn loop_stops_at_max_steps() {
     config.max_steps = 3;
     let agent = Agent::new(&provider, &tools, ToolContext::new(dir.path()), config);
 
-    let err = agent
+    // Graceful stop: returns a notice (not a hard error) so partial work isn't lost.
+    let answer = agent
         .run(
             vec![Message::user("loop forever")],
             &mut AllowAll,
             &mut Silent,
         )
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("did not finish within 3 steps"), "got: {err}");
+        .unwrap();
+    assert!(answer.contains("stopped after 3 steps"), "got: {answer}");
+}
+
+#[test]
+fn malformed_tool_args_are_reported_to_model_not_swallowed() {
+    // First turn: a tool call whose `arguments` is not valid JSON. Once the model
+    // sees the error tool-result, it recovers with a final answer.
+    let s = stub(|_a, _m, url, body| {
+        if !url.starts_with("/v1/chat/completions") {
+            return (404, String::new());
+        }
+        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+        let seen_tool = req["messages"]
+            .as_array()
+            .map(|ms| ms.iter().any(|m| m["role"] == "tool"))
+            .unwrap_or(false);
+        if seen_tool {
+            (200, json!({"choices":[{"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}]}).to_string())
+        } else {
+            (200, json!({"choices":[{"message":{"role":"assistant","content":"","tool_calls":[
+                {"id":"c","type":"function","function":{"name":"write_file","arguments":"{not json"}}
+            ]},"finish_reason":"tool_calls"}]}).to_string())
+        }
+    });
+    let provider = MonocleProvider::new("tok", s.router_url());
+    let tools = ToolRegistry::with_defaults();
+    let dir = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        &provider,
+        &tools,
+        ToolContext::new(dir.path()),
+        AgentConfig::new("any"),
+    );
+
+    let answer = agent
+        .run(vec![Message::user("do it")], &mut AllowAll, &mut Silent)
+        .unwrap();
+    assert_eq!(answer, "recovered");
 }

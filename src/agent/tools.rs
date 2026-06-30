@@ -109,11 +109,25 @@ impl Tool for ReadFile {
             Err(e) => return e,
         };
         match std::fs::read_to_string(ctx.resolve(path)) {
-            Ok(content) => ToolOutcome::ok(content),
+            // Cap large reads so one file can't blow the model's context window.
+            Ok(content) => {
+                let total = content.chars().count();
+                if total > MAX_READ_CHARS {
+                    let head: String = content.chars().take(MAX_READ_CHARS).collect();
+                    ToolOutcome::ok(format!(
+                        "{head}\n\n[truncated: showing first {MAX_READ_CHARS} of {total} characters]"
+                    ))
+                } else {
+                    ToolOutcome::ok(content)
+                }
+            }
             Err(e) => ToolOutcome::error(format!("read_file failed for {path}: {e}")),
         }
     }
 }
+
+/// Cap on `read_file` output (characters) to protect the context window.
+const MAX_READ_CHARS: usize = 50_000;
 
 // ── write_file ─────────────────────────────────────────────────────────────
 
