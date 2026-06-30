@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod audio_speech;
 pub mod audio_speech_azure;
 pub mod audio_transcribe;

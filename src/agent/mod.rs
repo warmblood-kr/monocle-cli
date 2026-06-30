@@ -5,3 +5,5 @@
 //! tools, permission/sandboxing, session, and ACP surface come later.
 
 pub mod providers;
+pub mod runner;
+pub mod tools;

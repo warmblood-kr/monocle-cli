@@ -36,6 +36,7 @@ fn non_streaming_turn_returns_assistant_content() {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::system("be terse"), Message::user("hi")],
             max_tokens: Some(64),
+            ..Default::default()
         })
         .unwrap();
 
@@ -57,6 +58,7 @@ fn same_provider_swaps_model_vendor_agnostically() {
                 model: model.into(),
                 messages: vec![Message::user("hi")],
                 max_tokens: None,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(resp.content, format!("echo:{model}"));
@@ -74,6 +76,7 @@ fn non_200_is_an_error() {
             model: "any".into(),
             messages: vec![Message::user("hi")],
             max_tokens: None,
+            ..Default::default()
         })
         .unwrap_err()
         .to_string();
