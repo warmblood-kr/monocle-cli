@@ -105,3 +105,30 @@ fn chat_errors_when_response_has_no_choices() {
         .to_string();
     assert!(err.contains("no choices"), "got: {err}");
 }
+
+#[test]
+fn tool_call_with_empty_id_gets_synthesized_id() {
+    // Finding #4 (non-streaming path): a tool call served with an empty `id` would
+    // break ACP correlation; the provider synthesizes a stable id from position.
+    let s = stub(|_a, _m, url, _b| {
+        if url.starts_with("/v1/chat/completions") {
+            (
+                200,
+                r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+                    .to_string(),
+            )
+        } else {
+            (404, String::new())
+        }
+    });
+    let provider = MonocleProvider::new("tok", s.router_url());
+    let resp = provider
+        .chat(&ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert_eq!(resp.tool_calls[0].id, "call_0");
+}

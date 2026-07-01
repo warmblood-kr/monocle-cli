@@ -61,6 +61,8 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
     },
+    /// [Experimental] Run as an ACP agent over stdio (editors / desktop / Craft)
+    Acp,
     /// List available models from the Monocle router
     Models,
     /// Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
@@ -73,10 +75,10 @@ enum Commands {
         #[arg(long)]
         workdir: Option<String>,
         /// Model id to use (routed via Monocle)
-        #[arg(long, default_value = "claude-sonnet-4-6")]
+        #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
         model: String,
         /// Maximum loop steps before giving up
-        #[arg(long = "max-steps", default_value = "20")]
+        #[arg(long = "max-steps", default_value_t = monocle_cli::agent::DEFAULT_MAX_STEPS)]
         max_steps: usize,
         /// Named session to persist/resume (~/.monocle/agent/<name>.jsonl)
         #[arg(long)]
@@ -98,7 +100,7 @@ enum Commands {
 #[derive(Args)]
 struct ChatArgs {
     /// Model ID to use
-    #[arg(long, default_value = "claude-sonnet-4-6")]
+    #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
     model: String,
     /// System prompt text
     #[arg(long = "system-prompt")]
@@ -244,6 +246,7 @@ fn main() {
             claude_command(&creds, &args);
             Ok(())
         }
+        Commands::Acp => monocle_cli::acp::serve(),
         Commands::Models => model_list_command(&client, &creds),
         Commands::Chat(args) => chat_command(&client, &creds, args.into()),
         Commands::Agent {

@@ -66,3 +66,30 @@ data: [DONE]\n\n";
     );
     assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
 }
+
+#[test]
+fn streamed_tool_call_with_empty_id_gets_synthesized_id() {
+    // Finding #4: a streamed tool call may arrive with no `id` (acc.id stays "").
+    // ACP correlates ToolCall/permission/ToolCallUpdate by id, so finalize must
+    // synthesize a stable non-empty id from position.
+    let s = stub_sse(|_a, _m, url, _b| {
+        if !url.starts_with("/v1/chat/completions") {
+            return (404, String::new());
+        }
+        let body = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n";
+        (200, body.to_string())
+    });
+    let provider = MonocleProvider::new("tok", s.router_url());
+
+    let resp = provider.chat_stream(&req(), &mut |_d| {}).unwrap();
+
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert!(
+        !resp.tool_calls[0].id.is_empty(),
+        "empty id must be synthesized"
+    );
+    assert_eq!(resp.tool_calls[0].id, "call_0");
+}

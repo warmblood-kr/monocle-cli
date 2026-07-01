@@ -38,23 +38,27 @@ impl Cancel {
 /// Decides whether a *side-effecting* tool call may run. Read-only tools are not
 /// gated. (Default policies: [`AllowAll`].)
 pub trait Approver {
-    fn approve(&mut self, tool_name: &str, args: &Value) -> bool;
+    fn approve(&mut self, id: &str, tool_name: &str, args: &Value) -> bool;
 }
 
 /// Approve everything — for tests and explicit local "yolo" runs.
 pub struct AllowAll;
 impl Approver for AllowAll {
-    fn approve(&mut self, _tool_name: &str, _args: &Value) -> bool {
+    fn approve(&mut self, _id: &str, _tool_name: &str, _args: &Value) -> bool {
         true
     }
 }
 
 /// Observes loop steps (for printing / logging). Default = no-op ([`Silent`]).
+///
+/// The `id` on the tool callbacks is the LLM tool-call id (`call.id`), which ties
+/// a call's start (`on_tool_call`) to its completion (`on_tool_result`) — the ACP
+/// surface uses it to correlate `ToolCall` / `ToolCallUpdate` lifecycle updates.
 pub trait Observer {
     /// A chunk of assistant text as it streams in.
     fn on_text_delta(&mut self, _delta: &str) {}
-    fn on_tool_call(&mut self, _name: &str, _args: &Value) {}
-    fn on_tool_result(&mut self, _name: &str, _outcome: &ToolOutcome) {}
+    fn on_tool_call(&mut self, _id: &str, _name: &str, _args: &Value) {}
+    fn on_tool_result(&mut self, _id: &str, _name: &str, _outcome: &ToolOutcome) {}
     /// A meta/control notice (stopped, cancelled) — NOT model answer text, so the
     /// CLI keeps it off the stdout answer channel.
     fn on_notice(&mut self, _msg: &str) {}
@@ -62,6 +66,20 @@ pub trait Observer {
 
 pub struct Silent;
 impl Observer for Silent {}
+
+/// Why the loop stopped — the *real* stop reason, reported to callers (the ACP
+/// surface maps it to a `StopReason`). Distinguishing these lets a cancel that
+/// lands during the final step be reported as cancelled rather than a completed
+/// answer, and a step-budget exhaustion as its own condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStop {
+    /// The model returned a final answer with no tool calls (normal completion).
+    EndTurn,
+    /// Cancellation was observed at a step boundary; the loop stopped gracefully.
+    Cancelled,
+    /// The step budget (`max_steps`) was exhausted before the model finished.
+    MaxSteps,
+}
 
 pub struct AgentConfig {
     pub model: String,
@@ -101,29 +119,39 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
         }
     }
 
+    /// Convenience constructor for the default config with a custom step budget —
+    /// the shape both `monocle agent` and the ACP surface build. Keeps the
+    /// `AgentConfig::new` + `max_steps` two-step in one place.
+    pub fn with_max_steps(
+        provider: &'a P,
+        tools: &'a ToolRegistry,
+        ctx: ToolContext,
+        model: impl Into<String>,
+        max_steps: usize,
+    ) -> Self {
+        let mut config = AgentConfig::new(model);
+        config.max_steps = max_steps;
+        Self::new(provider, tools, ctx, config)
+    }
+
     /// Run the loop to completion, appending this turn's assistant/tool messages
     /// to `conversation` (so callers can continue a multi-turn session) and
-    /// returning the model's final text answer.
+    /// reporting *why* it stopped (see [`RunStop`]). The model's streamed text is
+    /// surfaced through the observer and appended to the conversation, not returned.
     pub fn run(
         &self,
         conversation: &mut Vec<Message>,
         approver: &mut dyn Approver,
         observer: &mut dyn Observer,
         cancel: &Cancel,
-    ) -> Result<String> {
+    ) -> Result<RunStop> {
         let defs = self.tools.defs();
-        let mut last_text = String::new();
 
         for _step in 0..self.config.max_steps {
             // Cancellation is checked at each step boundary (graceful stop).
             if cancel.is_cancelled() {
-                let notice = "[agent cancelled]".to_string();
-                observer.on_notice(&notice);
-                return Ok(if last_text.is_empty() {
-                    notice
-                } else {
-                    format!("{last_text}\n\n{notice}")
-                });
+                observer.on_notice("[agent cancelled]");
+                return Ok(RunStop::Cancelled);
             }
             let req = ChatRequest {
                 model: self.config.model.clone(),
@@ -137,15 +165,12 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                 .chat_stream(&req, &mut |delta| observer.on_text_delta(delta))?;
 
             // No tool calls → this is the final answer (already streamed to the
-            // observer; also returned for programmatic / multi-turn callers).
+            // observer; appended to the conversation for multi-turn callers).
             if resp.tool_calls.is_empty() {
                 conversation.push(Message::assistant(resp.content.clone()));
-                return Ok(resp.content);
+                return Ok(RunStop::EndTurn);
             }
 
-            if !resp.content.is_empty() {
-                last_text = resp.content.clone();
-            }
             // Replay the assistant's tool-call turn before the matching results.
             conversation.push(Message::assistant_with_tool_calls(
                 resp.content.clone(),
@@ -158,16 +183,22 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                 let args: Value = match serde_json::from_str(&call.function.arguments) {
                     Ok(v) => v,
                     Err(e) => {
+                        // Emit the ToolCall first (with the raw args as a JSON string)
+                        // so an ACP client has a real ToolCall to correlate the
+                        // failure to — otherwise the ToolCallUpdate is an orphan and
+                        // the failure is invisible.
+                        let args_repr = Value::String(call.function.arguments.clone());
+                        observer.on_tool_call(&call.id, &call.function.name, &args_repr);
                         let outcome = ToolOutcome::error(format!(
                             "invalid arguments for `{}` (not valid JSON): {e}",
                             call.function.name
                         ));
-                        observer.on_tool_result(&call.function.name, &outcome);
+                        observer.on_tool_result(&call.id, &call.function.name, &outcome);
                         conversation.push(Message::tool(call.id.clone(), outcome.llm.clone()));
                         continue;
                     }
                 };
-                observer.on_tool_call(&call.function.name, &args);
+                observer.on_tool_call(&call.id, &call.function.name, &args);
 
                 let side_effecting = self
                     .tools
@@ -175,28 +206,32 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                     .map(|t| t.is_side_effecting())
                     .unwrap_or(true);
 
-                let outcome = if side_effecting && !approver.approve(&call.function.name, &args) {
-                    ToolOutcome::error(format!("tool call `{}` denied", call.function.name))
-                } else {
-                    self.tools.run(&self.ctx, &call.function.name, &args)
-                };
+                let outcome =
+                    if side_effecting && !approver.approve(&call.id, &call.function.name, &args) {
+                        ToolOutcome::error(format!("tool call `{}` denied", call.function.name))
+                    } else {
+                        self.tools.run(&self.ctx, &call.function.name, &args)
+                    };
 
-                observer.on_tool_result(&call.function.name, &outcome);
+                observer.on_tool_result(&call.id, &call.function.name, &outcome);
                 conversation.push(Message::tool(call.id.clone(), outcome.llm.clone()));
+
+                // A cancel that landed during this tool (e.g. a killed shell
+                // command) should stop us promptly: skip the remaining tool calls
+                // in this step so the top-of-step check reports `Cancelled` rather
+                // than running more side effects first.
+                if cancel.is_cancelled() {
+                    break;
+                }
             }
         }
 
-        // Step budget exhausted: don't throw away work — return the best text so
-        // far with a clear notice (graceful stop, not a hard error).
-        let notice = format!(
+        // Step budget exhausted: stop gracefully (not a hard error) with a clear
+        // notice; any streamed text is already in the observer / conversation.
+        observer.on_notice(&format!(
             "[agent stopped after {} steps without finishing]",
             self.config.max_steps
-        );
-        observer.on_notice(&notice);
-        Ok(if last_text.is_empty() {
-            notice
-        } else {
-            format!("{last_text}\n\n{notice}")
-        })
+        ));
+        Ok(RunStop::MaxSteps)
     }
 }

@@ -140,6 +140,18 @@ pub struct ChatResponse {
     pub finish_reason: Option<String>,
 }
 
+/// Ensure every assembled tool call has a non-empty `id`, synthesizing a stable
+/// `call_{i}` from position when the wire delivered an empty one. Downstream (ACP)
+/// correlates `ToolCall` / permission / `ToolCallUpdate` by this id, so an empty id
+/// would silently break that correlation. Non-empty ids are left untouched.
+fn ensure_tool_call_ids(tool_calls: &mut [ToolCall]) {
+    for (i, tc) in tool_calls.iter_mut().enumerate() {
+        if tc.id.is_empty() {
+            tc.id = format!("call_{i}");
+        }
+    }
+}
+
 /// Parse an OpenAI-compatible (non-streaming) chat completion body. Errors on a
 /// body with no `choices` (e.g. an error-shaped response) rather than silently
 /// returning an empty assistant turn that the loop would treat as a final answer.
@@ -151,8 +163,9 @@ fn parse_response_value(data: &Value) -> Result<ChatResponse> {
     }
     let message = &data["choices"][0]["message"];
     let content = message["content"].as_str().unwrap_or_default().to_string();
-    let tool_calls: Vec<ToolCall> =
+    let mut tool_calls: Vec<ToolCall> =
         serde_json::from_value(message["tool_calls"].clone()).unwrap_or_default();
+    ensure_tool_call_ids(&mut tool_calls);
     let model = data["model"].as_str().map(String::from);
     let finish_reason = data["choices"][0]["finish_reason"]
         .as_str()
@@ -335,7 +348,7 @@ impl LlmProvider for MonocleProvider {
             }
         }
 
-        let tool_calls = tool_acc
+        let mut tool_calls: Vec<ToolCall> = tool_acc
             .into_iter()
             .filter(|a| !a.name.is_empty())
             .map(|a| ToolCall {
@@ -347,6 +360,7 @@ impl LlmProvider for MonocleProvider {
                 },
             })
             .collect();
+        ensure_tool_call_ids(&mut tool_calls);
 
         Ok(ChatResponse {
             content,

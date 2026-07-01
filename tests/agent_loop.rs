@@ -9,9 +9,9 @@ use common::{
 };
 use monocle_cli::agent::providers::Message;
 use monocle_cli::agent::runner::{
-    Agent, AgentConfig, AllowAll, Approver, Cancel, Observer, Silent,
+    Agent, AgentConfig, AllowAll, Approver, Cancel, Observer, RunStop, Silent,
 };
-use monocle_cli::agent::tools::{ToolContext, ToolRegistry};
+use monocle_cli::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 
 // These tests exercise the loop IN ISOLATION via a scripted `FakeProvider` — no
 // HTTP, no wire format. The wire (Chat Completions / SSE) is covered separately
@@ -50,7 +50,7 @@ fn loop_executes_tool_then_returns_final_answer() {
         calls: Vec<String>,
     }
     impl Observer for Rec {
-        fn on_tool_call(&mut self, name: &str, _args: &Value) {
+        fn on_tool_call(&mut self, _id: &str, name: &str, _args: &Value) {
             self.calls.push(name.to_string());
         }
     }
@@ -60,11 +60,13 @@ fn loop_executes_tool_then_returns_final_answer() {
         Message::system("be helpful"),
         Message::user("write out.txt"),
     ];
-    let answer = agent
+    let stop = agent
         .run(&mut convo, &mut AllowAll, &mut rec, &Cancel::new())
         .unwrap();
 
-    assert_eq!(answer, "done");
+    // A plain text answer ends the turn normally; the final text lands in the convo.
+    assert!(matches!(stop, RunStop::EndTurn));
+    assert_eq!(convo.last().unwrap().content.as_deref(), Some("done"));
     assert_eq!(rec.calls, vec!["write_file"]);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
@@ -87,12 +89,12 @@ fn denied_side_effecting_tool_is_not_executed() {
 
     struct DenyAll;
     impl Approver for DenyAll {
-        fn approve(&mut self, _name: &str, _args: &Value) -> bool {
+        fn approve(&mut self, _id: &str, _name: &str, _args: &Value) -> bool {
             false
         }
     }
 
-    let answer = agent
+    let stop = agent
         .run(
             &mut vec![Message::user("write out.txt")],
             &mut DenyAll,
@@ -101,7 +103,7 @@ fn denied_side_effecting_tool_is_not_executed() {
         )
         .unwrap();
 
-    assert_eq!(answer, "done");
+    assert!(matches!(stop, RunStop::EndTurn));
     assert!(
         !dir.path().join("out.txt").exists(),
         "denied write must not touch disk"
@@ -117,7 +119,7 @@ fn loop_stops_at_max_steps() {
     let dir = tempfile::tempdir().unwrap();
     let agent = agent(&provider, &tools, dir.path(), 3);
 
-    let answer = agent
+    let stop = agent
         .run(
             &mut vec![Message::user("loop forever")],
             &mut AllowAll,
@@ -125,7 +127,7 @@ fn loop_stops_at_max_steps() {
             &Cancel::new(),
         )
         .unwrap();
-    assert!(answer.contains("stopped after 3 steps"), "got: {answer}");
+    assert!(matches!(stop, RunStop::MaxSteps), "expected MaxSteps");
 }
 
 #[test]
@@ -141,16 +143,16 @@ fn conversation_persists_across_turns() {
     let agent = agent(&provider, &tools, dir.path(), 20);
 
     let mut convo = vec![Message::system("s"), Message::user("first")];
-    let a1 = agent
+    agent
         .run(&mut convo, &mut AllowAll, &mut Silent, &Cancel::new())
         .unwrap();
-    assert_eq!(a1, "seen 1");
+    assert_eq!(convo.last().unwrap().content.as_deref(), Some("seen 1"));
 
     convo.push(Message::user("second"));
-    let a2 = agent
+    agent
         .run(&mut convo, &mut AllowAll, &mut Silent, &Cancel::new())
         .unwrap();
-    assert_eq!(a2, "seen 2");
+    assert_eq!(convo.last().unwrap().content.as_deref(), Some("seen 2"));
 
     // system, user, assistant, user, assistant
     assert_eq!(convo.len(), 5);
@@ -169,7 +171,7 @@ fn malformed_tool_args_are_reported_to_model_not_swallowed() {
     let dir = tempfile::tempdir().unwrap();
     let agent = agent(&provider, &tools, dir.path(), 20);
 
-    let answer = agent
+    let stop = agent
         .run(
             &mut vec![Message::user("do it")],
             &mut AllowAll,
@@ -177,7 +179,55 @@ fn malformed_tool_args_are_reported_to_model_not_swallowed() {
             &Cancel::new(),
         )
         .unwrap();
-    assert_eq!(answer, "recovered");
+    assert!(matches!(stop, RunStop::EndTurn));
+}
+
+#[test]
+fn malformed_tool_args_emit_tool_call_before_result() {
+    // Finding #2: even for unparseable args the loop must first surface a
+    // `on_tool_call` (so an ACP client has a ToolCall to correlate) and THEN the
+    // failure `on_tool_result` — never an orphan result the client ignores.
+    let provider = FakeProvider::new(|req| {
+        if has_tool_result(req) {
+            text_response("recovered")
+        } else {
+            tool_call_response_raw("c", "write_file", "{not json")
+        }
+    });
+    let tools = ToolRegistry::with_defaults();
+    let dir = tempfile::tempdir().unwrap();
+    let agent = agent(&provider, &tools, dir.path(), 20);
+
+    #[derive(Default)]
+    struct Rec {
+        events: Vec<String>,
+    }
+    impl Observer for Rec {
+        fn on_tool_call(&mut self, id: &str, name: &str, args: &Value) {
+            // args_repr for malformed input is the raw string wrapped as a JSON string.
+            self.events
+                .push(format!("call:{id}:{name}:str={}", args.is_string()));
+        }
+        fn on_tool_result(&mut self, id: &str, name: &str, _o: &ToolOutcome) {
+            self.events.push(format!("result:{id}:{name}"));
+        }
+    }
+    let mut rec = Rec::default();
+
+    agent
+        .run(
+            &mut vec![Message::user("do it")],
+            &mut AllowAll,
+            &mut rec,
+            &Cancel::new(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        rec.events,
+        vec!["call:c:write_file:str=true", "result:c:write_file"],
+        "on_tool_call must precede on_tool_result, both present"
+    );
 }
 
 #[test]
@@ -197,7 +247,7 @@ fn loop_can_be_cancelled_mid_run() {
     let dir = tempfile::tempdir().unwrap();
     let agent = agent(&provider, &tools, dir.path(), 100);
 
-    let answer = agent
+    let stop = agent
         .run(
             &mut vec![Message::user("go")],
             &mut AllowAll,
@@ -205,5 +255,5 @@ fn loop_can_be_cancelled_mid_run() {
             &cancel,
         )
         .unwrap();
-    assert!(answer.contains("cancelled"), "got: {answer}");
+    assert!(matches!(stop, RunStop::Cancelled), "expected Cancelled");
 }

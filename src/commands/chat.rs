@@ -3,6 +3,7 @@ use std::io::{IsTerminal, Write};
 use serde_json::Value;
 
 use crate::agent::providers::{ChatRequest, LlmProvider, Message, MonocleProvider};
+use crate::agent::DEFAULT_MODEL;
 use crate::auth::get_access_token;
 use crate::credentials::Credentials;
 use crate::endpoints;
@@ -10,7 +11,6 @@ use crate::error::Result;
 use crate::net::Client;
 use crate::origin::auth_headers;
 
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_MAX_TOKENS: i64 = 4096;
 
 pub struct ChatOptions {

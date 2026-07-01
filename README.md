@@ -58,6 +58,8 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
+| `monocle agent [prompt] [--workdir <dir>] [--model <id>] [--max-steps <n>] [--session <name>]` | **Experimental.** Headless agent loop with tools (read/write/edit + shell) |
+| `monocle acp` | **Experimental.** Run as an [ACP](https://agentclientprotocol.com) agent over stdio (for editors / desktop / Craft) |
 
 ## 💬 Chat with models
 
@@ -183,6 +185,28 @@ Other terminals and IDE integrations running plain `claude` are unaffected. To g
 
 > [!NOTE]
 > See **[Claude Code integration details](./docs/claude-code.md)** for `ANTHROPIC_API_KEY` handling, global setup, and troubleshooting.
+
+## 🧪 Experimental: agent & ACP
+
+> These are **experimental** and evolving. They require you to be logged in — every
+> LLM call is routed through Monocle (your chosen model, via `monocle login`).
+
+**`monocle agent`** runs a headless agent loop with file (read/write/edit) and shell
+tools in a working directory. Give it a task as an argument, pipe it via stdin, or omit
+it for an interactive REPL. Progress goes to stderr, the answer to stdout; `--session
+<name>` persists/resumes a conversation.
+
+```bash
+monocle agent "summarize the TODOs in this repo" --workdir .
+```
+
+> ⚠️ Tools are auto-approved (read/write/edit + shell). Run only in a directory you trust.
+
+**`monocle acp`** runs Monocle as an **[Agent Client Protocol](https://agentclientprotocol.com)**
+agent over stdio (JSON-RPC) — an editor, the Monocle desktop app, or Craft spawns it and
+drives sessions. Tool permission is delegated to the client (`session/request_permission`),
+tool calls stream as `ToolCall`/`ToolCallUpdate` updates, and a client may pick the model
+per session via `_meta.monocle.model` on `session/new` (falls back to the default).
 
 ## 🔌 Using Monocle from your own app (OpenAI-compatible SDK)
 
