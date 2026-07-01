@@ -11,12 +11,14 @@ use serde_json::Value;
 
 use crate::agent::providers::{LlmProvider, Message, MonocleProvider};
 use crate::agent::runner::{Agent, AgentConfig, AllowAll, Cancel, Observer};
+use crate::agent::session::{session_path, SessionStore};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::auth::get_access_token;
 use crate::colors as c;
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
+use crate::util::home_dir;
 
 const SYSTEM_PROMPT: &str = "You are Monocle's headless agent. Use the provided tools \
 (read_file, write_file, edit_file, and the shell) to accomplish the user's task within the \
@@ -27,6 +29,7 @@ pub struct AgentOptions {
     pub workdir: Option<String>,
     pub model: String,
     pub max_steps: usize,
+    pub session: Option<String>,
 }
 
 struct CliObserver;
@@ -86,12 +89,33 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         move || c.cancel()
     });
 
+    // Optional named session: resume by replaying the persisted conversation.
+    let session: Option<SessionStore> = opts
+        .session
+        .as_ref()
+        .map(|name| SessionStore::new(session_path(&home_dir(), name)));
+    let (mut convo, mut persisted) = match &session {
+        Some(store) => {
+            let loaded = store.load()?;
+            if loaded.is_empty() {
+                (vec![Message::system(SYSTEM_PROMPT)], 0)
+            } else {
+                eprintln!(
+                    "{}",
+                    c::dim(&format!("resumed session ({} messages)", loaded.len()))
+                );
+                let n = loaded.len();
+                (loaded, n)
+            }
+        }
+        None => (vec![Message::system(SYSTEM_PROMPT)], 0),
+    };
+
     let interactive = std::io::stdin().is_terminal();
-    let mut convo = vec![Message::system(SYSTEM_PROMPT)];
 
     // Seed the first turn from the prompt arg, or (non-interactive) piped stdin.
     if let Some(p) = opts.prompt {
-        run_turn(&agent, &mut convo, p, &cancel)?;
+        run_turn(&agent, &mut convo, p, &cancel, &session, &mut persisted)?;
     } else if !interactive {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input)?;
@@ -99,7 +123,14 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
             eprintln!("No input provided.");
             std::process::exit(1);
         }
-        run_turn(&agent, &mut convo, input.trim().to_string(), &cancel)?;
+        run_turn(
+            &agent,
+            &mut convo,
+            input.trim().to_string(),
+            &cancel,
+            &session,
+            &mut persisted,
+        )?;
     }
 
     // Piped / one-shot: done. Interactive: keep taking follow-ups in the session.
@@ -128,18 +159,28 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
             eprintln!("Bye.");
             break;
         }
-        run_turn(&agent, &mut convo, msg.to_string(), &cancel)?;
+        run_turn(
+            &agent,
+            &mut convo,
+            msg.to_string(),
+            &cancel,
+            &session,
+            &mut persisted,
+        )?;
     }
     Ok(())
 }
 
 /// Run one user turn to completion: append the message, stream the agent's
 /// answer to stdout (via the observer), and terminate the streamed line.
+#[allow(clippy::too_many_arguments)]
 fn run_turn<P: LlmProvider>(
     agent: &Agent<'_, P>,
     convo: &mut Vec<Message>,
     user: String,
     cancel: &Cancel,
+    session: &Option<SessionStore>,
+    persisted: &mut usize,
 ) -> Result<()> {
     // Clear any cancel from an idle Ctrl-C press before starting this turn.
     cancel.reset();
@@ -148,6 +189,11 @@ fn run_turn<P: LlmProvider>(
     let mut out = std::io::stdout();
     out.write_all(b"\n")?;
     out.flush()?;
+    // Persist this turn's new messages (append-only).
+    if let Some(store) = session {
+        store.append(&convo[*persisted..])?;
+        *persisted = convo.len();
+    }
     Ok(())
 }
 

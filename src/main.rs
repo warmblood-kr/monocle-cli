@@ -78,6 +78,9 @@ enum Commands {
         /// Maximum loop steps before giving up
         #[arg(long = "max-steps", default_value = "20")]
         max_steps: usize,
+        /// Named session to persist/resume (~/.monocle/agent/<name>.jsonl)
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Call audio (STT / TTS) endpoints directly for debugging
     Audio {
@@ -248,6 +251,7 @@ fn main() {
             workdir,
             model,
             max_steps,
+            session,
         } => agent_command(
             &client,
             &creds,
@@ -256,6 +260,7 @@ fn main() {
                 workdir,
                 model,
                 max_steps,
+                session,
             },
         ),
         Commands::Audio { command } => run_audio(&client, &creds, command),
