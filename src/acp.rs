@@ -54,6 +54,9 @@ struct SessionState {
     cwd: PathBuf,
     cancel: Cancel,
     model: String,
+    /// True while a `prompt()` turn is executing for this session. Guards against
+    /// concurrent prompts corrupting the `mem::take`-n conversation (see Fix #8).
+    running: bool,
 }
 
 /// The model id for a session: the client's `_meta["monocle.model"]` if present
@@ -116,6 +119,7 @@ impl Agent for MonocleAgent {
                 cwd: args.cwd,
                 cancel: Cancel::new(),
                 model: session_model(&args.meta),
+                running: false,
             },
         );
         Ok(acp::NewSessionResponse::new(id))
@@ -124,15 +128,22 @@ impl Agent for MonocleAgent {
     async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
         let key = args.session_id.0.to_string();
 
-        // Snapshot the session state (release the RefCell borrow before awaiting).
-        let (mut convo, cwd, cancel, model) = {
+        // Claim the session and MOVE its conversation out for the turn (leaving an
+        // empty Vec behind). Reject an overlapping prompt for the same session —
+        // two turns sharing the mem::take-n state would corrupt it (Fix #8). Keep
+        // this borrow short; it is released before the first await.
+        let (convo, cwd, cancel, model) = {
             let mut sessions = self.sessions.borrow_mut();
             let st = sessions
                 .get_mut(&key)
                 .ok_or_else(acp::Error::invalid_params)?;
+            if st.running {
+                return Err(acp::Error::invalid_params()); // session busy
+            }
+            st.running = true;
             st.cancel.reset();
             (
-                st.convo.clone(),
+                std::mem::take(&mut st.convo),
                 st.cwd.clone(),
                 st.cancel.clone(),
                 st.model.clone(),
@@ -140,15 +151,16 @@ impl Agent for MonocleAgent {
         };
 
         let user = prompt_text(&args.prompt);
-        convo.push(Message::user(user));
-
         let updates = self.updates.clone();
         let sid = args.session_id.clone();
 
         // Run the SYNC agent-core loop off the async thread; stream updates back,
         // and route side-effecting tool permission to the client (the editor
-        // decides via session/request_permission).
+        // decides via session/request_permission). The user message is pushed
+        // INSIDE the closure, only after auth succeeds, so an auth failure leaves
+        // the conversation exactly as it was.
         let joined = tokio::task::spawn_blocking(move || {
+            let mut convo = convo;
             let mut observer = AcpObserver {
                 updates: updates.clone(),
                 sid: sid.clone(),
@@ -156,11 +168,13 @@ impl Agent for MonocleAgent {
             let mut approver = AcpApprover {
                 calls: updates,
                 sid,
+                cancel: cancel.clone(),
             };
             let session = match try_access_token(&Client::new(), &Credentials::new()) {
                 Ok(s) => s,
                 Err(e) => return (convo, Err(e)),
             };
+            convo.push(Message::user(user));
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
             let mut config = AgentConfig::new(model);
@@ -172,16 +186,18 @@ impl Agent for MonocleAgent {
         .await
         .map_err(|_| acp::Error::internal_error())?;
 
-        // The loop reports the real stop reason — a cancel landing on the final
-        // (no-tool) step is Cancelled, not a spuriously "completed" EndTurn.
+        // ALWAYS write the (possibly partial) conversation back and release the
+        // running guard — for BOTH Ok and Err — so tools already executed this
+        // turn are not replayed on the client's retry (Fix #1). Then propagate.
         let (updated_convo, result) = joined;
-        let run_stop = result.map_err(acp::Error::into_internal_error)?;
-
-        // Persist the updated conversation for follow-up prompts.
         if let Some(st) = self.sessions.borrow_mut().get_mut(&key) {
             st.convo = updated_convo;
+            st.running = false;
         }
 
+        // The loop reports the real stop reason — a cancel landing on the final
+        // (no-tool) step is Cancelled, not a spuriously "completed" EndTurn.
+        let run_stop = result.map_err(acp::Error::into_internal_error)?;
         let stop = match run_stop {
             RunStop::Cancelled => acp::StopReason::Cancelled,
             RunStop::EndTurn => acp::StopReason::EndTurn,
@@ -272,6 +288,9 @@ impl Observer for AcpObserver {
 struct AcpApprover {
     calls: mpsc::UnboundedSender<ClientCall>,
     sid: acp::SessionId,
+    /// The session's cancel flag, so a permission wait breaks (denies) when the
+    /// client cancels the turn instead of hanging forever on the oneshot (Fix #5).
+    cancel: Cancel,
 }
 
 impl Approver for AcpApprover {
@@ -296,15 +315,29 @@ impl Approver for AcpApprover {
         ];
         let req = acp::RequestPermissionRequest::new(self.sid.clone(), tool_call, options);
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         if self.calls.send(ClientCall::Permission(req, tx)).is_err() {
             return false; // connection gone → deny
         }
-        // Block this off-thread loop until the client answers (or the turn ends).
-        matches!(
-            rx.blocking_recv(),
-            Ok(acp::RequestPermissionOutcome::Selected(sel)) if sel.option_id.0.as_ref() == "allow"
-        )
+        // Wait for the client's answer, but honor cancel so a never-answered
+        // permission can't hang this blocking-pool thread forever. Polling (not a
+        // single blocking_recv) lets us observe cancel between checks; the 20ms
+        // sleep is fine here — this runs on a spawn_blocking thread.
+        loop {
+            match rx.try_recv() {
+                Ok(acp::RequestPermissionOutcome::Selected(sel)) => {
+                    return sel.option_id.0.as_ref() == "allow";
+                }
+                Ok(_) => return false, // Cancelled outcome → deny
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    if self.cancel.is_cancelled() {
+                        return false; // turn cancelled → deny, don't hang
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(oneshot::error::TryRecvError::Closed) => return false, // sender gone → deny
+            }
+        }
     }
 }
 
@@ -338,6 +371,8 @@ async fn run() {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
     let agent = std::rc::Rc::new(MonocleAgent::new(tx));
+    // Hold a second handle so we can cancel in-flight sessions on shutdown (Fix #6).
+    let shutdown = std::rc::Rc::clone(&agent);
 
     let (conn, io_task) = acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
         tokio::task::spawn_local(fut);
@@ -346,6 +381,7 @@ async fn run() {
     // Make the loop's queued calls to the client over the connection: fire-and-
     // forget updates, and permission round-trips whose outcome is returned to the
     // (blocking) loop via the paired oneshot.
+    let conn = std::rc::Rc::new(conn);
     tokio::task::spawn_local(async move {
         while let Some(call) = rx.recv().await {
             match call {
@@ -353,17 +389,29 @@ async fn run() {
                     let _ = conn.session_notification(note).await;
                 }
                 ClientCall::Permission(req, ack) => {
-                    let outcome = match conn.request_permission(req).await {
-                        Ok(resp) => resp.outcome,
-                        Err(_) => acp::RequestPermissionOutcome::Cancelled,
-                    };
-                    let _ = ack.send(outcome);
+                    // Spawn the round-trip so an unanswered permission doesn't
+                    // head-of-line-block queued updates for other sessions (Fix #7).
+                    let conn = std::rc::Rc::clone(&conn);
+                    tokio::task::spawn_local(async move {
+                        let outcome = match conn.request_permission(req).await {
+                            Ok(resp) => resp.outcome,
+                            Err(_) => acp::RequestPermissionOutcome::Cancelled,
+                        };
+                        let _ = ack.send(outcome);
+                    });
                 }
             }
         }
     });
 
     let _ = io_task.await;
+
+    // Client disconnected: signal every in-flight session to stop so the detached
+    // spawn_blocking loops halt at their next step boundary and the runtime can
+    // shut down instead of blocking on LLM calls / tools (Fix #6).
+    for st in shutdown.sessions.borrow().values() {
+        st.cancel.cancel();
+    }
 }
 
 #[cfg(test)]
@@ -422,6 +470,7 @@ mod tests {
         let mut approver = AcpApprover {
             calls: tx,
             sid: acp::SessionId::new("s"),
+            cancel: Cancel::new(),
         };
         let granted = approver.approve("call_1", "write_file", &serde_json::json!({"path": "x"}));
         responder.join().unwrap();
@@ -432,6 +481,24 @@ mod tests {
     fn approver_grants_only_when_client_selects_allow() {
         assert!(approver_with_response("allow"));
         assert!(!approver_with_response("reject"));
+    }
+
+    #[test]
+    fn approver_denies_without_hanging_when_cancelled_and_no_answer() {
+        // The client never answers the permission (rx kept, never drained), but the
+        // turn is cancelled — approve() must break the wait and deny, not hang.
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientCall>();
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let mut approver = AcpApprover {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+            cancel,
+        };
+        let start = std::time::Instant::now();
+        assert!(!approver.approve("call_1", "write_file", &serde_json::json!({"path": "x"})));
+        // The 20ms poll means it returns almost immediately; bound it generously.
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
     /// Build an `AcpObserver` wired to an in-memory channel (no ACP stack), so a
@@ -499,6 +566,7 @@ mod tests {
         let mut approver = AcpApprover {
             calls: tx,
             sid: acp::SessionId::new("s"),
+            cancel: Cancel::new(),
         };
         assert!(!approver.approve("call_1", "write_file", &serde_json::json!({})));
     }
