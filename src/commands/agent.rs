@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::agent::providers::{LlmProvider, Message, MonocleProvider};
+use crate::agent::providers::{Message, MonocleProvider};
 use crate::agent::runner::{Agent, AgentConfig, AllowAll, Cancel, Observer};
 use crate::agent::session::{session_path, SessionStore};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
@@ -62,19 +62,69 @@ impl Observer for CliObserver {
     }
 }
 
-pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -> Result<()> {
-    let auth = get_access_token(client, creds);
-    let provider = MonocleProvider::from_session(auth);
-    let tools = ToolRegistry::with_defaults();
+/// Per-session driver. Rebuilds the provider each turn so a fresh (auto-refreshed)
+/// token is used — a long-lived interactive session never sends a stale bearer.
+struct Repl<'a> {
+    client: &'a Client,
+    creds: &'a Credentials,
+    tools: ToolRegistry,
+    workdir: PathBuf,
+    model: String,
+    max_steps: usize,
+    cancel: Cancel,
+    session: Option<SessionStore>,
+    convo: Vec<Message>,
+    persisted: usize,
+}
 
+impl Repl<'_> {
+    fn run_turn(&mut self, user: String) -> Result<()> {
+        // Fresh token each turn (get_access_token refreshes if near expiry).
+        let auth = get_access_token(self.client, self.creds);
+        let provider = MonocleProvider::from_session(auth);
+        let mut config = AgentConfig::new(self.model.as_str());
+        config.max_steps = self.max_steps;
+        let agent = Agent::new(
+            &provider,
+            &self.tools,
+            ToolContext::new(self.workdir.clone()),
+            config,
+        );
+
+        // Clear any cancel from an idle Ctrl-C press before starting this turn.
+        self.cancel.reset();
+        let mark = self.convo.len();
+        self.convo.push(Message::user(user));
+        if let Err(e) = agent.run(
+            &mut self.convo,
+            &mut AllowAll,
+            &mut CliObserver,
+            &self.cancel,
+        ) {
+            // Roll back this failed turn's (partial) messages so a retry — and the
+            // persisted session — stay well-formed.
+            self.convo.truncate(mark);
+            return Err(e);
+        }
+
+        let mut out = std::io::stdout();
+        out.write_all(b"\n")?;
+        out.flush()?;
+
+        // Persist this turn's new messages (append-only).
+        if let Some(store) = &self.session {
+            store.append(&self.convo[self.persisted..])?;
+            self.persisted = self.convo.len();
+        }
+        Ok(())
+    }
+}
+
+pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -> Result<()> {
     let workdir = opts
         .workdir
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-
-    let mut config = AgentConfig::new(opts.model);
-    config.max_steps = opts.max_steps;
-    let agent = Agent::new(&provider, &tools, ToolContext::new(workdir.clone()), config);
 
     eprintln!(
         "{} {}",
@@ -98,7 +148,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         .session
         .as_ref()
         .map(|name| SessionStore::new(session_path(&home_dir(), name)));
-    let (mut convo, mut persisted) = match &session {
+    let (convo, persisted) = match &session {
         Some(store) => {
             let loaded = store.load()?;
             if loaded.is_empty() {
@@ -115,11 +165,24 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         None => (vec![Message::system(SYSTEM_PROMPT)], 0),
     };
 
+    let mut repl = Repl {
+        client,
+        creds,
+        tools: ToolRegistry::with_defaults(),
+        workdir,
+        model: opts.model,
+        max_steps: opts.max_steps,
+        cancel,
+        session,
+        convo,
+        persisted,
+    };
+
     let interactive = std::io::stdin().is_terminal();
 
     // Seed the first turn from the prompt arg, or (non-interactive) piped stdin.
     if let Some(p) = opts.prompt {
-        run_turn(&agent, &mut convo, p, &cancel, &session, &mut persisted)?;
+        repl.run_turn(p)?;
     } else if !interactive {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input)?;
@@ -127,14 +190,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
             eprintln!("No input provided.");
             std::process::exit(1);
         }
-        run_turn(
-            &agent,
-            &mut convo,
-            input.trim().to_string(),
-            &cancel,
-            &session,
-            &mut persisted,
-        )?;
+        repl.run_turn(input.trim().to_string())?;
     }
 
     // Piped / one-shot: done. Interactive: keep taking follow-ups in the session.
@@ -164,48 +220,9 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
             break;
         }
         // A transient per-turn error must not tear down the interactive session.
-        if let Err(e) = run_turn(
-            &agent,
-            &mut convo,
-            msg.to_string(),
-            &cancel,
-            &session,
-            &mut persisted,
-        ) {
+        if let Err(e) = repl.run_turn(msg.to_string()) {
             eprintln!("{} {e}", c::red("Error:"));
         }
-    }
-    Ok(())
-}
-
-/// Run one user turn to completion: append the message, stream the agent's
-/// answer to stdout (via the observer), and terminate the streamed line.
-#[allow(clippy::too_many_arguments)]
-fn run_turn<P: LlmProvider>(
-    agent: &Agent<'_, P>,
-    convo: &mut Vec<Message>,
-    user: String,
-    cancel: &Cancel,
-    session: &Option<SessionStore>,
-    persisted: &mut usize,
-) -> Result<()> {
-    // Clear any cancel from an idle Ctrl-C press before starting this turn.
-    cancel.reset();
-    let mark = convo.len();
-    convo.push(Message::user(user));
-    if let Err(e) = agent.run(convo, &mut AllowAll, &mut CliObserver, cancel) {
-        // Roll back this failed turn's (partial) messages so a retry — and the
-        // persisted session — stay well-formed.
-        convo.truncate(mark);
-        return Err(e);
-    }
-    let mut out = std::io::stdout();
-    out.write_all(b"\n")?;
-    out.flush()?;
-    // Persist this turn's new messages (append-only).
-    if let Some(store) = session {
-        store.append(&convo[*persisted..])?;
-        *persisted = convo.len();
     }
     Ok(())
 }
