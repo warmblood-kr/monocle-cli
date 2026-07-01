@@ -26,6 +26,22 @@ cargo fmt               # 포매팅
 - 내부 리팩토링이나 구현 개선은 README 반영 불필요
 - 새 명령어, 옵션 변경, 설정 흐름 변경 등 사용자에게 보이는 변화만 반영 대상
 
+## 에이전트 모드 (WIP — Path B)
+
+`monocle`를 **헤드리스 에이전트**로 확장 중. **코딩 에이전트가 아니라**, monocle
+**Craft**(및 데스크탑)가 구동하는 **모델‑무관 서버‑에이전트 백엔드** — Craft의
+Sonnet 종속 비용을 Craft 코어 변경 없이 완화(= 모델 자유도 G1)하는 게 목적.
+
+- **설계(SDD/에픽):** warmblood-kr/monocle#158 · **구현 상태:** warmblood-kr/monocle-cli#44
+- **코드:** `src/agent/`(`providers`=LLM 추상화/G1, `tools`=read/write/edit +
+  크로스플랫폼 shell, `runner`=agent-core 루프) + `src/commands/agent.rs`
+  (`monocle agent <prompt>`, experimental). 모든 HTTP는 `src/net.rs` 파사드.
+- **작업 브랜치:** `feature/agent-mode-providers` (base `rust-rewrite`/PR #43).
+  push/PR은 승인 게이트 — 로컬 커밋만.
+- **시퀀스(§9):** Phase 0(얼개)✅ → **Phase 1 스트리밍(동기 SSE)+멀티턴**(다음) →
+  Phase 2 세션/스티어링 → Phase 3 **ACP 표면 + 권한**(G4) → Phase 4 정교화.
+- pi(earendil-works/pi, MIT)를 설계 참고로만(코드 차용 X); ACP = Zed Agent Client Protocol.
+
 ## 지식 관리 — wb-para 스킬 적극 사용
 
 이 저장소는 모노클 AI 코드베이스입니다. 작업 중 나오는 결정·통찰·운영 지식은 `warmble-jumble` vault에 축적해야 팀이 재활용할 수 있으므로, wb-para sub-skill을 능동적으로 호출하세요.
