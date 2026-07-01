@@ -55,6 +55,9 @@ pub trait Observer {
     fn on_text_delta(&mut self, _delta: &str) {}
     fn on_tool_call(&mut self, _name: &str, _args: &Value) {}
     fn on_tool_result(&mut self, _name: &str, _outcome: &ToolOutcome) {}
+    /// A meta/control notice (stopped, cancelled) — NOT model answer text, so the
+    /// CLI keeps it off the stdout answer channel.
+    fn on_notice(&mut self, _msg: &str) {}
 }
 
 pub struct Silent;
@@ -115,7 +118,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
             // Cancellation is checked at each step boundary (graceful stop).
             if cancel.is_cancelled() {
                 let notice = "[agent cancelled]".to_string();
-                observer.on_text_delta(&format!("\n{notice}\n"));
+                observer.on_notice(&notice);
                 return Ok(if last_text.is_empty() {
                     notice
                 } else {
@@ -189,7 +192,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
             "[agent stopped after {} steps without finishing]",
             self.config.max_steps
         );
-        observer.on_text_delta(&format!("\n{notice}\n"));
+        observer.on_notice(&notice);
         Ok(if last_text.is_empty() {
             notice
         } else {

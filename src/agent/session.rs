@@ -31,15 +31,28 @@ impl SessionStore {
             return Ok(Vec::new());
         }
         let text = std::fs::read_to_string(&self.path)?;
-        let mut messages = Vec::new();
-        for (i, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut messages = Vec::with_capacity(lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            match serde_json::from_str::<Message>(line) {
+                Ok(message) => messages.push(message),
+                Err(e) => {
+                    // Tolerate a truncated/corrupt FINAL line (e.g. the process was
+                    // killed mid-write); a corrupt earlier line is real corruption.
+                    if i + 1 == lines.len() {
+                        eprintln!("Warning: dropping incomplete final session line: {e}");
+                        break;
+                    }
+                    return Err(AppError::new(format!(
+                        "corrupt session line {}: {e}",
+                        i + 1
+                    )));
+                }
             }
-            let message: Message = serde_json::from_str(line)
-                .map_err(|e| AppError::new(format!("corrupt session line {}: {e}", i + 1)))?;
-            messages.push(message);
         }
         Ok(messages)
     }

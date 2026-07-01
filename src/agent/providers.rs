@@ -140,8 +140,15 @@ pub struct ChatResponse {
     pub finish_reason: Option<String>,
 }
 
-/// Parse an OpenAI-compatible (non-streaming) chat completion body.
-fn parse_response_value(data: &Value) -> ChatResponse {
+/// Parse an OpenAI-compatible (non-streaming) chat completion body. Errors on a
+/// body with no `choices` (e.g. an error-shaped response) rather than silently
+/// returning an empty assistant turn that the loop would treat as a final answer.
+fn parse_response_value(data: &Value) -> Result<ChatResponse> {
+    if data.get("choices").and_then(|c| c.get(0)).is_none() {
+        return Err(AppError::new(format!(
+            "unexpected chat response (no choices): {data}"
+        )));
+    }
     let message = &data["choices"][0]["message"];
     let content = message["content"].as_str().unwrap_or_default().to_string();
     let tool_calls: Vec<ToolCall> =
@@ -150,12 +157,12 @@ fn parse_response_value(data: &Value) -> ChatResponse {
     let finish_reason = data["choices"][0]["finish_reason"]
         .as_str()
         .map(String::from);
-    ChatResponse {
+    Ok(ChatResponse {
         content,
         tool_calls,
         model,
         finish_reason,
-    }
+    })
 }
 
 /// Accumulates a streamed tool call across SSE deltas (id/name arrive first,
@@ -241,7 +248,7 @@ impl LlmProvider for MonocleProvider {
             )));
         }
         let data: Value = resp.json()?;
-        Ok(parse_response_value(&data))
+        parse_response_value(&data)
     }
 
     fn chat_stream(
@@ -265,7 +272,7 @@ impl LlmProvider for MonocleProvider {
         // Non-SSE response (or a stub): buffer and parse as one completion.
         if !stream.is_event_stream() {
             let data: Value = serde_json::from_str(&stream.read_all())?;
-            let resp = parse_response_value(&data);
+            let resp = parse_response_value(&data)?;
             if !resp.content.is_empty() {
                 on_delta(&resp.content);
             }

@@ -57,6 +57,41 @@ fn append_accumulates() {
 }
 
 #[test]
+fn load_tolerates_truncated_final_line() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.jsonl");
+    let store = SessionStore::new(&path);
+    store
+        .append(&[Message::user("one"), Message::user("two")])
+        .unwrap();
+    // Simulate a crash mid-write: an invalid, unterminated final line.
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    write!(f, "{{\"role\":\"assist").unwrap();
+    drop(f);
+
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.len(), 2, "good lines survive; corrupt tail dropped");
+    assert_eq!(loaded[1].content.as_deref(), Some("two"));
+}
+
+#[test]
+fn load_errors_on_corrupt_non_final_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.jsonl");
+    std::fs::write(
+        &path,
+        "{\"role\":\"user\",\"content\":\"a\"}\nNOT JSON\n{\"role\":\"user\",\"content\":\"b\"}\n",
+    )
+    .unwrap();
+    // A corrupt line in the middle is real corruption — not silently skipped.
+    assert!(SessionStore::new(&path).load().is_err());
+}
+
+#[test]
 fn session_path_is_under_monocle_agent() {
     let p = session_path(Path::new("/home/x"), "work");
     assert!(p.ends_with(".monocle/agent/work.jsonl"), "{}", p.display());

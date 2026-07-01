@@ -56,11 +56,15 @@ impl Observer for CliObserver {
         };
         eprintln!("  {} {}", tag, c::dim(&one_line(outcome.ui_text(), 200)));
     }
+    fn on_notice(&mut self, msg: &str) {
+        // Control notices go to stderr — stdout stays the clean answer channel.
+        eprintln!("\n{}", c::dim(msg));
+    }
 }
 
 pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -> Result<()> {
-    let session = get_access_token(client, creds);
-    let provider = MonocleProvider::from_session(session);
+    let auth = get_access_token(client, creds);
+    let provider = MonocleProvider::from_session(auth);
     let tools = ToolRegistry::with_defaults();
 
     let workdir = opts
@@ -159,14 +163,17 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
             eprintln!("Bye.");
             break;
         }
-        run_turn(
+        // A transient per-turn error must not tear down the interactive session.
+        if let Err(e) = run_turn(
             &agent,
             &mut convo,
             msg.to_string(),
             &cancel,
             &session,
             &mut persisted,
-        )?;
+        ) {
+            eprintln!("{} {e}", c::red("Error:"));
+        }
     }
     Ok(())
 }
@@ -184,8 +191,14 @@ fn run_turn<P: LlmProvider>(
 ) -> Result<()> {
     // Clear any cancel from an idle Ctrl-C press before starting this turn.
     cancel.reset();
+    let mark = convo.len();
     convo.push(Message::user(user));
-    agent.run(convo, &mut AllowAll, &mut CliObserver, cancel)?;
+    if let Err(e) = agent.run(convo, &mut AllowAll, &mut CliObserver, cancel) {
+        // Roll back this failed turn's (partial) messages so a retry — and the
+        // persisted session — stay well-formed.
+        convo.truncate(mark);
+        return Err(e);
+    }
     let mut out = std::io::stdout();
     out.write_all(b"\n")?;
     out.flush()?;

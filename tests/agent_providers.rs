@@ -82,3 +82,26 @@ fn non_200_is_an_error() {
         .to_string();
     assert!(err.contains("API error 500"), "got: {err}");
 }
+
+#[test]
+fn chat_errors_when_response_has_no_choices() {
+    // A 200 with an error-shaped body (no `choices`) must surface as an error,
+    // not a silent empty assistant turn.
+    let s = stub(|_a, _m, url, _b| {
+        if url.starts_with("/v1/chat/completions") {
+            (200, r#"{"error":{"message":"boom"}}"#.to_string())
+        } else {
+            (404, String::new())
+        }
+    });
+    let provider = MonocleProvider::new("tok", s.router_url());
+    let err = provider
+        .chat(&ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no choices"), "got: {err}");
+}
