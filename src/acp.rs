@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::providers::{Message, MonocleProvider};
-use crate::agent::runner::{Agent as CoreAgent, AgentConfig, Approver, Cancel, Observer};
+use crate::agent::runner::{Agent as CoreAgent, AgentConfig, Approver, Cancel, Observer, RunStop};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::auth::try_access_token;
 use crate::credentials::Credentials;
@@ -159,7 +159,7 @@ impl Agent for MonocleAgent {
             };
             let session = match try_access_token(&Client::new(), &Credentials::new()) {
                 Ok(s) => s,
-                Err(e) => return (convo, cancel.is_cancelled(), Err(e)),
+                Err(e) => return (convo, Err(e)),
             };
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
@@ -167,23 +167,25 @@ impl Agent for MonocleAgent {
             config.max_steps = DEFAULT_MAX_STEPS;
             let agent = CoreAgent::new(&provider, &tools, ToolContext::new(cwd), config);
             let result = agent.run(&mut convo, &mut approver, &mut observer, &cancel);
-            (convo, cancel.is_cancelled(), result.map(|_| ()))
+            (convo, result)
         })
         .await
         .map_err(|_| acp::Error::internal_error())?;
 
-        let (updated_convo, cancelled, result) = joined;
-        result.map_err(acp::Error::into_internal_error)?;
+        // The loop reports the real stop reason — a cancel landing on the final
+        // (no-tool) step is Cancelled, not a spuriously "completed" EndTurn.
+        let (updated_convo, result) = joined;
+        let run_stop = result.map_err(acp::Error::into_internal_error)?;
 
         // Persist the updated conversation for follow-up prompts.
         if let Some(st) = self.sessions.borrow_mut().get_mut(&key) {
             st.convo = updated_convo;
         }
 
-        let stop = if cancelled {
-            acp::StopReason::Cancelled
-        } else {
-            acp::StopReason::EndTurn
+        let stop = match run_stop {
+            RunStop::Cancelled => acp::StopReason::Cancelled,
+            RunStop::EndTurn => acp::StopReason::EndTurn,
+            RunStop::MaxSteps => acp::StopReason::MaxTurnRequests,
         };
         Ok(acp::PromptResponse::new(stop))
     }
