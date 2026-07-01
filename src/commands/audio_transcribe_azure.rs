@@ -8,7 +8,7 @@ use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::{AppError, Result};
 use crate::net::{Client, FilePart};
-use crate::origin::origin_header;
+use crate::origin::auth_headers;
 
 #[derive(Default)]
 pub struct AudioTranscribeAzureOptions {
@@ -87,7 +87,7 @@ pub fn audio_transcribe_azure_command(
     let bearer = format!("Bearer {}", session.token);
     let resp = client.post_multipart(
         &format!("{}{}", session.router_url, endpoints::AZURE_SPEECH_TO_TEXT),
-        &[("Authorization", &bearer), origin_header()],
+        &auth_headers(&bearer),
         FilePart {
             field: "audio".to_string(),
             filename: input.filename,

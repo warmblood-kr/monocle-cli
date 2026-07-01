@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
+use monocle_cli::commands::agent::{agent_command, AgentOptions};
 use monocle_cli::commands::audio_speech::{audio_speech_command, AudioSpeechOptions};
 use monocle_cli::commands::audio_speech_azure::{
     audio_speech_azure_command, AudioSpeechAzureOptions,
@@ -64,6 +65,23 @@ enum Commands {
     Models,
     /// Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
     Chat(ChatArgs),
+    /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
+    Agent {
+        /// The task/prompt (optional; omit to type it interactively, or pipe via stdin)
+        prompt: Option<String>,
+        /// Working directory the agent acts in (default: current directory)
+        #[arg(long)]
+        workdir: Option<String>,
+        /// Model id to use (routed via Monocle)
+        #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: String,
+        /// Maximum loop steps before giving up
+        #[arg(long = "max-steps", default_value = "20")]
+        max_steps: usize,
+        /// Named session to persist/resume (~/.monocle/agent/<name>.jsonl)
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Call audio (STT / TTS) endpoints directly for debugging
     Audio {
         #[command(subcommand)]
@@ -228,6 +246,23 @@ fn main() {
         }
         Commands::Models => model_list_command(&client, &creds),
         Commands::Chat(args) => chat_command(&client, &creds, args.into()),
+        Commands::Agent {
+            prompt,
+            workdir,
+            model,
+            max_steps,
+            session,
+        } => agent_command(
+            &client,
+            &creds,
+            AgentOptions {
+                prompt,
+                workdir,
+                model,
+                max_steps,
+                session,
+            },
+        ),
         Commands::Audio { command } => run_audio(&client, &creds, command),
         Commands::Model { command } => {
             match command {

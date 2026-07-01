@@ -1,6 +1,7 @@
 //! Library surface for the `monocle` CLI. The binary (`src/main.rs`) is a thin
 //! clap front-end over these modules; tests import them directly.
 
+pub mod agent;
 pub mod audio_io;
 pub mod auth;
 pub mod colors;

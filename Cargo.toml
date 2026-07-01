@@ -27,6 +27,13 @@ rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tiny_http = "0.12"
 open = "5"
+ctrlc = "3"
+# ACP server-agent surface (Phase 3). async stays confined to src/acp.rs; the
+# core loop is sync. Pin 0.9 (trait-based `impl Agent`); 1.0 is a builder rewrite.
+agent-client-protocol = "0.9"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "io-std", "macros", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [dev-dependencies]
 tempfile = "3"
