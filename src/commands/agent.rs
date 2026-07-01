@@ -31,14 +31,15 @@ pub struct AgentOptions {
 
 struct CliObserver;
 impl Observer for CliObserver {
-    fn on_text(&mut self, text: &str) {
-        if !text.trim().is_empty() {
-            eprintln!("{}", c::dim(text));
-        }
+    fn on_text_delta(&mut self, delta: &str) {
+        // Stream assistant text to stdout as it arrives (tool progress goes to stderr).
+        let mut out = std::io::stdout();
+        let _ = out.write_all(delta.as_bytes());
+        let _ = out.flush();
     }
     fn on_tool_call(&mut self, name: &str, args: &Value) {
         eprintln!(
-            "{} {} {}",
+            "\n{} {} {}",
             c::cyan("⏵"),
             c::bold(name),
             c::dim(&one_line(&args.to_string(), 120))
@@ -78,15 +79,17 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         c::yellow("⚠ experimental: tools auto-approved (read/write/edit + shell). Run only in a directory you trust.")
     );
 
-    let answer = agent.run(
+    // Assistant text (including the final answer) is streamed to stdout by the
+    // observer as it arrives; we don't reprint the returned value.
+    agent.run(
         vec![Message::system(SYSTEM_PROMPT), Message::user(opts.prompt)],
         &mut AllowAll,
         &mut CliObserver,
     )?;
 
     let mut out = std::io::stdout();
-    out.write_all(answer.as_bytes())?;
     out.write_all(b"\n")?;
+    out.flush()?;
     Ok(())
 }
 

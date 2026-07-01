@@ -27,7 +27,8 @@ impl Approver for AllowAll {
 
 /// Observes loop steps (for printing / logging). Default = no-op ([`Silent`]).
 pub trait Observer {
-    fn on_text(&mut self, _text: &str) {}
+    /// A chunk of assistant text as it streams in.
+    fn on_text_delta(&mut self, _delta: &str) {}
     fn on_tool_call(&mut self, _name: &str, _args: &Value) {}
     fn on_tool_result(&mut self, _name: &str, _outcome: &ToolOutcome) {}
 }
@@ -85,21 +86,24 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
         let mut last_text = String::new();
 
         for _step in 0..self.config.max_steps {
-            let resp = self.provider.chat(&ChatRequest {
+            let req = ChatRequest {
                 model: self.config.model.clone(),
                 messages: messages.clone(),
                 max_tokens: self.config.max_tokens,
                 tools: defs.clone(),
-            })?;
+            };
+            // Stream assistant text to the observer as it arrives.
+            let resp = self
+                .provider
+                .chat_stream(&req, &mut |delta| observer.on_text_delta(delta))?;
 
-            // No tool calls → this is the final answer (returned, not observed, so
-            // the caller can route it to stdout exactly once).
+            // No tool calls → this is the final answer (already streamed to the
+            // observer; also returned for programmatic / multi-turn callers).
             if resp.tool_calls.is_empty() {
                 return Ok(resp.content);
             }
 
             if !resp.content.is_empty() {
-                observer.on_text(&resp.content);
                 last_text = resp.content.clone();
             }
             // Replay the assistant's tool-call turn before the matching results.
@@ -148,6 +152,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
             "[agent stopped after {} steps without finishing]",
             self.config.max_steps
         );
+        observer.on_text_delta(&format!("\n{notice}\n"));
         Ok(if last_text.is_empty() {
             notice
         } else {

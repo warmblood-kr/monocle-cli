@@ -7,6 +7,8 @@
 //! signatures — so "go async later" never colors the call tree. Keep `reqwest`
 //! types from leaking past this boundary.
 
+use std::io::{BufRead, BufReader, Read};
+
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -136,6 +138,33 @@ impl Client {
         }
         send(req)
     }
+
+    /// POST `application/json` and return a streaming line reader over the (SSE)
+    /// response body — no buffering. For `stream: true` chat completions.
+    pub fn post_json_stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<EventStream> {
+        let mut req = self.inner.post(url).json(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().map_err(|e| AppError(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Ok(EventStream {
+            status,
+            content_type,
+            reader: BufReader::new(resp),
+        })
+    }
 }
 
 fn send(req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
@@ -148,4 +177,41 @@ fn send(req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
         status_text,
         body,
     })
+}
+
+/// A streaming HTTP response — a blocking line reader over the body. Keeps the
+/// `reqwest` type private so streaming stays behind the net boundary; the caller
+/// parses SSE (`data:` lines) itself.
+pub struct EventStream {
+    pub status: u16,
+    pub content_type: String,
+    reader: BufReader<reqwest::blocking::Response>,
+}
+
+impl EventStream {
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// Whether the body is a Server-Sent Events stream.
+    pub fn is_event_stream(&self) -> bool {
+        self.content_type.contains("event-stream")
+    }
+
+    /// Next line (including the trailing newline), or `None` at end of stream.
+    pub fn next_line(&mut self) -> Result<Option<String>> {
+        let mut line = String::new();
+        let n = self
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| AppError(e.to_string()))?;
+        Ok(if n == 0 { None } else { Some(line) })
+    }
+
+    /// Drain the remaining body to a string (error bodies / non-SSE responses).
+    pub fn read_all(&mut self) -> String {
+        let mut s = String::new();
+        let _ = self.reader.read_to_string(&mut s);
+        s
+    }
 }

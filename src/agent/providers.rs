@@ -140,10 +140,52 @@ pub struct ChatResponse {
     pub finish_reason: Option<String>,
 }
 
+/// Parse an OpenAI-compatible (non-streaming) chat completion body.
+fn parse_response_value(data: &Value) -> ChatResponse {
+    let message = &data["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or_default().to_string();
+    let tool_calls: Vec<ToolCall> =
+        serde_json::from_value(message["tool_calls"].clone()).unwrap_or_default();
+    let model = data["model"].as_str().map(String::from);
+    let finish_reason = data["choices"][0]["finish_reason"]
+        .as_str()
+        .map(String::from);
+    ChatResponse {
+        content,
+        tool_calls,
+        model,
+        finish_reason,
+    }
+}
+
+/// Accumulates a streamed tool call across SSE deltas (id/name arrive first,
+/// arguments come in fragments).
+#[derive(Default)]
+struct ToolCallAcc {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
 /// The seam the agent loop is built on. Any backend (monocle-routed today, a
 /// direct provider tomorrow) implements this; the loop never names a vendor.
 pub trait LlmProvider {
     fn chat(&self, req: &ChatRequest) -> Result<ChatResponse>;
+
+    /// Streaming variant: emits assistant text deltas via `on_delta` as they
+    /// arrive, returning the assembled final response. Default delegates to
+    /// `chat` and emits the whole content once (fine for tests / non-streaming).
+    fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatResponse> {
+        let resp = self.chat(req)?;
+        if !resp.content.is_empty() {
+            on_delta(&resp.content);
+        }
+        Ok(resp)
+    }
 }
 
 /// `LlmProvider` backed by monocle routing (chat-proxy, OpenAI-compatible).
@@ -166,15 +208,12 @@ impl MonocleProvider {
     pub fn from_session(session: AuthSession) -> Self {
         Self::new(session.token, session.router_url)
     }
-}
 
-impl LlmProvider for MonocleProvider {
-    fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
-        let bearer = format!("Bearer {}", self.token);
+    fn build_body(&self, req: &ChatRequest, stream: bool) -> Value {
         let mut body = json!({
             "model": req.model,
             "messages": req.messages,
-            "stream": false,
+            "stream": stream,
         });
         if let Some(max_tokens) = req.max_tokens {
             body["max_tokens"] = json!(max_tokens);
@@ -182,13 +221,18 @@ impl LlmProvider for MonocleProvider {
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools);
         }
+        body
+    }
+}
 
+impl LlmProvider for MonocleProvider {
+    fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        let bearer = format!("Bearer {}", self.token);
         let resp = self.client.post_json(
             &format!("{}{}", self.router_url, endpoints::CHAT_COMPLETIONS),
             &[("Authorization", &bearer), origin_header()],
-            &body,
+            &self.build_body(req, false),
         )?;
-
         if !resp.ok() {
             return Err(AppError::new(format!(
                 "API error {}: {}",
@@ -196,16 +240,106 @@ impl LlmProvider for MonocleProvider {
                 resp.text()
             )));
         }
-
         let data: Value = resp.json()?;
-        let message = &data["choices"][0]["message"];
-        let content = message["content"].as_str().unwrap_or_default().to_string();
-        let tool_calls: Vec<ToolCall> =
-            serde_json::from_value(message["tool_calls"].clone()).unwrap_or_default();
-        let model = data["model"].as_str().map(String::from);
-        let finish_reason = data["choices"][0]["finish_reason"]
-            .as_str()
-            .map(String::from);
+        Ok(parse_response_value(&data))
+    }
+
+    fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatResponse> {
+        let bearer = format!("Bearer {}", self.token);
+        let mut stream = self.client.post_json_stream(
+            &format!("{}{}", self.router_url, endpoints::CHAT_COMPLETIONS),
+            &[("Authorization", &bearer), origin_header()],
+            &self.build_body(req, true),
+        )?;
+
+        if !stream.ok() {
+            let status = stream.status;
+            let body = stream.read_all();
+            return Err(AppError::new(format!("API error {status}: {body}")));
+        }
+
+        // Non-SSE response (or a stub): buffer and parse as one completion.
+        if !stream.is_event_stream() {
+            let data: Value = serde_json::from_str(&stream.read_all())?;
+            let resp = parse_response_value(&data);
+            if !resp.content.is_empty() {
+                on_delta(&resp.content);
+            }
+            return Ok(resp);
+        }
+
+        // SSE: assemble content + tool calls from `data:` deltas.
+        let mut content = String::new();
+        let mut finish_reason: Option<String> = None;
+        let mut model: Option<String> = None;
+        let mut tool_acc: Vec<ToolCallAcc> = Vec::new();
+
+        while let Some(raw) = stream.next_line()? {
+            let data = match raw.trim_end().strip_prefix("data:") {
+                Some(d) => d.trim_start().to_string(),
+                None => continue,
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            let v: Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if model.is_none() {
+                model = v["model"].as_str().map(String::from);
+            }
+            let choice = &v["choices"][0];
+            if let Some(fr) = choice["finish_reason"].as_str() {
+                finish_reason = Some(fr.to_string());
+            }
+            let delta = &choice["delta"];
+            if let Some(c) = delta["content"].as_str() {
+                if !c.is_empty() {
+                    content.push_str(c);
+                    on_delta(c);
+                }
+            }
+            if let Some(tcs) = delta["tool_calls"].as_array() {
+                for tc in tcs {
+                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                    while tool_acc.len() <= idx {
+                        tool_acc.push(ToolCallAcc::default());
+                    }
+                    let acc = &mut tool_acc[idx];
+                    if let Some(id) = tc["id"].as_str() {
+                        if !id.is_empty() {
+                            acc.id = id.to_string();
+                        }
+                    }
+                    if let Some(name) = tc["function"]["name"].as_str() {
+                        if !name.is_empty() {
+                            acc.name = name.to_string();
+                        }
+                    }
+                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                        acc.arguments.push_str(args);
+                    }
+                }
+            }
+        }
+
+        let tool_calls = tool_acc
+            .into_iter()
+            .filter(|a| !a.name.is_empty())
+            .map(|a| ToolCall {
+                id: a.id,
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: a.name,
+                    arguments: a.arguments,
+                },
+            })
+            .collect();
 
         Ok(ChatResponse {
             content,
