@@ -10,9 +10,9 @@
 //! only (the ACP *wire protocol* is the stable contract, not the crate API).
 //!
 //! Scope: initialize / new_session / prompt / cancel; tools run locally; tool
-//! permission is delegated to the client via `session/request_permission`
-//! (allow/reject). Follow-ups: client fs/terminal callbacks, richer ToolCall
-//! updates, per-session model config.
+//! permission is delegated to the client via `session/request_permission`; tool
+//! calls stream as correlated `ToolCall`/`ToolCallUpdate` lifecycle updates.
+//! Follow-ups: client fs/terminal callbacks, per-session model config.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -137,7 +137,6 @@ impl Agent for MonocleAgent {
             let mut approver = AcpApprover {
                 calls: updates,
                 sid,
-                tool_counter: 0,
             };
             let session = get_access_token(&Client::new(), &Credentials::new());
             let provider = MonocleProvider::from_session(session);
@@ -175,8 +174,20 @@ impl Agent for MonocleAgent {
     }
 }
 
+/// Map a tool name to the ACP `ToolKind` the client renders it as. The default
+/// (the shell tool, `bash`/`powershell`) is `Execute`.
+fn tool_kind(name: &str) -> acp::ToolKind {
+    match name {
+        "read_file" => acp::ToolKind::Read,
+        "write_file" | "edit_file" => acp::ToolKind::Edit,
+        _ => acp::ToolKind::Execute,
+    }
+}
+
 /// Bridges the sync loop's `Observer` callbacks to ACP `session/update`
-/// notifications (agent message text + tool progress as thought chunks).
+/// notifications (agent message text + tool-call lifecycle updates). The LLM
+/// tool-call id ties a call's `ToolCall` (in-progress) to its `ToolCallUpdate`
+/// (completed/failed) — the same id the client sees in the permission request.
 struct AcpObserver {
     updates: mpsc::UnboundedSender<ClientCall>,
     sid: acp::SessionId,
@@ -199,16 +210,29 @@ impl Observer for AcpObserver {
             acp::ContentChunk::new(acp::ContentBlock::from(delta.to_string())),
         ));
     }
-    fn on_tool_call(&mut self, name: &str, args: &serde_json::Value) {
-        let text = format!("⏵ {name} {args}");
-        self.send(acp::SessionUpdate::AgentThoughtChunk(
-            acp::ContentChunk::new(acp::ContentBlock::from(text)),
+    fn on_tool_call(&mut self, id: &str, name: &str, args: &serde_json::Value) {
+        self.send(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new(id.to_string()), name)
+                .kind(tool_kind(name))
+                .status(acp::ToolCallStatus::InProgress)
+                .raw_input(args.clone()),
         ));
     }
-    fn on_tool_result(&mut self, _name: &str, outcome: &ToolOutcome) {
-        let text = format!("  {}", outcome.ui_text());
-        self.send(acp::SessionUpdate::AgentThoughtChunk(
-            acp::ContentChunk::new(acp::ContentBlock::from(text)),
+    fn on_tool_result(&mut self, id: &str, _name: &str, outcome: &ToolOutcome) {
+        let status = if outcome.is_error {
+            acp::ToolCallStatus::Failed
+        } else {
+            acp::ToolCallStatus::Completed
+        };
+        self.send(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(
+                acp::ToolCallId::new(id.to_string()),
+                acp::ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(vec![acp::ToolCallContent::from(
+                        outcome.ui_text().to_string(),
+                    )]),
+            ),
         ));
     }
     fn on_notice(&mut self, msg: &str) {
@@ -224,14 +248,14 @@ impl Observer for AcpObserver {
 struct AcpApprover {
     calls: mpsc::UnboundedSender<ClientCall>,
     sid: acp::SessionId,
-    tool_counter: u64,
 }
 
 impl Approver for AcpApprover {
-    fn approve(&mut self, tool_name: &str, args: &serde_json::Value) -> bool {
-        self.tool_counter += 1;
+    fn approve(&mut self, id: &str, tool_name: &str, args: &serde_json::Value) -> bool {
+        // Reuse the streamed ToolCall's id so the client correlates the permission
+        // request with the in-progress tool call it already rendered.
         let tool_call = acp::ToolCallUpdate::new(
-            acp::ToolCallId::new(format!("tc-{}", self.tool_counter)),
+            acp::ToolCallId::new(id.to_string()),
             acp::ToolCallUpdateFields::new().title(format!("{tool_name} {args}")),
         );
         let options = vec![
@@ -346,9 +370,8 @@ mod tests {
         let mut approver = AcpApprover {
             calls: tx,
             sid: acp::SessionId::new("s"),
-            tool_counter: 0,
         };
-        let granted = approver.approve("write_file", &serde_json::json!({"path": "x"}));
+        let granted = approver.approve("call_1", "write_file", &serde_json::json!({"path": "x"}));
         responder.join().unwrap();
         granted
     }
@@ -359,6 +382,64 @@ mod tests {
         assert!(!approver_with_response("reject"));
     }
 
+    /// Build an `AcpObserver` wired to an in-memory channel (no ACP stack), so a
+    /// callback's emitted `SessionUpdate` can be read back synchronously.
+    fn observer_channel() -> (AcpObserver, mpsc::UnboundedReceiver<ClientCall>) {
+        let (tx, rx) = mpsc::unbounded_channel::<ClientCall>();
+        let observer = AcpObserver {
+            updates: tx,
+            sid: acp::SessionId::new("s"),
+        };
+        (observer, rx)
+    }
+
+    /// The single `SessionUpdate` the observer just sent (panics otherwise).
+    fn next_update(rx: &mut mpsc::UnboundedReceiver<ClientCall>) -> acp::SessionUpdate {
+        match rx.try_recv().expect("expected one queued ClientCall") {
+            ClientCall::Notify(n) => n.update,
+            ClientCall::Permission(..) => panic!("expected Notify, got Permission"),
+        }
+    }
+
+    #[test]
+    fn on_tool_call_emits_in_progress_tool_call_with_id_and_kind() {
+        let (mut observer, mut rx) = observer_channel();
+        observer.on_tool_call("call_9", "write_file", &serde_json::json!({"path": "x"}));
+        match next_update(&mut rx) {
+            acp::SessionUpdate::ToolCall(tc) => {
+                assert_eq!(tc.tool_call_id.0.as_ref(), "call_9");
+                assert_eq!(tc.status, acp::ToolCallStatus::InProgress);
+                assert_eq!(tc.kind, acp::ToolKind::Edit);
+            }
+            _ => panic!("expected a ToolCall update"),
+        }
+    }
+
+    #[test]
+    fn on_tool_result_ok_emits_completed_update_with_same_id() {
+        let (mut observer, mut rx) = observer_channel();
+        observer.on_tool_result("call_9", "write_file", &ToolOutcome::ok("hi"));
+        match next_update(&mut rx) {
+            acp::SessionUpdate::ToolCallUpdate(tcu) => {
+                assert_eq!(tcu.tool_call_id.0.as_ref(), "call_9");
+                assert_eq!(tcu.fields.status, Some(acp::ToolCallStatus::Completed));
+            }
+            _ => panic!("expected a ToolCallUpdate update"),
+        }
+    }
+
+    #[test]
+    fn on_tool_result_error_emits_failed_update() {
+        let (mut observer, mut rx) = observer_channel();
+        observer.on_tool_result("call_9", "write_file", &ToolOutcome::error("boom"));
+        match next_update(&mut rx) {
+            acp::SessionUpdate::ToolCallUpdate(tcu) => {
+                assert_eq!(tcu.fields.status, Some(acp::ToolCallStatus::Failed));
+            }
+            _ => panic!("expected a ToolCallUpdate update"),
+        }
+    }
+
     #[test]
     fn approver_denies_when_connection_is_gone() {
         let (tx, rx) = mpsc::unbounded_channel::<ClientCall>();
@@ -366,8 +447,7 @@ mod tests {
         let mut approver = AcpApprover {
             calls: tx,
             sid: acp::SessionId::new("s"),
-            tool_counter: 0,
         };
-        assert!(!approver.approve("write_file", &serde_json::json!({})));
+        assert!(!approver.approve("call_1", "write_file", &serde_json::json!({})));
     }
 }

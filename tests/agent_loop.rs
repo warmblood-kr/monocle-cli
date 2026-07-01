@@ -50,7 +50,7 @@ fn loop_executes_tool_then_returns_final_answer() {
         calls: Vec<String>,
     }
     impl Observer for Rec {
-        fn on_tool_call(&mut self, name: &str, _args: &Value) {
+        fn on_tool_call(&mut self, _id: &str, name: &str, _args: &Value) {
             self.calls.push(name.to_string());
         }
     }
@@ -87,7 +87,7 @@ fn denied_side_effecting_tool_is_not_executed() {
 
     struct DenyAll;
     impl Approver for DenyAll {
-        fn approve(&mut self, _name: &str, _args: &Value) -> bool {
+        fn approve(&mut self, _id: &str, _name: &str, _args: &Value) -> bool {
             false
         }
     }

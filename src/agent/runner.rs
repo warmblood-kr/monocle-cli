@@ -38,23 +38,27 @@ impl Cancel {
 /// Decides whether a *side-effecting* tool call may run. Read-only tools are not
 /// gated. (Default policies: [`AllowAll`].)
 pub trait Approver {
-    fn approve(&mut self, tool_name: &str, args: &Value) -> bool;
+    fn approve(&mut self, id: &str, tool_name: &str, args: &Value) -> bool;
 }
 
 /// Approve everything — for tests and explicit local "yolo" runs.
 pub struct AllowAll;
 impl Approver for AllowAll {
-    fn approve(&mut self, _tool_name: &str, _args: &Value) -> bool {
+    fn approve(&mut self, _id: &str, _tool_name: &str, _args: &Value) -> bool {
         true
     }
 }
 
 /// Observes loop steps (for printing / logging). Default = no-op ([`Silent`]).
+///
+/// The `id` on the tool callbacks is the LLM tool-call id (`call.id`), which ties
+/// a call's start (`on_tool_call`) to its completion (`on_tool_result`) — the ACP
+/// surface uses it to correlate `ToolCall` / `ToolCallUpdate` lifecycle updates.
 pub trait Observer {
     /// A chunk of assistant text as it streams in.
     fn on_text_delta(&mut self, _delta: &str) {}
-    fn on_tool_call(&mut self, _name: &str, _args: &Value) {}
-    fn on_tool_result(&mut self, _name: &str, _outcome: &ToolOutcome) {}
+    fn on_tool_call(&mut self, _id: &str, _name: &str, _args: &Value) {}
+    fn on_tool_result(&mut self, _id: &str, _name: &str, _outcome: &ToolOutcome) {}
     /// A meta/control notice (stopped, cancelled) — NOT model answer text, so the
     /// CLI keeps it off the stdout answer channel.
     fn on_notice(&mut self, _msg: &str) {}
@@ -162,12 +166,12 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                             "invalid arguments for `{}` (not valid JSON): {e}",
                             call.function.name
                         ));
-                        observer.on_tool_result(&call.function.name, &outcome);
+                        observer.on_tool_result(&call.id, &call.function.name, &outcome);
                         conversation.push(Message::tool(call.id.clone(), outcome.llm.clone()));
                         continue;
                     }
                 };
-                observer.on_tool_call(&call.function.name, &args);
+                observer.on_tool_call(&call.id, &call.function.name, &args);
 
                 let side_effecting = self
                     .tools
@@ -175,13 +179,14 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                     .map(|t| t.is_side_effecting())
                     .unwrap_or(true);
 
-                let outcome = if side_effecting && !approver.approve(&call.function.name, &args) {
-                    ToolOutcome::error(format!("tool call `{}` denied", call.function.name))
-                } else {
-                    self.tools.run(&self.ctx, &call.function.name, &args)
-                };
+                let outcome =
+                    if side_effecting && !approver.approve(&call.id, &call.function.name, &args) {
+                        ToolOutcome::error(format!("tool call `{}` denied", call.function.name))
+                    } else {
+                        self.tools.run(&self.ctx, &call.function.name, &args)
+                    };
 
-                observer.on_tool_result(&call.function.name, &outcome);
+                observer.on_tool_result(&call.id, &call.function.name, &outcome);
                 conversation.push(Message::tool(call.id.clone(), outcome.llm.clone()));
             }
         }

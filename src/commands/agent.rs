@@ -40,7 +40,7 @@ impl Observer for CliObserver {
         let _ = out.write_all(delta.as_bytes());
         let _ = out.flush();
     }
-    fn on_tool_call(&mut self, name: &str, args: &Value) {
+    fn on_tool_call(&mut self, _id: &str, name: &str, args: &Value) {
         eprintln!(
             "\n{} {} {}",
             c::cyan("⏵"),
@@ -48,7 +48,7 @@ impl Observer for CliObserver {
             c::dim(&one_line(&args.to_string(), 120))
         );
     }
-    fn on_tool_result(&mut self, _name: &str, outcome: &ToolOutcome) {
+    fn on_tool_result(&mut self, _id: &str, _name: &str, outcome: &ToolOutcome) {
         let tag = if outcome.is_error {
             c::red("✗")
         } else {
