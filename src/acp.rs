@@ -9,9 +9,10 @@
 //! a swappable adapter — pinning 0.9 vs migrating to 1.0 is a change to this file
 //! only (the ACP *wire protocol* is the stable contract, not the crate API).
 //!
-//! v1 scope: initialize / new_session / prompt / cancel; tools run locally;
-//! permission is auto-allowed (client `session/request_permission` round-trip and
-//! client fs/terminal callbacks are Phase-3 follow-ups).
+//! Scope: initialize / new_session / prompt / cancel; tools run locally; tool
+//! permission is delegated to the client via `session/request_permission`
+//! (allow/reject). Follow-ups: client fs/terminal callbacks, richer ToolCall
+//! updates, per-session model config.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,11 +20,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_client_protocol::{self as acp, Agent, Client as _};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::providers::{Message, MonocleProvider};
-use crate::agent::runner::{Agent as CoreAgent, AgentConfig, AllowAll, Cancel, Observer};
+use crate::agent::runner::{Agent as CoreAgent, AgentConfig, Approver, Cancel, Observer};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::auth::get_access_token;
 use crate::credentials::Credentials;
@@ -37,6 +38,16 @@ session's working directory. Take minimal, verified steps. When finished, give a
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_MAX_STEPS: usize = 20;
 
+/// A call the (blocking) agent loop needs the async ACP connection to make on
+/// its behalf — either a fire-and-forget update or a permission round-trip.
+enum ClientCall {
+    Notify(acp::SessionNotification),
+    Permission(
+        acp::RequestPermissionRequest,
+        oneshot::Sender<acp::RequestPermissionOutcome>,
+    ),
+}
+
 /// Per-ACP-session state, keyed by session id string.
 struct SessionState {
     convo: Vec<Message>,
@@ -46,13 +57,13 @@ struct SessionState {
 
 struct MonocleAgent {
     /// Outbound `session/update` notifications → forwarded to the connection.
-    updates: mpsc::UnboundedSender<acp::SessionNotification>,
+    updates: mpsc::UnboundedSender<ClientCall>,
     sessions: RefCell<HashMap<String, SessionState>>,
     next_id: AtomicU64,
 }
 
 impl MonocleAgent {
-    fn new(updates: mpsc::UnboundedSender<acp::SessionNotification>) -> Self {
+    fn new(updates: mpsc::UnboundedSender<ClientCall>) -> Self {
         Self {
             updates,
             sessions: RefCell::new(HashMap::new()),
@@ -115,16 +126,26 @@ impl Agent for MonocleAgent {
         let updates = self.updates.clone();
         let sid = args.session_id.clone();
 
-        // Run the SYNC agent-core loop off the async thread; stream updates back.
+        // Run the SYNC agent-core loop off the async thread; stream updates back,
+        // and route side-effecting tool permission to the client (the editor
+        // decides via session/request_permission).
         let joined = tokio::task::spawn_blocking(move || {
-            let mut observer = AcpObserver { updates, sid };
+            let mut observer = AcpObserver {
+                updates: updates.clone(),
+                sid: sid.clone(),
+            };
+            let mut approver = AcpApprover {
+                calls: updates,
+                sid,
+                tool_counter: 0,
+            };
             let session = get_access_token(&Client::new(), &Credentials::new());
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
             let mut config = AgentConfig::new(DEFAULT_MODEL);
             config.max_steps = DEFAULT_MAX_STEPS;
             let agent = CoreAgent::new(&provider, &tools, ToolContext::new(cwd), config);
-            let result = agent.run(&mut convo, &mut AllowAll, &mut observer, &cancel);
+            let result = agent.run(&mut convo, &mut approver, &mut observer, &cancel);
             (convo, cancel.is_cancelled(), result.map(|_| ()))
         })
         .await
@@ -157,7 +178,7 @@ impl Agent for MonocleAgent {
 /// Bridges the sync loop's `Observer` callbacks to ACP `session/update`
 /// notifications (agent message text + tool progress as thought chunks).
 struct AcpObserver {
-    updates: mpsc::UnboundedSender<acp::SessionNotification>,
+    updates: mpsc::UnboundedSender<ClientCall>,
     sid: acp::SessionId,
 }
 
@@ -165,7 +186,10 @@ impl AcpObserver {
     fn send(&self, update: acp::SessionUpdate) {
         let _ = self
             .updates
-            .send(acp::SessionNotification::new(self.sid.clone(), update));
+            .send(ClientCall::Notify(acp::SessionNotification::new(
+                self.sid.clone(),
+                update,
+            )));
     }
 }
 
@@ -191,6 +215,48 @@ impl Observer for AcpObserver {
         self.send(acp::SessionUpdate::AgentThoughtChunk(
             acp::ContentChunk::new(acp::ContentBlock::from(msg.to_string())),
         ));
+    }
+}
+
+/// Bridges the sync loop's `Approver` to ACP `session/request_permission`: the
+/// client (editor) decides whether a side-effecting tool may run. Read-only
+/// tools are never gated (the loop doesn't consult the approver for them).
+struct AcpApprover {
+    calls: mpsc::UnboundedSender<ClientCall>,
+    sid: acp::SessionId,
+    tool_counter: u64,
+}
+
+impl Approver for AcpApprover {
+    fn approve(&mut self, tool_name: &str, args: &serde_json::Value) -> bool {
+        self.tool_counter += 1;
+        let tool_call = acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(format!("tc-{}", self.tool_counter)),
+            acp::ToolCallUpdateFields::new().title(format!("{tool_name} {args}")),
+        );
+        let options = vec![
+            acp::PermissionOption::new(
+                acp::PermissionOptionId::new("allow"),
+                "Allow",
+                acp::PermissionOptionKind::AllowOnce,
+            ),
+            acp::PermissionOption::new(
+                acp::PermissionOptionId::new("reject"),
+                "Reject",
+                acp::PermissionOptionKind::RejectOnce,
+            ),
+        ];
+        let req = acp::RequestPermissionRequest::new(self.sid.clone(), tool_call, options);
+
+        let (tx, rx) = oneshot::channel();
+        if self.calls.send(ClientCall::Permission(req, tx)).is_err() {
+            return false; // connection gone → deny
+        }
+        // Block this off-thread loop until the client answers (or the turn ends).
+        matches!(
+            rx.blocking_recv(),
+            Ok(acp::RequestPermissionOutcome::Selected(sel)) if sel.option_id.0.as_ref() == "allow"
+        )
     }
 }
 
@@ -222,17 +288,30 @@ async fn run() {
     let outgoing = tokio::io::stdout().compat_write();
     let incoming = tokio::io::stdin().compat();
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<acp::SessionNotification>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
     let agent = std::rc::Rc::new(MonocleAgent::new(tx));
 
     let (conn, io_task) = acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
         tokio::task::spawn_local(fut);
     });
 
-    // Forward the loop's queued notifications to the client over the connection.
+    // Make the loop's queued calls to the client over the connection: fire-and-
+    // forget updates, and permission round-trips whose outcome is returned to the
+    // (blocking) loop via the paired oneshot.
     tokio::task::spawn_local(async move {
-        while let Some(note) = rx.recv().await {
-            let _ = conn.session_notification(note).await;
+        while let Some(call) = rx.recv().await {
+            match call {
+                ClientCall::Notify(note) => {
+                    let _ = conn.session_notification(note).await;
+                }
+                ClientCall::Permission(req, ack) => {
+                    let outcome = match conn.request_permission(req).await {
+                        Ok(resp) => resp.outcome,
+                        Err(_) => acp::RequestPermissionOutcome::Cancelled,
+                    };
+                    let _ = ack.send(outcome);
+                }
+            }
         }
     });
 
@@ -251,5 +330,44 @@ mod tests {
         ];
         assert_eq!(prompt_text(&blocks), "hello\nworld");
         assert_eq!(prompt_text(&[]), "");
+    }
+
+    /// Drive `AcpApprover` against a scripted client that answers the permission
+    /// request with the given option id, off-thread (approve() blocks on it).
+    fn approver_with_response(option: &'static str) -> bool {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
+        let responder = std::thread::spawn(move || {
+            if let Some(ClientCall::Permission(_req, ack)) = rx.blocking_recv() {
+                let _ = ack.send(acp::RequestPermissionOutcome::Selected(
+                    acp::SelectedPermissionOutcome::new(option),
+                ));
+            }
+        });
+        let mut approver = AcpApprover {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+            tool_counter: 0,
+        };
+        let granted = approver.approve("write_file", &serde_json::json!({"path": "x"}));
+        responder.join().unwrap();
+        granted
+    }
+
+    #[test]
+    fn approver_grants_only_when_client_selects_allow() {
+        assert!(approver_with_response("allow"));
+        assert!(!approver_with_response("reject"));
+    }
+
+    #[test]
+    fn approver_denies_when_connection_is_gone() {
+        let (tx, rx) = mpsc::unbounded_channel::<ClientCall>();
+        drop(rx); // client/connection gone → the send fails → deny, never block.
+        let mut approver = AcpApprover {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+            tool_counter: 0,
+        };
+        assert!(!approver.approve("write_file", &serde_json::json!({})));
     }
 }
