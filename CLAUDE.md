@@ -34,13 +34,18 @@ Sonnet 종속 비용을 Craft 코어 변경 없이 완화(= 모델 자유도 G1)
 
 - **설계(SDD/에픽):** warmblood-kr/monocle#158 · **구현 상태:** warmblood-kr/monocle-cli#44
 - **코드:** `src/agent/`(`providers`=LLM 추상화/G1, `tools`=read/write/edit +
-  크로스플랫폼 shell, `runner`=agent-core 루프) + `src/commands/agent.rs`
-  (`monocle agent <prompt>`, experimental). 모든 HTTP는 `src/net.rs` 파사드.
-- **작업 브랜치:** `feature/agent-mode-providers` (base `rust-rewrite`/PR #43).
-  push/PR은 승인 게이트 — 로컬 커밋만.
-- **시퀀스(§9):** Phase 0(얼개)✅ → **Phase 1 스트리밍(동기 SSE)+멀티턴**(다음) →
-  Phase 2 세션/스티어링 → Phase 3 **ACP 표면 + 권한**(G4) → Phase 4 정교화.
-- pi(earendil-works/pi, MIT)를 설계 참고로만(코드 차용 X); ACP = Zed Agent Client Protocol.
+  크로스플랫폼 shell, `runner`=agent-core 루프[동기], `session`=JSONL 세션) +
+  `src/commands/agent.rs`(`monocle agent`, REPL/스트리밍/`--session`) +
+  **`src/acp.rs`(`monocle acp` — ACP stdio 서버; async는 여기에만 격리, 코어는 동기)**.
+  모든 HTTP는 `src/net.rs` 파사드.
+- **작업 브랜치:** `feature/agent-mode-acp` (base `rust-rewrite`; providers/agent는
+  PR #45로 `rust-rewrite`에 머지됨). push/PR은 승인 게이트.
+- **시퀀스(§9):** Phase 0(얼개)✅ → Phase 1 스트리밍+멀티턴✅ → Phase 2 세션/
+  듀얼채널✅ → **Phase 3 ACP 표면**✅(구동/스트리밍/권한 위임/ToolCall 라이프사이클/
+  미로그인 생존/세션별 모델[`_meta.monocle.model`]) → Phase 4 정교화(client fs/
+  terminal 콜백 등 남음).
+- pi(earendil-works/pi, MIT)를 설계 참고로만(코드 차용 X); ACP = Zed Agent Client
+  Protocol, crate `agent-client-protocol` 0.9(교체 가능 어댑터, `acp.rs`에 격리).
 
 ## 지식 관리 — wb-para 스킬 적극 사용
 
