@@ -12,7 +12,7 @@
 //! Scope: initialize / new_session / prompt / cancel; tools run locally; tool
 //! permission is delegated to the client via `session/request_permission`; tool
 //! calls stream as correlated `ToolCall`/`ToolCallUpdate` lifecycle updates.
-//! Follow-ups: client fs/terminal callbacks, per-session model config.
+//! Follow-ups: client fs/terminal callbacks.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -53,6 +53,19 @@ struct SessionState {
     convo: Vec<Message>,
     cwd: PathBuf,
     cancel: Cancel,
+    model: String,
+}
+
+/// The model id for a session: the client's `_meta["monocle.model"]` if present
+/// (a string), else `DEFAULT_MODEL`. The id is still routed/validated by monocle
+/// chat-proxy — we only pass it through. Any fallback (meta absent, key absent,
+/// or key not a string) yields `DEFAULT_MODEL`.
+fn session_model(meta: &Option<acp::Meta>) -> String {
+    meta.as_ref()
+        .and_then(|m| m.get("monocle.model"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_MODEL)
+        .to_string()
 }
 
 struct MonocleAgent {
@@ -102,6 +115,7 @@ impl Agent for MonocleAgent {
                 convo: vec![Message::system(SYSTEM_PROMPT)],
                 cwd: args.cwd,
                 cancel: Cancel::new(),
+                model: session_model(&args.meta),
             },
         );
         Ok(acp::NewSessionResponse::new(id))
@@ -111,13 +125,18 @@ impl Agent for MonocleAgent {
         let key = args.session_id.0.to_string();
 
         // Snapshot the session state (release the RefCell borrow before awaiting).
-        let (mut convo, cwd, cancel) = {
+        let (mut convo, cwd, cancel, model) = {
             let mut sessions = self.sessions.borrow_mut();
             let st = sessions
                 .get_mut(&key)
                 .ok_or_else(acp::Error::invalid_params)?;
             st.cancel.reset();
-            (st.convo.clone(), st.cwd.clone(), st.cancel.clone())
+            (
+                st.convo.clone(),
+                st.cwd.clone(),
+                st.cancel.clone(),
+                st.model.clone(),
+            )
         };
 
         let user = prompt_text(&args.prompt);
@@ -144,7 +163,7 @@ impl Agent for MonocleAgent {
             };
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
-            let mut config = AgentConfig::new(DEFAULT_MODEL);
+            let mut config = AgentConfig::new(model);
             config.max_steps = DEFAULT_MAX_STEPS;
             let agent = CoreAgent::new(&provider, &tools, ToolContext::new(cwd), config);
             let result = agent.run(&mut convo, &mut approver, &mut observer, &cancel);
@@ -348,6 +367,34 @@ async fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an `acp::Meta` (a `serde_json::Map`) from a JSON object literal.
+    fn meta(value: serde_json::Value) -> acp::Meta {
+        serde_json::from_value(value).expect("meta must be a JSON object")
+    }
+
+    #[test]
+    fn session_model_defaults_when_meta_absent() {
+        assert_eq!(session_model(&None), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn session_model_defaults_when_key_absent() {
+        let m = meta(serde_json::json!({ "other.key": "x" }));
+        assert_eq!(session_model(&Some(m)), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn session_model_defaults_when_key_not_a_string() {
+        let m = meta(serde_json::json!({ "monocle.model": 42 }));
+        assert_eq!(session_model(&Some(m)), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn session_model_uses_meta_key_when_present() {
+        let m = meta(serde_json::json!({ "monocle.model": "claude-haiku-4-5" }));
+        assert_eq!(session_model(&Some(m)), "claude-haiku-4-5");
+    }
 
     #[test]
     fn prompt_text_joins_text_blocks_and_ignores_non_text() {
