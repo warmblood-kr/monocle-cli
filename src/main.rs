@@ -75,10 +75,10 @@ enum Commands {
         #[arg(long)]
         workdir: Option<String>,
         /// Model id to use (routed via Monocle)
-        #[arg(long, default_value = "claude-sonnet-4-6")]
+        #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
         model: String,
         /// Maximum loop steps before giving up
-        #[arg(long = "max-steps", default_value = "20")]
+        #[arg(long = "max-steps", default_value_t = monocle_cli::agent::DEFAULT_MAX_STEPS)]
         max_steps: usize,
         /// Named session to persist/resume (~/.monocle/agent/<name>.jsonl)
         #[arg(long)]
@@ -100,7 +100,7 @@ enum Commands {
 #[derive(Args)]
 struct ChatArgs {
     /// Model ID to use
-    #[arg(long, default_value = "claude-sonnet-4-6")]
+    #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
     model: String,
     /// System prompt text
     #[arg(long = "system-prompt")]

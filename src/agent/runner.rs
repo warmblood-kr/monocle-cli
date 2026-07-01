@@ -119,6 +119,21 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
         }
     }
 
+    /// Convenience constructor for the default config with a custom step budget —
+    /// the shape both `monocle agent` and the ACP surface build. Keeps the
+    /// `AgentConfig::new` + `max_steps` two-step in one place.
+    pub fn with_max_steps(
+        provider: &'a P,
+        tools: &'a ToolRegistry,
+        ctx: ToolContext,
+        model: impl Into<String>,
+        max_steps: usize,
+    ) -> Self {
+        let mut config = AgentConfig::new(model);
+        config.max_steps = max_steps;
+        Self::new(provider, tools, ctx, config)
+    }
+
     /// Run the loop to completion, appending this turn's assistant/tool messages
     /// to `conversation` (so callers can continue a multi-turn session) and
     /// reporting *why* it stopped (see [`RunStop`]). The model's streamed text is

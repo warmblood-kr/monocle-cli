@@ -24,19 +24,19 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::providers::{Message, MonocleProvider};
-use crate::agent::runner::{Agent as CoreAgent, AgentConfig, Approver, Cancel, Observer, RunStop};
+use crate::agent::runner::{Agent as CoreAgent, Approver, Cancel, Observer, RunStop};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
+use crate::agent::{DEFAULT_MAX_STEPS, DEFAULT_MODEL, SYSTEM_PROMPT};
 use crate::auth::try_access_token;
 use crate::credentials::Credentials;
 use crate::error::{AppError, Result};
 use crate::net::Client;
 
-const SYSTEM_PROMPT: &str = "You are Monocle's headless agent. Use the provided tools \
-(read_file, write_file, edit_file, and the shell) to accomplish the user's task within the \
-session's working directory. Take minimal, verified steps. When finished, give a brief summary.";
-
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
-const DEFAULT_MAX_STEPS: usize = 20;
+/// Permission option ids sent to the client on `session/request_permission` and
+/// matched back on its answer. One symbol tying construct↔compare, so a rename
+/// can't silently break approvals.
+const PERM_ALLOW: &str = "allow";
+const PERM_REJECT: &str = "reject";
 
 /// A call the (blocking) agent loop needs the async ACP connection to make on
 /// its behalf — either a fire-and-forget update or a permission round-trip.
@@ -177,9 +177,13 @@ impl Agent for MonocleAgent {
             convo.push(Message::user(user));
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
-            let mut config = AgentConfig::new(model);
-            config.max_steps = DEFAULT_MAX_STEPS;
-            let agent = CoreAgent::new(&provider, &tools, ToolContext::new(cwd), config);
+            let agent = CoreAgent::with_max_steps(
+                &provider,
+                &tools,
+                ToolContext::new(cwd),
+                model,
+                DEFAULT_MAX_STEPS,
+            );
             let result = agent.run(&mut convo, &mut approver, &mut observer, &cancel);
             (convo, result)
         })
@@ -303,12 +307,12 @@ impl Approver for AcpApprover {
         );
         let options = vec![
             acp::PermissionOption::new(
-                acp::PermissionOptionId::new("allow"),
+                acp::PermissionOptionId::new(PERM_ALLOW),
                 "Allow",
                 acp::PermissionOptionKind::AllowOnce,
             ),
             acp::PermissionOption::new(
-                acp::PermissionOptionId::new("reject"),
+                acp::PermissionOptionId::new(PERM_REJECT),
                 "Reject",
                 acp::PermissionOptionKind::RejectOnce,
             ),
@@ -326,7 +330,7 @@ impl Approver for AcpApprover {
         loop {
             match rx.try_recv() {
                 Ok(acp::RequestPermissionOutcome::Selected(sel)) => {
-                    return sel.option_id.0.as_ref() == "allow";
+                    return sel.option_id.0.as_ref() == PERM_ALLOW;
                 }
                 Ok(_) => return false, // Cancelled outcome → deny
                 Err(oneshot::error::TryRecvError::Empty) => {

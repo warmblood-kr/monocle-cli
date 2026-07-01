@@ -10,19 +10,16 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::providers::{Message, MonocleProvider};
-use crate::agent::runner::{Agent, AgentConfig, AllowAll, Cancel, Observer};
+use crate::agent::runner::{Agent, AllowAll, Cancel, Observer};
 use crate::agent::session::{session_path, SessionStore};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
+use crate::agent::SYSTEM_PROMPT;
 use crate::auth::get_access_token;
 use crate::colors as c;
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
 use crate::util::home_dir;
-
-const SYSTEM_PROMPT: &str = "You are Monocle's headless agent. Use the provided tools \
-(read_file, write_file, edit_file, and the shell) to accomplish the user's task within the \
-working directory. Take minimal, verified steps. When finished, give a brief summary.";
 
 pub struct AgentOptions {
     pub prompt: Option<String>,
@@ -82,13 +79,12 @@ impl Repl<'_> {
         // Fresh token each turn (get_access_token refreshes if near expiry).
         let auth = get_access_token(self.client, self.creds);
         let provider = MonocleProvider::from_session(auth);
-        let mut config = AgentConfig::new(self.model.as_str());
-        config.max_steps = self.max_steps;
-        let agent = Agent::new(
+        let agent = Agent::with_max_steps(
             &provider,
             &self.tools,
             ToolContext::new(self.workdir.clone()),
-            config,
+            self.model.as_str(),
+            self.max_steps,
         );
 
         // Clear any cancel from an idle Ctrl-C press before starting this turn.
