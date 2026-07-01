@@ -6,4 +6,5 @@
 
 pub mod providers;
 pub mod runner;
+pub mod session;
 pub mod tools;
