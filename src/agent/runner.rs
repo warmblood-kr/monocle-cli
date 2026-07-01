@@ -125,7 +125,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                             call.function.name
                         ));
                         observer.on_tool_result(&call.function.name, &outcome);
-                        conversation.push(Message::tool(call.id.clone(), outcome.content.clone()));
+                        conversation.push(Message::tool(call.id.clone(), outcome.llm.clone()));
                         continue;
                     }
                 };
@@ -144,7 +144,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                 };
 
                 observer.on_tool_result(&call.function.name, &outcome);
-                conversation.push(Message::tool(call.id.clone(), outcome.content.clone()));
+                conversation.push(Message::tool(call.id.clone(), outcome.llm.clone()));
             }
         }
 

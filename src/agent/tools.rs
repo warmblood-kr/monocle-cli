@@ -37,25 +37,39 @@ impl ToolContext {
     }
 }
 
-/// The result of running a tool. `is_error` lets the loop/model see failures
-/// without aborting the whole turn.
+/// The result of running a tool, split into two channels (SDD §9a):
+/// `llm` is fed back into the conversation (re-sent every turn → keep bounded);
+/// `ui` is the human/client-facing rendering (falls back to `llm`).
+/// `is_error` lets the loop/model see failures without aborting the whole turn.
 pub struct ToolOutcome {
-    pub content: String,
+    pub llm: String,
+    pub ui: Option<String>,
     pub is_error: bool,
 }
 
 impl ToolOutcome {
-    pub fn ok(content: impl Into<String>) -> Self {
+    pub fn ok(llm: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
+            llm: llm.into(),
+            ui: None,
             is_error: false,
         }
     }
-    pub fn error(content: impl Into<String>) -> Self {
+    pub fn error(llm: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
+            llm: llm.into(),
+            ui: None,
             is_error: true,
         }
+    }
+    /// Attach an explicit human/UI-facing rendering.
+    pub fn with_ui(mut self, ui: impl Into<String>) -> Self {
+        self.ui = Some(ui.into());
+        self
+    }
+    /// The human-facing text (explicit `ui`, else the `llm` channel).
+    pub fn ui_text(&self) -> &str {
+        self.ui.as_deref().unwrap_or(&self.llm)
     }
 }
 
@@ -81,6 +95,25 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> std::result::Result<&'a str, ToolO
     args[key]
         .as_str()
         .ok_or_else(|| ToolOutcome::error(format!("missing or non-string argument: {key}")))
+}
+
+/// Cap on `bash`/`powershell` output fed to the model (re-sent every turn, §9a).
+const MAX_SHELL_CHARS: usize = 20_000;
+
+/// Truncate the middle of long output, keeping head + tail (errors often trail).
+fn cap_output(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let head_n = max * 3 / 5;
+    let tail_n = max - head_n;
+    let head: String = s.chars().take(head_n).collect();
+    let tail: String = s.chars().skip(total - tail_n).collect();
+    format!(
+        "{head}\n[... {} characters omitted ...]\n{tail}",
+        total - head_n - tail_n
+    )
 }
 
 // ── read_file ──────────────────────────────────────────────────────────────
@@ -112,14 +145,18 @@ impl Tool for ReadFile {
             // Cap large reads so one file can't blow the model's context window.
             Ok(content) => {
                 let total = content.chars().count();
-                if total > MAX_READ_CHARS {
+                let (llm, truncated) = if total > MAX_READ_CHARS {
                     let head: String = content.chars().take(MAX_READ_CHARS).collect();
-                    ToolOutcome::ok(format!(
-                        "{head}\n\n[truncated: showing first {MAX_READ_CHARS} of {total} characters]"
-                    ))
+                    (
+                        format!(
+                            "{head}\n\n[truncated: showing first {MAX_READ_CHARS} of {total} characters]"
+                        ),
+                        ", truncated",
+                    )
                 } else {
-                    ToolOutcome::ok(content)
-                }
+                    (content, "")
+                };
+                ToolOutcome::ok(llm).with_ui(format!("read {path} — {total} chars{truncated}"))
             }
             Err(e) => ToolOutcome::error(format!("read_file failed for {path}: {e}")),
         }
@@ -286,19 +323,24 @@ impl Tool for Shell {
                 let code = out.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                let mut content = String::new();
+                let mut combined = String::new();
                 if !stdout.is_empty() {
-                    content.push_str(&stdout);
+                    combined.push_str(&stdout);
                 }
                 if !stderr.is_empty() {
-                    if !content.is_empty() && !content.ends_with('\n') {
-                        content.push('\n');
+                    if !combined.is_empty() && !combined.ends_with('\n') {
+                        combined.push('\n');
                     }
-                    content.push_str(&stderr);
+                    combined.push_str(&stderr);
                 }
-                content.push_str(&format!("\n[exit code: {code}]"));
+                // Cap the LLM-facing output (re-sent every turn — §9a).
+                let llm = format!(
+                    "{}\n[exit code: {code}]",
+                    cap_output(&combined, MAX_SHELL_CHARS)
+                );
                 ToolOutcome {
-                    content,
+                    llm,
+                    ui: Some(format!("exit {code}")),
                     is_error: !out.status.success(),
                 }
             }

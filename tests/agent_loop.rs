@@ -168,7 +168,12 @@ fn conversation_persists_across_turns() {
     let provider = MonocleProvider::new("tok", s.router_url());
     let tools = ToolRegistry::with_defaults();
     let dir = tempfile::tempdir().unwrap();
-    let agent = Agent::new(&provider, &tools, ToolContext::new(dir.path()), AgentConfig::new("any"));
+    let agent = Agent::new(
+        &provider,
+        &tools,
+        ToolContext::new(dir.path()),
+        AgentConfig::new("any"),
+    );
 
     let mut convo = vec![Message::system("s"), Message::user("first")];
     let a1 = agent.run(&mut convo, &mut AllowAll, &mut Silent).unwrap();

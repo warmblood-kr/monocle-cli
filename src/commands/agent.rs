@@ -51,7 +51,7 @@ impl Observer for CliObserver {
         } else {
             c::green("✓")
         };
-        eprintln!("  {} {}", tag, c::dim(&one_line(&outcome.content, 200)));
+        eprintln!("  {} {}", tag, c::dim(&one_line(outcome.ui_text(), 200)));
     }
 }
 
