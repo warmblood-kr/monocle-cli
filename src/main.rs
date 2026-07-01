@@ -61,6 +61,8 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
     },
+    /// [Experimental] Run as an ACP agent over stdio (editors / desktop / Craft)
+    Acp,
     /// List available models from the Monocle router
     Models,
     /// Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
@@ -244,6 +246,7 @@ fn main() {
             claude_command(&creds, &args);
             Ok(())
         }
+        Commands::Acp => monocle_cli::acp::serve(),
         Commands::Models => model_list_command(&client, &creds),
         Commands::Chat(args) => chat_command(&client, &creds, args.into()),
         Commands::Agent {
