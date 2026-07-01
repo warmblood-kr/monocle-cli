@@ -7,7 +7,7 @@ use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::{AppError, Result};
 use crate::net::Client;
-use crate::origin::origin_header;
+use crate::origin::auth_headers;
 
 #[derive(Deserialize)]
 struct ModelInfo {
@@ -39,7 +39,7 @@ pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
 
     let resp = client.get(
         &format!("{}{}", session.router_url, endpoints::MODELS),
-        &[("Authorization", &bearer), origin_header()],
+        &auth_headers(&bearer),
     )?;
 
     if !resp.ok() {

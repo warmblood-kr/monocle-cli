@@ -17,7 +17,7 @@ use crate::auth::AuthSession;
 use crate::endpoints;
 use crate::error::{AppError, Result};
 use crate::net::Client;
-use crate::origin::origin_header;
+use crate::origin::auth_headers;
 
 /// One chat message (OpenAI-compatible). `content` is optional because an
 /// assistant message that only makes tool calls carries no text.
@@ -237,7 +237,7 @@ impl LlmProvider for MonocleProvider {
         let bearer = format!("Bearer {}", self.token);
         let resp = self.client.post_json(
             &format!("{}{}", self.router_url, endpoints::CHAT_COMPLETIONS),
-            &[("Authorization", &bearer), origin_header()],
+            &auth_headers(&bearer),
             &self.build_body(req, false),
         )?;
         if !resp.ok() {
@@ -259,7 +259,7 @@ impl LlmProvider for MonocleProvider {
         let bearer = format!("Bearer {}", self.token);
         let mut stream = self.client.post_json_stream(
             &format!("{}{}", self.router_url, endpoints::CHAT_COMPLETIONS),
-            &[("Authorization", &bearer), origin_header()],
+            &auth_headers(&bearer),
             &self.build_body(req, true),
         )?;
 

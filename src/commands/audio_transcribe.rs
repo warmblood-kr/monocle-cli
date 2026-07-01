@@ -6,7 +6,7 @@ use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
 use crate::net::{Client, FilePart};
-use crate::origin::origin_header;
+use crate::origin::auth_headers;
 
 #[derive(Default)]
 pub struct AudioTranscribeOptions {
@@ -53,7 +53,7 @@ pub fn audio_transcribe_command(
     let bearer = format!("Bearer {}", session.token);
     let resp = client.post_multipart(
         &format!("{}{}", session.router_url, endpoints::AUDIO_TRANSCRIPTIONS),
-        &[("Authorization", &bearer), origin_header()],
+        &auth_headers(&bearer),
         FilePart {
             field: "file".to_string(),
             filename: input.filename,

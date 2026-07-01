@@ -9,7 +9,7 @@ use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::{AppError, Result};
 use crate::net::Client;
-use crate::origin::origin_header;
+use crate::origin::auth_headers;
 
 const DEFAULT_MODEL: &str = "gpt-4o-mini-tts";
 const DEFAULT_VOICE: &str = "alloy";
@@ -63,7 +63,7 @@ pub fn audio_speech_command(
     let bearer = format!("Bearer {}", session.token);
     let resp = client.post_json(
         &format!("{}{}", session.router_url, endpoints::AUDIO_SPEECH),
-        &[("Authorization", &bearer), origin_header()],
+        &auth_headers(&bearer),
         &payload,
     )?;
 

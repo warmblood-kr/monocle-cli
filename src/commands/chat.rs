@@ -1,14 +1,14 @@
 use std::io::{IsTerminal, Write};
 
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
+use crate::agent::providers::{ChatRequest, LlmProvider, Message, MonocleProvider};
 use crate::auth::get_access_token;
 use crate::credentials::Credentials;
 use crate::endpoints;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::net::Client;
-use crate::origin::origin_header;
+use crate::origin::auth_headers;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_MAX_TOKENS: i64 = 4096;
@@ -20,63 +20,27 @@ pub struct ChatOptions {
     pub max_tokens: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ChatChoiceMsg {
-    content: Option<String>,
-}
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: Option<ChatChoiceMsg>,
-}
-#[derive(Deserialize)]
-struct ChatResponse {
-    #[serde(default)]
-    choices: Vec<ChatChoice>,
-}
-
+/// One non-streaming chat turn via the shared provider (chat-proxy routing).
 fn call_chat(
-    client: &Client,
-    router_url: &str,
-    token: &str,
+    provider: &MonocleProvider,
     model: &str,
     system_prompt: Option<&str>,
     user_message: &str,
     max_tokens: i64,
 ) -> Result<String> {
-    let mut messages: Vec<Value> = Vec::new();
+    let mut messages = Vec::new();
     if let Some(sp) = system_prompt {
-        messages.push(json!({ "role": "system", "content": sp }));
+        messages.push(Message::system(sp));
     }
-    messages.push(json!({ "role": "user", "content": user_message }));
+    messages.push(Message::user(user_message));
 
-    let bearer = format!("Bearer {token}");
-    let resp = client.post_json(
-        &format!("{router_url}{}", endpoints::CHAT_COMPLETIONS),
-        &[("Authorization", &bearer), origin_header()],
-        &json!({
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "stream": false,
-        }),
-    )?;
-
-    if !resp.ok() {
-        return Err(AppError::new(format!(
-            "API error {}: {}",
-            resp.status,
-            resp.text()
-        )));
-    }
-
-    let data: ChatResponse = resp.json()?;
-    Ok(data
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message)
-        .and_then(|m| m.content)
-        .unwrap_or_default())
+    let resp = provider.chat(&ChatRequest {
+        model: model.to_string(),
+        messages,
+        max_tokens: Some(max_tokens),
+        ..Default::default()
+    })?;
+    Ok(resp.content)
 }
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
@@ -110,7 +74,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     // Validate the model ID against the available models (non-fatal on failure).
     if let Ok(resp) = client.get(
         &format!("{router_url}{}", endpoints::MODELS),
-        &[("Authorization", &bearer), origin_header()],
+        &auth_headers(&bearer),
     ) {
         if resp.ok() {
             if let Ok(data) = resp.json::<Value>() {
@@ -135,6 +99,8 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         }
     }
 
+    let provider = MonocleProvider::new(token, router_url.clone());
+
     // Non-interactive: stdin is piped.
     if !std::io::stdin().is_terminal() {
         let mut input = String::new();
@@ -146,9 +112,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         eprintln!("Using model: {model}");
         eprintln!("Router: {router_url}");
         let result = call_chat(
-            client,
-            &router_url,
-            &token,
+            &provider,
             &model,
             system_prompt.as_deref(),
             input.trim(),
@@ -192,9 +156,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
 
         eprintln!();
         match call_chat(
-            client,
-            &router_url,
-            &token,
+            &provider,
             &model,
             system_prompt.as_deref(),
             trimmed,
