@@ -107,7 +107,11 @@ fn shell_runs_in_workdir() {
 fn read_file_splits_llm_and_ui_channels() {
     let (_d, ctx) = ctx();
     let reg = ToolRegistry::with_defaults();
-    reg.run(&ctx, "write_file", &json!({"path": "a.txt", "content": "hello"}));
+    reg.run(
+        &ctx,
+        "write_file",
+        &json!({"path": "a.txt", "content": "hello"}),
+    );
 
     let r = reg.run(&ctx, "read_file", &json!({"path": "a.txt"}));
     assert_eq!(r.llm, "hello"); // model sees full content

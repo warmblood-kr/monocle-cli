@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::providers::{LlmProvider, Message, MonocleProvider};
-use crate::agent::runner::{Agent, AgentConfig, AllowAll, Observer};
+use crate::agent::runner::{Agent, AgentConfig, AllowAll, Cancel, Observer};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::auth::get_access_token;
 use crate::colors as c;
@@ -79,12 +79,19 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         c::yellow("⚠ experimental: tools auto-approved (read/write/edit + shell). Run only in a directory you trust.")
     );
 
+    // Ctrl-C cancels the *current turn* (not the process); Ctrl-D / /exit quits.
+    let cancel = Cancel::new();
+    let _ = ctrlc::set_handler({
+        let c = cancel.clone();
+        move || c.cancel()
+    });
+
     let interactive = std::io::stdin().is_terminal();
     let mut convo = vec![Message::system(SYSTEM_PROMPT)];
 
     // Seed the first turn from the prompt arg, or (non-interactive) piped stdin.
     if let Some(p) = opts.prompt {
-        run_turn(&agent, &mut convo, p)?;
+        run_turn(&agent, &mut convo, p, &cancel)?;
     } else if !interactive {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input)?;
@@ -92,7 +99,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
             eprintln!("No input provided.");
             std::process::exit(1);
         }
-        run_turn(&agent, &mut convo, input.trim().to_string())?;
+        run_turn(&agent, &mut convo, input.trim().to_string(), &cancel)?;
     }
 
     // Piped / one-shot: done. Interactive: keep taking follow-ups in the session.
@@ -102,7 +109,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
 
     eprintln!(
         "{}",
-        c::dim("Interactive — type a follow-up; Ctrl-D or /exit to quit.")
+        c::dim("Interactive — Ctrl-C aborts the turn; Ctrl-D or /exit to quit.")
     );
     let stdin = std::io::stdin();
     loop {
@@ -121,7 +128,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
             eprintln!("Bye.");
             break;
         }
-        run_turn(&agent, &mut convo, msg.to_string())?;
+        run_turn(&agent, &mut convo, msg.to_string(), &cancel)?;
     }
     Ok(())
 }
@@ -132,9 +139,12 @@ fn run_turn<P: LlmProvider>(
     agent: &Agent<'_, P>,
     convo: &mut Vec<Message>,
     user: String,
+    cancel: &Cancel,
 ) -> Result<()> {
+    // Clear any cancel from an idle Ctrl-C press before starting this turn.
+    cancel.reset();
     convo.push(Message::user(user));
-    agent.run(convo, &mut AllowAll, &mut CliObserver)?;
+    agent.run(convo, &mut AllowAll, &mut CliObserver, cancel)?;
     let mut out = std::io::stdout();
     out.write_all(b"\n")?;
     out.flush()?;

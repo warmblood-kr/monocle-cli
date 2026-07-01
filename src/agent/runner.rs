@@ -5,11 +5,35 @@
 //! a real scoped-approval / sandboxing policy plugs in here later). An `Observer`
 //! surfaces the loop's steps (the CLI prints them; tests stay silent).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use crate::agent::providers::{ChatRequest, LlmProvider, Message};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::error::Result;
+
+/// A cheap, clonable cancellation flag shared between the loop and whoever can
+/// stop it (a Ctrl-C handler, an ACP `session/cancel`, a test). Checked at each
+/// step boundary — the loop stops gracefully. Pure and trivially testable.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+    pub fn reset(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 /// Decides whether a *side-effecting* tool call may run. Read-only tools are not
 /// gated. (Default policies: [`AllowAll`].)
@@ -82,11 +106,22 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
         conversation: &mut Vec<Message>,
         approver: &mut dyn Approver,
         observer: &mut dyn Observer,
+        cancel: &Cancel,
     ) -> Result<String> {
         let defs = self.tools.defs();
         let mut last_text = String::new();
 
         for _step in 0..self.config.max_steps {
+            // Cancellation is checked at each step boundary (graceful stop).
+            if cancel.is_cancelled() {
+                let notice = "[agent cancelled]".to_string();
+                observer.on_text_delta(&format!("\n{notice}\n"));
+                return Ok(if last_text.is_empty() {
+                    notice
+                } else {
+                    format!("{last_text}\n\n{notice}")
+                });
+            }
             let req = ChatRequest {
                 model: self.config.model.clone(),
                 messages: conversation.clone(),

@@ -1,51 +1,50 @@
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde_json::{json, Value};
 
-use common::stub;
-use monocle_cli::agent::providers::{Message, MonocleProvider};
-use monocle_cli::agent::runner::{Agent, AgentConfig, AllowAll, Approver, Observer, Silent};
+use common::{
+    has_tool_result, text_response, tool_call_response, tool_call_response_raw, FakeProvider,
+};
+use monocle_cli::agent::providers::Message;
+use monocle_cli::agent::runner::{
+    Agent, AgentConfig, AllowAll, Approver, Cancel, Observer, Silent,
+};
 use monocle_cli::agent::tools::{ToolContext, ToolRegistry};
 
-/// Stateful stub LLM: first turn requests a `write_file` tool call; once it sees
-/// a tool-result message in the conversation, it returns a final answer.
-fn write_then_finish_stub() -> common::Stub {
-    stub(|_addr, _method, url, body| {
-        if !url.starts_with("/v1/chat/completions") {
-            return (404, String::new());
-        }
-        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-        let seen_tool_result = req["messages"]
-            .as_array()
-            .map(|ms| ms.iter().any(|m| m["role"] == "tool"))
-            .unwrap_or(false);
+// These tests exercise the loop IN ISOLATION via a scripted `FakeProvider` — no
+// HTTP, no wire format. The wire (Chat Completions / SSE) is covered separately
+// by `agent_providers` / `agent_streaming`.
 
-        let resp = if seen_tool_result {
-            json!({"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]})
-        } else {
-            let args = serde_json::to_string(&json!({"path":"out.txt","content":"hi"})).unwrap();
-            json!({"choices":[{"message":{"role":"assistant","content":"","tool_calls":[
-                {"id":"call_1","type":"function","function":{"name":"write_file","arguments": args}}
-            ]},"finish_reason":"tool_calls"}]})
-        };
-        (200, resp.to_string())
-    })
+fn agent<'a>(
+    provider: &'a FakeProvider,
+    tools: &'a ToolRegistry,
+    dir: &std::path::Path,
+    max_steps: usize,
+) -> Agent<'a, FakeProvider> {
+    let mut config = AgentConfig::new("any");
+    config.max_steps = max_steps;
+    Agent::new(provider, tools, ToolContext::new(dir), config)
 }
 
 #[test]
 fn loop_executes_tool_then_returns_final_answer() {
-    let s = write_then_finish_stub();
-    let provider = MonocleProvider::new("tok", s.router_url());
+    let provider = FakeProvider::new(|req| {
+        if has_tool_result(req) {
+            text_response("done")
+        } else {
+            tool_call_response(
+                "call_1",
+                "write_file",
+                json!({"path":"out.txt","content":"hi"}),
+            )
+        }
+    });
     let tools = ToolRegistry::with_defaults();
     let dir = tempfile::tempdir().unwrap();
-    let agent = Agent::new(
-        &provider,
-        &tools,
-        ToolContext::new(dir.path()),
-        AgentConfig::new("any"),
-    );
+    let agent = agent(&provider, &tools, dir.path(), 20);
 
-    // Observer records which tools were called.
     #[derive(Default)]
     struct Rec {
         calls: Vec<String>,
@@ -57,15 +56,12 @@ fn loop_executes_tool_then_returns_final_answer() {
     }
     let mut rec = Rec::default();
 
+    let mut convo = vec![
+        Message::system("be helpful"),
+        Message::user("write out.txt"),
+    ];
     let answer = agent
-        .run(
-            &mut vec![
-                Message::system("be helpful"),
-                Message::user("write out.txt"),
-            ],
-            &mut AllowAll,
-            &mut rec,
-        )
+        .run(&mut convo, &mut AllowAll, &mut rec, &Cancel::new())
         .unwrap();
 
     assert_eq!(answer, "done");
@@ -78,16 +74,16 @@ fn loop_executes_tool_then_returns_final_answer() {
 
 #[test]
 fn denied_side_effecting_tool_is_not_executed() {
-    let s = write_then_finish_stub();
-    let provider = MonocleProvider::new("tok", s.router_url());
+    let provider = FakeProvider::new(|req| {
+        if has_tool_result(req) {
+            text_response("done")
+        } else {
+            tool_call_response("c", "write_file", json!({"path":"out.txt","content":"hi"}))
+        }
+    });
     let tools = ToolRegistry::with_defaults();
     let dir = tempfile::tempdir().unwrap();
-    let agent = Agent::new(
-        &provider,
-        &tools,
-        ToolContext::new(dir.path()),
-        AgentConfig::new("any"),
-    );
+    let agent = agent(&provider, &tools, dir.path(), 20);
 
     struct DenyAll;
     impl Approver for DenyAll {
@@ -101,11 +97,10 @@ fn denied_side_effecting_tool_is_not_executed() {
             &mut vec![Message::user("write out.txt")],
             &mut DenyAll,
             &mut Silent,
+            &Cancel::new(),
         )
         .unwrap();
 
-    // The model still finishes (it sees the denial as a tool result), but nothing
-    // was written.
     assert_eq!(answer, "done");
     assert!(
         !dir.path().join("out.txt").exists(),
@@ -115,33 +110,19 @@ fn denied_side_effecting_tool_is_not_executed() {
 
 #[test]
 fn loop_stops_at_max_steps() {
-    // Stub that ALWAYS asks for another (read-only) tool call → never finishes.
-    let s = stub(|_a, _m, url, _b| {
-        if !url.starts_with("/v1/chat/completions") {
-            return (404, String::new());
-        }
-        let args = serde_json::to_string(&json!({"path":"whatever"})).unwrap();
-        (
-            200,
-            json!({"choices":[{"message":{"role":"assistant","content":"","tool_calls":[
-                {"id":"c","type":"function","function":{"name":"read_file","arguments": args}}
-            ]},"finish_reason":"tool_calls"}]})
-            .to_string(),
-        )
-    });
-    let provider = MonocleProvider::new("tok", s.router_url());
+    // Always asks for another (read-only) tool call → never finishes.
+    let provider =
+        FakeProvider::new(|_| tool_call_response("c", "read_file", json!({"path":"whatever"})));
     let tools = ToolRegistry::with_defaults();
     let dir = tempfile::tempdir().unwrap();
-    let mut config = AgentConfig::new("any");
-    config.max_steps = 3;
-    let agent = Agent::new(&provider, &tools, ToolContext::new(dir.path()), config);
+    let agent = agent(&provider, &tools, dir.path(), 3);
 
-    // Graceful stop: returns a notice (not a hard error) so partial work isn't lost.
     let answer = agent
         .run(
             &mut vec![Message::user("loop forever")],
             &mut AllowAll,
             &mut Silent,
+            &Cancel::new(),
         )
         .unwrap();
     assert!(answer.contains("stopped after 3 steps"), "got: {answer}");
@@ -149,39 +130,26 @@ fn loop_stops_at_max_steps() {
 
 #[test]
 fn conversation_persists_across_turns() {
-    // No-tool stub whose answer reports how many `user` messages it saw — proof
-    // the conversation carries forward between `run` calls (multi-turn).
-    let s = stub(|_a, _m, url, body| {
-        if !url.starts_with("/v1/chat/completions") {
-            return (404, String::new());
-        }
-        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-        let users = req["messages"]
-            .as_array()
-            .map(|ms| ms.iter().filter(|m| m["role"] == "user").count())
-            .unwrap_or(0);
-        (
-            200,
-            json!({"choices":[{"message":{"role":"assistant","content":format!("seen {users}")},"finish_reason":"stop"}]}).to_string(),
-        )
+    // Answer reports how many `user` messages it saw — proof the conversation
+    // carries forward between `run` calls (multi-turn).
+    let provider = FakeProvider::new(|req| {
+        let users = req.messages.iter().filter(|m| m.role == "user").count();
+        text_response(&format!("seen {users}"))
     });
-    let provider = MonocleProvider::new("tok", s.router_url());
     let tools = ToolRegistry::with_defaults();
     let dir = tempfile::tempdir().unwrap();
-    let agent = Agent::new(
-        &provider,
-        &tools,
-        ToolContext::new(dir.path()),
-        AgentConfig::new("any"),
-    );
+    let agent = agent(&provider, &tools, dir.path(), 20);
 
     let mut convo = vec![Message::system("s"), Message::user("first")];
-    let a1 = agent.run(&mut convo, &mut AllowAll, &mut Silent).unwrap();
+    let a1 = agent
+        .run(&mut convo, &mut AllowAll, &mut Silent, &Cancel::new())
+        .unwrap();
     assert_eq!(a1, "seen 1");
 
-    // `run` appended the assistant answer; a follow-up turn sees both users.
     convo.push(Message::user("second"));
-    let a2 = agent.run(&mut convo, &mut AllowAll, &mut Silent).unwrap();
+    let a2 = agent
+        .run(&mut convo, &mut AllowAll, &mut Silent, &Cancel::new())
+        .unwrap();
     assert_eq!(a2, "seen 2");
 
     // system, user, assistant, user, assistant
@@ -190,41 +158,52 @@ fn conversation_persists_across_turns() {
 
 #[test]
 fn malformed_tool_args_are_reported_to_model_not_swallowed() {
-    // First turn: a tool call whose `arguments` is not valid JSON. Once the model
-    // sees the error tool-result, it recovers with a final answer.
-    let s = stub(|_a, _m, url, body| {
-        if !url.starts_with("/v1/chat/completions") {
-            return (404, String::new());
-        }
-        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-        let seen_tool = req["messages"]
-            .as_array()
-            .map(|ms| ms.iter().any(|m| m["role"] == "tool"))
-            .unwrap_or(false);
-        if seen_tool {
-            (200, json!({"choices":[{"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}]}).to_string())
+    let provider = FakeProvider::new(|req| {
+        if has_tool_result(req) {
+            text_response("recovered")
         } else {
-            (200, json!({"choices":[{"message":{"role":"assistant","content":"","tool_calls":[
-                {"id":"c","type":"function","function":{"name":"write_file","arguments":"{not json"}}
-            ]},"finish_reason":"tool_calls"}]}).to_string())
+            tool_call_response_raw("c", "write_file", "{not json")
         }
     });
-    let provider = MonocleProvider::new("tok", s.router_url());
     let tools = ToolRegistry::with_defaults();
     let dir = tempfile::tempdir().unwrap();
-    let agent = Agent::new(
-        &provider,
-        &tools,
-        ToolContext::new(dir.path()),
-        AgentConfig::new("any"),
-    );
+    let agent = agent(&provider, &tools, dir.path(), 20);
 
     let answer = agent
         .run(
             &mut vec![Message::user("do it")],
             &mut AllowAll,
             &mut Silent,
+            &Cancel::new(),
         )
         .unwrap();
     assert_eq!(answer, "recovered");
+}
+
+#[test]
+fn loop_can_be_cancelled_mid_run() {
+    // The fake cancels after its first response; the loop must stop at the next
+    // step boundary rather than looping forever.
+    let cancel = Cancel::new();
+    let trigger = cancel.clone();
+    let calls = AtomicUsize::new(0);
+    let provider = FakeProvider::new(move |_| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            trigger.cancel();
+        }
+        tool_call_response("c", "read_file", json!({"path":"x"}))
+    });
+    let tools = ToolRegistry::with_defaults();
+    let dir = tempfile::tempdir().unwrap();
+    let agent = agent(&provider, &tools, dir.path(), 100);
+
+    let answer = agent
+        .run(
+            &mut vec![Message::user("go")],
+            &mut AllowAll,
+            &mut Silent,
+            &cancel,
+        )
+        .unwrap();
+    assert!(answer.contains("cancelled"), "got: {answer}");
 }
