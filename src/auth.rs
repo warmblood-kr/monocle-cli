@@ -4,6 +4,7 @@
 //! credentials exist or refresh fails — callers don't handle those cases.
 
 use crate::credentials::{Credentials, CredentialsData};
+use crate::error::{AppError, Result};
 use crate::net::Client;
 use crate::refresh::refresh_access_token;
 use crate::util::{now_ms, parse_iso_ms};
@@ -25,12 +26,16 @@ pub fn router_url_for(creds: &CredentialsData) -> String {
     format!("{scheme}://{}", creds.tenant_domain)
 }
 
-pub fn get_access_token(client: &Client, creds: &Credentials) -> AuthSession {
+/// Non-exiting variant of [`get_access_token`]. Returns an [`AppError`] instead
+/// of printing to stderr and calling `std::process::exit(1)`, so long-lived
+/// callers (e.g. the ACP server) can fail a single request and stay alive.
+pub fn try_access_token(client: &Client, creds: &Credentials) -> Result<AuthSession> {
     let stored = match creds.read() {
         Some(c) => c,
         None => {
-            eprintln!("Not logged in. Run `monocle login --tenant <domain>` first.");
-            std::process::exit(1);
+            return Err(AppError::new(
+                "Not logged in. Run `monocle login --tenant <domain>` first.",
+            ));
         }
     };
 
@@ -42,16 +47,46 @@ pub fn get_access_token(client: &Client, creds: &Credentials) -> AuthSession {
             match refresh_access_token(client, &stored, creds) {
                 Ok(refreshed) => active = refreshed,
                 Err(e) => {
-                    eprintln!("Token refresh failed: {e}");
-                    std::process::exit(1);
+                    return Err(AppError::new(format!("Token refresh failed: {e}")));
                 }
             }
         }
     }
 
     let router_url = router_url_for(&active);
-    AuthSession {
+    Ok(AuthSession {
         token: active.access_token,
         router_url,
+    })
+}
+
+pub fn get_access_token(client: &Client, creds: &Credentials) -> AuthSession {
+    match try_access_token(client, creds) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_access_token_errors_when_not_logged_in() {
+        // Point at an empty temp home so no real `~/.monocle` is consulted and
+        // the missing-credentials branch fires without any network access.
+        let dir = tempfile::tempdir().unwrap();
+        let creds = Credentials::with_home(dir.path());
+
+        match try_access_token(&Client::new(), &creds) {
+            Ok(_) => panic!("absent credentials must return Err, not Ok"),
+            Err(err) => assert!(
+                err.to_string().starts_with("Not logged in"),
+                "unexpected message: {err}"
+            ),
+        }
     }
 }

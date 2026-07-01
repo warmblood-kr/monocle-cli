@@ -26,7 +26,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::agent::providers::{Message, MonocleProvider};
 use crate::agent::runner::{Agent as CoreAgent, AgentConfig, Approver, Cancel, Observer};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
-use crate::auth::get_access_token;
+use crate::auth::try_access_token;
 use crate::credentials::Credentials;
 use crate::error::{AppError, Result};
 use crate::net::Client;
@@ -138,7 +138,10 @@ impl Agent for MonocleAgent {
                 calls: updates,
                 sid,
             };
-            let session = get_access_token(&Client::new(), &Credentials::new());
+            let session = match try_access_token(&Client::new(), &Credentials::new()) {
+                Ok(s) => s,
+                Err(e) => return (convo, cancel.is_cancelled(), Err(e)),
+            };
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
             let mut config = AgentConfig::new(DEFAULT_MODEL);
