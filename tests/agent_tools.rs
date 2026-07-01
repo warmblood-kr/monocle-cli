@@ -1,5 +1,6 @@
 use serde_json::json;
 
+use monocle_cli::agent::runner::Cancel;
 use monocle_cli::agent::tools::{ToolContext, ToolRegistry};
 
 fn ctx() -> (tempfile::TempDir, ToolContext) {
@@ -139,4 +140,76 @@ fn shell_llm_output_is_capped_ui_is_concise() {
         r.llm.chars().count()
     );
     assert_eq!(r.ui_text(), "exit 0");
+}
+
+/// A cancel already set before the shell tool runs returns immediately (well under
+/// the command's 5s runtime) as an error — proves the pre-spawn cancel check.
+#[cfg(unix)]
+#[test]
+fn shell_honors_cancel_set_before_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let ctx = ToolContext::new(dir.path()).with_cancel(cancel);
+    let reg = ToolRegistry::with_defaults();
+
+    let start = std::time::Instant::now();
+    let r = reg.run(&ctx, "bash", &json!({ "command": "sleep 5" }));
+    let elapsed = start.elapsed();
+
+    assert!(r.is_error, "cancelled shell should be an error: {}", r.llm);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "should return promptly, took {elapsed:?}"
+    );
+}
+
+/// A cancel flipped ~100ms into a 5s command kills it mid-run — proves the poll
+/// loop's `child.kill()` path (the whole point of Fix #9).
+#[cfg(unix)]
+#[test]
+fn shell_is_killed_mid_run_on_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = Cancel::new();
+    let ctx = ToolContext::new(dir.path()).with_cancel(cancel.clone());
+    let reg = ToolRegistry::with_defaults();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cancel.cancel();
+    });
+
+    let start = std::time::Instant::now();
+    let r = reg.run(&ctx, "bash", &json!({ "command": "sleep 5" }));
+    let elapsed = start.elapsed();
+
+    assert!(r.is_error, "cancelled shell should be an error: {}", r.llm);
+    assert!(
+        r.llm.contains("cancelled"),
+        "message should mention cancel: {}",
+        r.llm
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "kill should be prompt, took {elapsed:?}"
+    );
+}
+
+/// Regression: the piped/threaded/poll path still runs a normal quick command and
+/// returns its output successfully (a non-cancelled context is the common case).
+#[test]
+fn shell_normal_command_still_succeeds_with_non_cancelled_ctx() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ToolContext::new(dir.path()).with_cancel(Cancel::new());
+    let reg = ToolRegistry::with_defaults();
+
+    #[cfg(not(windows))]
+    let (tool, cmd) = ("bash", "echo hi");
+    #[cfg(windows)]
+    let (tool, cmd) = ("powershell", "Write-Output hi");
+
+    let r = reg.run(&ctx, tool, &json!({ "command": cmd }));
+    assert!(!r.is_error, "{}", r.llm);
+    assert!(r.llm.contains("hi"), "{}", r.llm);
+    assert!(r.llm.contains("[exit code: 0]"), "{}", r.llm);
 }

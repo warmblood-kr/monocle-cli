@@ -180,7 +180,7 @@ impl Agent for MonocleAgent {
             let agent = CoreAgent::with_max_steps(
                 &provider,
                 &tools,
-                ToolContext::new(cwd),
+                ToolContext::new(cwd).with_cancel(cancel.clone()),
                 model,
                 DEFAULT_MAX_STEPS,
             );

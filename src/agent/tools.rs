@@ -7,23 +7,40 @@
 //! seam (see `loop`); tools here just execute. Paths resolve relative to the
 //! tool context's working directory.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::agent::providers::ToolDef;
+use crate::agent::runner::Cancel;
 
-/// Execution context shared by all tools (the working directory the agent acts in).
+/// Execution context shared by all tools (the working directory the agent acts in,
+/// plus the turn's [`Cancel`] flag so long-running tools can be interrupted mid-run).
 pub struct ToolContext {
     pub workdir: PathBuf,
+    /// Cancellation flag for the current turn. Defaults to a fresh, never-set
+    /// `Cancel` (= "not cancellable") so the many `ToolContext::new(cwd)` call
+    /// sites and tests keep working; the real callers attach the turn's flag via
+    /// [`ToolContext::with_cancel`].
+    pub cancel: Cancel,
 }
 
 impl ToolContext {
     pub fn new(workdir: impl Into<PathBuf>) -> Self {
         Self {
             workdir: workdir.into(),
+            cancel: Cancel::new(),
         }
+    }
+
+    /// Attach the turn's cancellation flag so cancellable tools (the shell) can be
+    /// interrupted mid-run instead of only at the step boundary.
+    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// Resolve a (possibly relative) path against the working directory.
@@ -304,6 +321,11 @@ impl Tool for Shell {
             Err(e) => return e,
         };
 
+        // Honor a cancel that landed before we even spawned — don't start work.
+        if ctx.cancel.is_cancelled() {
+            return ToolOutcome::error("shell command cancelled before it started");
+        }
+
         #[cfg(windows)]
         let mut cmd = {
             let mut c = Command::new("powershell");
@@ -316,35 +338,97 @@ impl Tool for Shell {
             c.arg("-c").arg(command);
             c
         };
-        cmd.current_dir(&ctx.workdir);
+        cmd.current_dir(&ctx.workdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        match cmd.output() {
-            Ok(out) => {
-                let code = out.status.code().unwrap_or(-1);
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let mut combined = String::new();
-                if !stdout.is_empty() {
-                    combined.push_str(&stdout);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return ToolOutcome::error(format!("failed to run shell: {e}")),
+        };
+
+        // Drain stdout/stderr on their own threads so a chatty long-running command
+        // can't deadlock the poll loop by filling a pipe buffer.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let drain = |pipe: Option<std::process::ChildStdout>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut buf);
                 }
-                if !stderr.is_empty() {
-                    if !combined.is_empty() && !combined.ends_with('\n') {
-                        combined.push('\n');
+                buf
+            })
+        };
+        let drain_err = |pipe: Option<std::process::ChildStderr>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut buf);
+                }
+                buf
+            })
+        };
+        let out_handle = drain(stdout_pipe);
+        let err_handle = drain_err(stderr_pipe);
+
+        // Poll: exit → done; cancel → kill+reap; else nap and re-check.
+        let mut cancelled = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if ctx.cancel.is_cancelled() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cancelled = true;
+                        break None;
                     }
-                    combined.push_str(&stderr);
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                // Cap the LLM-facing output (re-sent every turn — §9a).
-                let llm = format!(
-                    "{}\n[exit code: {code}]",
-                    cap_output(&combined, MAX_SHELL_CHARS)
-                );
-                ToolOutcome {
-                    llm,
-                    ui: Some(format!("exit {code}")),
-                    is_error: !out.status.success(),
+                Err(e) => {
+                    let _ = child.wait();
+                    return ToolOutcome::error(format!("failed to wait on shell: {e}"));
                 }
             }
-            Err(e) => ToolOutcome::error(format!("failed to run shell: {e}")),
+        };
+
+        // Reader threads finish once the pipes close (on exit or kill).
+        let stdout = out_handle.join().unwrap_or_default();
+        let stderr = err_handle.join().unwrap_or_default();
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        let mut combined = String::new();
+        if !stdout.is_empty() {
+            combined.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&stderr);
+        }
+        // Cap the LLM-facing output (re-sent every turn — §9a).
+        let capped = cap_output(&combined, MAX_SHELL_CHARS);
+
+        if cancelled {
+            let partial = if capped.is_empty() {
+                String::new()
+            } else {
+                format!("\n[partial output before cancel]\n{capped}")
+            };
+            return ToolOutcome::error(format!("shell command cancelled{partial}"))
+                .with_ui("cancelled".to_string());
+        }
+
+        let code = status.and_then(|s| s.code()).unwrap_or(-1);
+        let success = status.map(|s| s.success()).unwrap_or(false);
+        let llm = format!("{capped}\n[exit code: {code}]");
+        ToolOutcome {
+            llm,
+            ui: Some(format!("exit {code}")),
+            is_error: !success,
         }
     }
 }

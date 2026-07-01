@@ -215,6 +215,14 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
 
                 observer.on_tool_result(&call.id, &call.function.name, &outcome);
                 conversation.push(Message::tool(call.id.clone(), outcome.llm.clone()));
+
+                // A cancel that landed during this tool (e.g. a killed shell
+                // command) should stop us promptly: skip the remaining tool calls
+                // in this step so the top-of-step check reports `Cancelled` rather
+                // than running more side effects first.
+                if cancel.is_cancelled() {
+                    break;
+                }
             }
         }
 

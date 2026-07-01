@@ -82,7 +82,7 @@ impl Repl<'_> {
         let agent = Agent::with_max_steps(
             &provider,
             &self.tools,
-            ToolContext::new(self.workdir.clone()),
+            ToolContext::new(self.workdir.clone()).with_cancel(self.cancel.clone()),
             self.model.as_str(),
             self.max_steps,
         );
