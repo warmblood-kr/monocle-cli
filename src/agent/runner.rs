@@ -74,11 +74,12 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
         }
     }
 
-    /// Run the loop to completion, returning the model's final text answer.
-    /// `messages` is the seed conversation (e.g. a system prompt + the user task).
+    /// Run the loop to completion, appending this turn's assistant/tool messages
+    /// to `conversation` (so callers can continue a multi-turn session) and
+    /// returning the model's final text answer.
     pub fn run(
         &self,
-        mut messages: Vec<Message>,
+        conversation: &mut Vec<Message>,
         approver: &mut dyn Approver,
         observer: &mut dyn Observer,
     ) -> Result<String> {
@@ -88,7 +89,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
         for _step in 0..self.config.max_steps {
             let req = ChatRequest {
                 model: self.config.model.clone(),
-                messages: messages.clone(),
+                messages: conversation.clone(),
                 max_tokens: self.config.max_tokens,
                 tools: defs.clone(),
             };
@@ -100,6 +101,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
             // No tool calls → this is the final answer (already streamed to the
             // observer; also returned for programmatic / multi-turn callers).
             if resp.tool_calls.is_empty() {
+                conversation.push(Message::assistant(resp.content.clone()));
                 return Ok(resp.content);
             }
 
@@ -107,7 +109,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                 last_text = resp.content.clone();
             }
             // Replay the assistant's tool-call turn before the matching results.
-            messages.push(Message::assistant_with_tool_calls(
+            conversation.push(Message::assistant_with_tool_calls(
                 resp.content.clone(),
                 resp.tool_calls.clone(),
             ));
@@ -123,7 +125,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                             call.function.name
                         ));
                         observer.on_tool_result(&call.function.name, &outcome);
-                        messages.push(Message::tool(call.id.clone(), outcome.content.clone()));
+                        conversation.push(Message::tool(call.id.clone(), outcome.content.clone()));
                         continue;
                     }
                 };
@@ -142,7 +144,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                 };
 
                 observer.on_tool_result(&call.function.name, &outcome);
-                messages.push(Message::tool(call.id.clone(), outcome.content.clone()));
+                conversation.push(Message::tool(call.id.clone(), outcome.content.clone()));
             }
         }
 

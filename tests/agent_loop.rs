@@ -59,7 +59,7 @@ fn loop_executes_tool_then_returns_final_answer() {
 
     let answer = agent
         .run(
-            vec![
+            &mut vec![
                 Message::system("be helpful"),
                 Message::user("write out.txt"),
             ],
@@ -98,7 +98,7 @@ fn denied_side_effecting_tool_is_not_executed() {
 
     let answer = agent
         .run(
-            vec![Message::user("write out.txt")],
+            &mut vec![Message::user("write out.txt")],
             &mut DenyAll,
             &mut Silent,
         )
@@ -139,12 +139,48 @@ fn loop_stops_at_max_steps() {
     // Graceful stop: returns a notice (not a hard error) so partial work isn't lost.
     let answer = agent
         .run(
-            vec![Message::user("loop forever")],
+            &mut vec![Message::user("loop forever")],
             &mut AllowAll,
             &mut Silent,
         )
         .unwrap();
     assert!(answer.contains("stopped after 3 steps"), "got: {answer}");
+}
+
+#[test]
+fn conversation_persists_across_turns() {
+    // No-tool stub whose answer reports how many `user` messages it saw — proof
+    // the conversation carries forward between `run` calls (multi-turn).
+    let s = stub(|_a, _m, url, body| {
+        if !url.starts_with("/v1/chat/completions") {
+            return (404, String::new());
+        }
+        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+        let users = req["messages"]
+            .as_array()
+            .map(|ms| ms.iter().filter(|m| m["role"] == "user").count())
+            .unwrap_or(0);
+        (
+            200,
+            json!({"choices":[{"message":{"role":"assistant","content":format!("seen {users}")},"finish_reason":"stop"}]}).to_string(),
+        )
+    });
+    let provider = MonocleProvider::new("tok", s.router_url());
+    let tools = ToolRegistry::with_defaults();
+    let dir = tempfile::tempdir().unwrap();
+    let agent = Agent::new(&provider, &tools, ToolContext::new(dir.path()), AgentConfig::new("any"));
+
+    let mut convo = vec![Message::system("s"), Message::user("first")];
+    let a1 = agent.run(&mut convo, &mut AllowAll, &mut Silent).unwrap();
+    assert_eq!(a1, "seen 1");
+
+    // `run` appended the assistant answer; a follow-up turn sees both users.
+    convo.push(Message::user("second"));
+    let a2 = agent.run(&mut convo, &mut AllowAll, &mut Silent).unwrap();
+    assert_eq!(a2, "seen 2");
+
+    // system, user, assistant, user, assistant
+    assert_eq!(convo.len(), 5);
 }
 
 #[test]
@@ -179,7 +215,11 @@ fn malformed_tool_args_are_reported_to_model_not_swallowed() {
     );
 
     let answer = agent
-        .run(vec![Message::user("do it")], &mut AllowAll, &mut Silent)
+        .run(
+            &mut vec![Message::user("do it")],
+            &mut AllowAll,
+            &mut Silent,
+        )
         .unwrap();
     assert_eq!(answer, "recovered");
 }

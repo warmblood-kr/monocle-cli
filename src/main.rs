@@ -67,8 +67,8 @@ enum Commands {
     Chat(ChatArgs),
     /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
     Agent {
-        /// The task/prompt for the agent
-        prompt: String,
+        /// The task/prompt (optional; omit to type it interactively, or pipe via stdin)
+        prompt: Option<String>,
         /// Working directory the agent acts in (default: current directory)
         #[arg(long)]
         workdir: Option<String>,

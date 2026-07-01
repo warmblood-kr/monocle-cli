@@ -4,12 +4,12 @@
 //! edit + cross-platform shell) into the agent-core loop, prints progress to
 //! stderr, and the final answer to stdout.
 
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::agent::providers::{Message, MonocleProvider};
+use crate::agent::providers::{LlmProvider, Message, MonocleProvider};
 use crate::agent::runner::{Agent, AgentConfig, AllowAll, Observer};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::auth::get_access_token;
@@ -18,12 +18,12 @@ use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
 
-const SYSTEM_PROMPT: &str = "You are Monocle's headless coding agent. Use the provided tools \
+const SYSTEM_PROMPT: &str = "You are Monocle's headless agent. Use the provided tools \
 (read_file, write_file, edit_file, and the shell) to accomplish the user's task within the \
 working directory. Take minimal, verified steps. When finished, give a brief summary.";
 
 pub struct AgentOptions {
-    pub prompt: String,
+    pub prompt: Option<String>,
     pub workdir: Option<String>,
     pub model: String,
     pub max_steps: usize,
@@ -79,14 +79,62 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         c::yellow("⚠ experimental: tools auto-approved (read/write/edit + shell). Run only in a directory you trust.")
     );
 
-    // Assistant text (including the final answer) is streamed to stdout by the
-    // observer as it arrives; we don't reprint the returned value.
-    agent.run(
-        vec![Message::system(SYSTEM_PROMPT), Message::user(opts.prompt)],
-        &mut AllowAll,
-        &mut CliObserver,
-    )?;
+    let interactive = std::io::stdin().is_terminal();
+    let mut convo = vec![Message::system(SYSTEM_PROMPT)];
 
+    // Seed the first turn from the prompt arg, or (non-interactive) piped stdin.
+    if let Some(p) = opts.prompt {
+        run_turn(&agent, &mut convo, p)?;
+    } else if !interactive {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        if input.trim().is_empty() {
+            eprintln!("No input provided.");
+            std::process::exit(1);
+        }
+        run_turn(&agent, &mut convo, input.trim().to_string())?;
+    }
+
+    // Piped / one-shot: done. Interactive: keep taking follow-ups in the session.
+    if !interactive {
+        return Ok(());
+    }
+
+    eprintln!(
+        "{}",
+        c::dim("Interactive — type a follow-up; Ctrl-D or /exit to quit.")
+    );
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("\n{} ", c::cyan("»"));
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            eprintln!("\nBye.");
+            break;
+        }
+        let msg = line.trim();
+        if msg.is_empty() {
+            continue;
+        }
+        if msg == "/exit" || msg == "/quit" {
+            eprintln!("Bye.");
+            break;
+        }
+        run_turn(&agent, &mut convo, msg.to_string())?;
+    }
+    Ok(())
+}
+
+/// Run one user turn to completion: append the message, stream the agent's
+/// answer to stdout (via the observer), and terminate the streamed line.
+fn run_turn<P: LlmProvider>(
+    agent: &Agent<'_, P>,
+    convo: &mut Vec<Message>,
+    user: String,
+) -> Result<()> {
+    convo.push(Message::user(user));
+    agent.run(convo, &mut AllowAll, &mut CliObserver)?;
     let mut out = std::io::stdout();
     out.write_all(b"\n")?;
     out.flush()?;
