@@ -196,6 +196,10 @@ tools in a working directory. Give it a task as an argument, pipe it via stdin, 
 it for an interactive REPL. Progress goes to stderr, the answer to stdout; `--session
 <name>` persists/resumes a conversation.
 
+The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
+and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
+Command history persists across sessions in `~/.monocle/agent_history`.
+
 In the interactive REPL, lines starting with `/` are local management commands (handled
 without calling the model, printed to stderr): `/help` lists them, `/config` shows the
 session config (model, max-steps, workdir, session), `/status` adds your login status,

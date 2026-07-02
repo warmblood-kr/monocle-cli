@@ -7,6 +7,8 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use serde_json::Value;
 
 use crate::agent::providers::{Message, MonocleProvider};
@@ -305,63 +307,95 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     eprintln!(
         "{}",
         c::dim(
-            "Interactive — /help for commands; Ctrl-C aborts the turn; Ctrl-D or /exit to quit."
+            "Interactive — ↑/↓ history, ←/→ & Ctrl-A/E/K/Y editing; /help for commands; Ctrl-C aborts the turn; Ctrl-D or /exit to quit."
         )
     );
-    let stdin = std::io::stdin();
+
+    // rustyline gives the input line proper editing (←/→, ↑/↓ history, Emacs
+    // Ctrl-A/E/K/Y) with its default Emacs keymap + file history. It is used
+    // ONLY here, on the interactive TTY path — the headless / piped / ACP paths
+    // above never touch it, keeping the engine UI-free (CLAUDE.md 설계 원칙:
+    // rich UI is the host's job via `monocle acp`). This is input-line editing
+    // only; it does not take over scrollback/paging.
+    let mut rl = DefaultEditor::new().map_err(|e| crate::error::AppError::new(e.to_string()))?;
+    let history_path = home_dir().join(".monocle").join("agent_history");
+    if let Some(parent) = history_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Best-effort history persistence: a missing/unreadable file just means an
+    // empty history this session.
+    let _ = rl.load_history(&history_path);
+
+    // rustyline reads the prompt in raw mode, where Ctrl-C surfaces as
+    // `Interrupted` WITHOUT raising SIGINT — so the `ctrlc` turn-cancel handler
+    // is not triggered at the idle prompt (we just start a fresh line). During a
+    // turn the terminal is back in cooked mode, so Ctrl-C raises SIGINT and that
+    // handler cancels the running turn, exactly as before.
+    let prompt = format!("{} ", c::cyan("»"));
     loop {
-        eprint!("\n{} ", c::cyan("»"));
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        if stdin.read_line(&mut line)? == 0 {
-            eprintln!("\nBye.");
-            break;
-        }
-        let msg = line.trim();
-        if msg.is_empty() {
-            continue;
-        }
-        // Slash commands are handled locally (never sent to the agent/LLM), and
-        // printed to stderr so stdout stays the clean answer channel.
-        match dispatch_command(msg) {
-            Command::Quit => {
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let msg = line.trim();
+                if msg.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(line.as_str());
+                // Slash commands are handled locally (never sent to the agent/LLM),
+                // and printed to stderr so stdout stays the clean answer channel.
+                match dispatch_command(msg) {
+                    Command::Quit => {
+                        eprintln!("Bye.");
+                        break;
+                    }
+                    Command::Help => eprintln!("{}", help_text()),
+                    Command::Config => eprintln!(
+                        "{}",
+                        config_text(
+                            &repl.model,
+                            repl.max_steps,
+                            &repl.workdir,
+                            repl.session_name()
+                        )
+                    ),
+                    Command::Status => {
+                        let login = repl.login_view();
+                        eprintln!(
+                            "{}",
+                            status_text(
+                                login.as_ref(),
+                                &repl.model,
+                                repl.max_steps,
+                                &repl.workdir,
+                                repl.session_name(),
+                            )
+                        );
+                    }
+                    Command::Unknown(cmd) => {
+                        eprintln!("unknown command: {cmd} (try /help)");
+                    }
+                    Command::Turn => {
+                        // A transient per-turn error must not tear down the session.
+                        if let Err(e) = repl.run_turn(msg.to_string()) {
+                            eprintln!("{} {e}", c::red("Error:"));
+                        }
+                    }
+                }
+            }
+            // Ctrl-C at the idle prompt: don't quit — just start a fresh prompt.
+            Err(ReadlineError::Interrupted) => continue,
+            // Ctrl-D (EOF): quit, matching the previous read_line behavior.
+            Err(ReadlineError::Eof) => {
                 eprintln!("Bye.");
                 break;
             }
-            Command::Help => eprintln!("{}", help_text()),
-            Command::Config => eprintln!(
-                "{}",
-                config_text(
-                    &repl.model,
-                    repl.max_steps,
-                    &repl.workdir,
-                    repl.session_name()
-                )
-            ),
-            Command::Status => {
-                let login = repl.login_view();
-                eprintln!(
-                    "{}",
-                    status_text(
-                        login.as_ref(),
-                        &repl.model,
-                        repl.max_steps,
-                        &repl.workdir,
-                        repl.session_name(),
-                    )
-                );
-            }
-            Command::Unknown(cmd) => {
-                eprintln!("unknown command: {cmd} (try /help)");
-            }
-            Command::Turn => {
-                // A transient per-turn error must not tear down the interactive session.
-                if let Err(e) = repl.run_turn(msg.to_string()) {
-                    eprintln!("{} {e}", c::red("Error:"));
-                }
+            Err(e) => {
+                eprintln!("{} {e}", c::red("Error:"));
+                break;
             }
         }
     }
+
+    let _ = rl.save_history(&history_path);
     Ok(())
 }
 
