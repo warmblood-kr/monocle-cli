@@ -34,6 +34,10 @@ agent-client-protocol = "0.9"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "io-std", "macros", "sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+# Trait-only crate (already in the tree) to name the ACP transport's byte-stream
+# bound (AsyncRead/AsyncWrite), so `acp::serve_over` is generic over the transport
+# — stdio today, socket/WebSocket later (two-way door). No heavy runtime deps.
+futures-io = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

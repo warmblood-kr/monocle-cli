@@ -675,14 +675,29 @@ pub fn serve() -> Result<()> {
         .build()
         .map_err(|e| AppError::new(e.to_string()))?;
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, run());
+    local.block_on(&rt, run_stdio());
     Ok(())
 }
 
-async fn run() {
+/// Set up stdio as the transport and drive the ACP agent over it. stdio is ACP's
+/// standard (and today only) transport — the client spawns us and talks over
+/// stdin/stdout.
+async fn run_stdio() {
     let outgoing = tokio::io::stdout().compat_write();
     let incoming = tokio::io::stdin().compat();
+    serve_over(incoming, outgoing).await;
+}
 
+/// Drive the ACP agent over an arbitrary transport: raw byte streams carrying
+/// newline-delimited JSON-RPC. `run_stdio` is today's only caller; a future
+/// socket / WebSocket channel is just another caller with different streams — the
+/// JSON-RPC message layer is identical, so a new transport is additive, not a
+/// rewrite (two-way door, per the interop design principle in CLAUDE.md).
+async fn serve_over<I, O>(incoming: I, outgoing: O)
+where
+    I: futures_io::AsyncRead + Unpin + 'static,
+    O: futures_io::AsyncWrite + Unpin + 'static,
+{
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
     let agent = std::rc::Rc::new(MonocleAgent::new(tx));
     // Hold a second handle so we can cancel in-flight sessions on shutdown (Fix #6).

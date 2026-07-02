@@ -956,6 +956,7 @@ dependencies = [
  "chrono",
  "clap",
  "ctrlc",
+ "futures-io",
  "open",
  "rand 0.8.6",
  "reqwest",
