@@ -20,14 +20,17 @@ pub(crate) enum Management {
     Config,
 }
 
-/// Recognize a bare management-command invocation (with or without a leading `/`).
-/// Returns `None` for anything else (normal input). Used by BOTH the REPL and ACP.
-/// Case-sensitive, exact word only — `helpme` / `/bogus` are not management.
+/// Recognize a management-command invocation. The leading `/` is REQUIRED so a
+/// legitimate one-word prompt like `help` (meaning "help me") reaches the model
+/// instead of being hijacked into a local response. ACP clients advertise these
+/// with slash-less names (`help`) but render/transmit them with the slash
+/// (`/help`), matching how the REPL's own dispatch works. Returns `None` for
+/// anything else (normal input). Case-sensitive, exact word only.
 pub(crate) fn management_command(input: &str) -> Option<Management> {
     match input.trim() {
-        "help" | "/help" => Some(Management::Help),
-        "status" | "/status" => Some(Management::Status),
-        "config" | "/config" => Some(Management::Config),
+        "/help" => Some(Management::Help),
+        "/status" => Some(Management::Status),
+        "/config" => Some(Management::Config),
         _ => None,
     }
 }
@@ -115,22 +118,23 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn management_command_recognizes_bare_and_slashed() {
-        assert_eq!(management_command("help"), Some(Management::Help));
+    fn management_command_requires_leading_slash() {
         assert_eq!(management_command("/help"), Some(Management::Help));
-        assert_eq!(management_command("status"), Some(Management::Status));
         assert_eq!(management_command("/status"), Some(Management::Status));
-        assert_eq!(management_command("config"), Some(Management::Config));
         assert_eq!(management_command("/config"), Some(Management::Config));
     }
 
     #[test]
     fn management_command_trims_surrounding_whitespace() {
-        assert_eq!(management_command("  help  "), Some(Management::Help));
+        assert_eq!(management_command("  /help  "), Some(Management::Help));
     }
 
     #[test]
     fn management_command_returns_none_for_normal_input() {
+        // Bare words are NOT commands — a legit prompt "help" reaches the model.
+        assert_eq!(management_command("help"), None);
+        assert_eq!(management_command("status"), None);
+        assert_eq!(management_command("config"), None);
         assert_eq!(management_command("hello"), None);
         assert_eq!(management_command(""), None);
         assert_eq!(management_command("/bogus"), None);
