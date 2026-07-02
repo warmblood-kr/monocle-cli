@@ -4,6 +4,7 @@
 //! This is the §9 step-1 spike: the `providers` abstraction only. The agent loop,
 //! tools, permission/sandboxing, session, and ACP surface come later.
 
+pub mod commands;
 pub mod providers;
 pub mod runner;
 pub mod session;

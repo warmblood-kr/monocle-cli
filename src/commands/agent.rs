@@ -5,12 +5,13 @@
 //! stderr, and the final answer to stdout.
 
 use std::io::{IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::Value;
 
+use crate::agent::commands::{config_text, help_text, login_view, status_text};
 use crate::agent::providers::{Message, MonocleProvider};
 use crate::agent::runner::{Agent, AllowAll, Cancel, Observer};
 use crate::agent::session::{session_path, SessionStore};
@@ -21,7 +22,7 @@ use crate::colors as c;
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
-use crate::util::{home_dir, now_ms, parse_iso_ms};
+use crate::util::home_dir;
 
 pub struct AgentOptions {
     pub prompt: Option<String>,
@@ -84,21 +85,6 @@ impl Repl<'_> {
             .as_ref()
             .and_then(|s| s.path().file_stem())
             .and_then(|s| s.to_str())
-    }
-
-    /// Build a plain login snapshot from stored credentials, without calling
-    /// `get_access_token` (which would refresh / exit the process). Reads only.
-    fn login_view(&self) -> Option<LoginView> {
-        let data = self.creds.read()?;
-        let expired = match parse_iso_ms(&data.access_token_expires_at) {
-            Some(exp) => now_ms() + EXPIRY_BUFFER_MS > exp,
-            None => true,
-        };
-        Some(LoginView {
-            tenant: format!("{} ({})", data.tenant_name, data.tenant_domain),
-            email: data.email,
-            expired,
-        })
     }
 
     fn run_turn(&mut self, user: String) -> Result<()> {
@@ -168,62 +154,6 @@ fn dispatch_command(input: &str) -> Command {
         "/exit" | "/quit" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     }
-}
-
-/// Plain login snapshot for `/status`, built by the REPL from `creds.read()` so
-/// the formatter stays pure (no IO / no `Credentials` dependency).
-struct LoginView {
-    tenant: String,
-    email: String,
-    expired: bool,
-}
-
-/// Same 5-minute buffer the auth refresh path uses, so "expired" here matches
-/// when a turn would actually trigger a refresh.
-const EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
-
-fn help_text() -> String {
-    [
-        "commands:",
-        "  /help    show this help",
-        "  /config  show session config (model, max-steps, workdir, session)",
-        "  /status  show login status and session config",
-        "  /exit    quit the REPL (also /quit, Ctrl-D)",
-    ]
-    .join("\n")
-}
-
-fn config_text(model: &str, max_steps: usize, workdir: &Path, session: Option<&str>) -> String {
-    format!(
-        "model:     {}\nmax-steps: {}\nworkdir:   {}\nsession:   {}",
-        model,
-        max_steps,
-        workdir.display(),
-        session.unwrap_or("(none)"),
-    )
-}
-
-fn status_text(
-    login: Option<&LoginView>,
-    model: &str,
-    max_steps: usize,
-    workdir: &Path,
-    session: Option<&str>,
-) -> String {
-    let head = match login {
-        Some(v) => format!(
-            "logged in as {} — {}\naccess token: {}",
-            v.email,
-            v.tenant,
-            if v.expired { "expired" } else { "valid" },
-        ),
-        None => "not logged in".to_string(),
-    };
-    format!(
-        "{}\n{}",
-        head,
-        config_text(model, max_steps, workdir, session)
-    )
 }
 
 pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -> Result<()> {
@@ -358,7 +288,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
                         )
                     ),
                     Command::Status => {
-                        let login = repl.login_view();
+                        let login = login_view(repl.creds);
                         eprintln!(
                             "{}",
                             status_text(
@@ -413,7 +343,6 @@ fn one_line(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn dispatch_recognizes_management_commands() {
@@ -436,61 +365,5 @@ mod tests {
     fn dispatch_passes_through_plain_text() {
         assert_eq!(dispatch_command("hello world"), Command::Turn);
         assert_eq!(dispatch_command("summarize the /etc dir"), Command::Turn);
-    }
-
-    #[test]
-    fn help_text_lists_each_command() {
-        let h = help_text();
-        for cmd in ["/help", "/config", "/status", "/exit"] {
-            assert!(h.contains(cmd), "help missing {cmd}: {h}");
-        }
-    }
-
-    #[test]
-    fn config_text_shows_fields_and_none_session() {
-        let wd = PathBuf::from("/tmp/work");
-        let out = config_text("claude-x", 12, &wd, None);
-        assert!(out.contains("claude-x"), "{out}");
-        assert!(out.contains("12"), "{out}");
-        assert!(out.contains("/tmp/work"), "{out}");
-        assert!(out.contains("(none)"), "{out}");
-    }
-
-    #[test]
-    fn config_text_shows_named_session() {
-        let wd = PathBuf::from("/tmp/work");
-        let out = config_text("claude-x", 12, &wd, Some("mysess"));
-        assert!(out.contains("mysess"), "{out}");
-        assert!(!out.contains("(none)"), "{out}");
-    }
-
-    #[test]
-    fn status_text_logged_out() {
-        let wd = PathBuf::from("/tmp/work");
-        let out = status_text(None, "m", 3, &wd, None);
-        assert!(out.contains("not logged in"), "{out}");
-        // Config block is still shown.
-        assert!(out.contains("/tmp/work"), "{out}");
-    }
-
-    #[test]
-    fn status_text_logged_in_valid_and_expired() {
-        let wd = PathBuf::from("/tmp/work");
-        let view = LoginView {
-            tenant: "Acme (acme.example.com)".to_string(),
-            email: "a@b.com".to_string(),
-            expired: false,
-        };
-        let out = status_text(Some(&view), "m", 3, &wd, None);
-        assert!(out.contains("logged in as a@b.com"), "{out}");
-        assert!(out.contains("Acme (acme.example.com)"), "{out}");
-        assert!(out.contains("valid"), "{out}");
-
-        let expired = LoginView {
-            expired: true,
-            ..view
-        };
-        let out = status_text(Some(&expired), "m", 3, &wd, None);
-        assert!(out.contains("expired"), "{out}");
     }
 }

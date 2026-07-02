@@ -28,6 +28,9 @@ use agent_client_protocol::{self as acp, Agent, Client as _};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::agent::commands::{
+    config_text, help_text, login_view, management_command, status_text, Management,
+};
 use crate::agent::providers::{Message, MonocleProvider};
 use crate::agent::runner::{Agent as CoreAgent, Approver, Cancel, Observer, RunStop};
 use crate::agent::tools::{
@@ -124,6 +127,49 @@ impl MonocleAgent {
             client_caps: RefCell::new(acp::ClientCapabilities::default()),
         }
     }
+
+    /// Read a session's model + working directory (brief `RefCell` borrow), for
+    /// rendering the `config`/`status` management responses. Falls back to the
+    /// defaults if the session is unknown (a client only prompts sessions it made).
+    fn session_config(&self, key: &str) -> (String, PathBuf) {
+        self.sessions
+            .borrow()
+            .get(key)
+            .map(|st| (st.model.clone(), st.cwd.clone()))
+            .unwrap_or_else(|| (DEFAULT_MODEL.to_string(), PathBuf::new()))
+    }
+
+    /// Build the text answer for a locally-handled management command, reusing the
+    /// REPL's shared formatters (DRY). Reads only — never touches `convo`/`running`.
+    /// The ACP "session name" shown in the output is the session id string (`key`).
+    fn management_response(&self, key: &str, cmd: Management) -> String {
+        match cmd {
+            Management::Help => help_text(),
+            Management::Config => {
+                let (model, cwd) = self.session_config(key);
+                config_text(&model, DEFAULT_MAX_STEPS, &cwd, Some(key))
+            }
+            Management::Status => {
+                let (model, cwd) = self.session_config(key);
+                let login = login_view(&Credentials::new());
+                status_text(login.as_ref(), &model, DEFAULT_MAX_STEPS, &cwd, Some(key))
+            }
+        }
+    }
+}
+
+/// The management commands advertised to the ACP client on `new_session` (names
+/// WITHOUT a leading slash — the client adds the slash UI). Kept as a tiny builder
+/// so it can be unit-tested independently of the async `new_session` path.
+fn advertised_commands() -> Vec<acp::AvailableCommand> {
+    vec![
+        acp::AvailableCommand::new("help", "Show available commands"),
+        acp::AvailableCommand::new("status", "Show login status and session config"),
+        acp::AvailableCommand::new(
+            "config",
+            "Show the session config (model, working directory)",
+        ),
+    ]
 }
 
 #[async_trait::async_trait(?Send)]
@@ -163,11 +209,41 @@ impl Agent for MonocleAgent {
                 running: false,
             },
         );
+        // Advertise the locally-handled management commands so an ACP client can
+        // surface them (slash menu). These are answered by `prompt()` without ever
+        // reaching the LLM (see `management_command`).
+        let _ = self
+            .updates
+            .send(ClientCall::Notify(acp::SessionNotification::new(
+                id.clone(),
+                acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+                    advertised_commands(),
+                )),
+            )));
         Ok(acp::NewSessionResponse::new(id))
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
         let key = args.session_id.0.to_string();
+        let user = prompt_text(&args.prompt);
+
+        // Management commands (help/status/config) are answered LOCALLY: a
+        // synchronous local response streamed back as a normal agent turn, never
+        // sent to the LLM. Handle it before the running-guard / mem::take / LLM
+        // path, and do NOT append it (or its output) to the session `convo` — this
+        // keeps management chatter out of the model's conversation history.
+        if let Some(cmd) = management_command(&user) {
+            let text = self.management_response(&key, cmd);
+            let _ = self
+                .updates
+                .send(ClientCall::Notify(acp::SessionNotification::new(
+                    args.session_id.clone(),
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                        acp::ContentBlock::from(text),
+                    )),
+                )));
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
 
         // Claim the session and MOVE its conversation out for the turn (leaving an
         // empty Vec behind). Reject an overlapping prompt for the same session —
@@ -191,7 +267,6 @@ impl Agent for MonocleAgent {
             )
         };
 
-        let user = prompt_text(&args.prompt);
         let updates = self.updates.clone();
         let sid = args.session_id.clone();
 
@@ -1148,6 +1223,46 @@ mod tests {
         assert!(!r.cancelled);
         assert_eq!(r.exit_code, None);
         assert!(r.output.contains("unavailable"), "{}", r.output);
+    }
+
+    #[test]
+    fn advertised_commands_names_help_status_config() {
+        let names: Vec<String> = advertised_commands()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, vec!["help", "status", "config"]);
+    }
+
+    #[test]
+    fn new_session_advertises_management_commands() {
+        // Drive the real `new_session` and drain the updates channel to confirm it
+        // enqueues an AvailableCommandsUpdate naming help/status/config.
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
+        let agent = MonocleAgent::new(tx);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(agent.new_session(acp::NewSessionRequest::new("/work")))
+            .expect("new_session");
+
+        let mut names: Option<Vec<String>> = None;
+        while let Ok(call) = rx.try_recv() {
+            if let ClientCall::Notify(n) = call {
+                if let acp::SessionUpdate::AvailableCommandsUpdate(u) = n.update {
+                    names = Some(
+                        u.available_commands
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect(),
+                    );
+                }
+            }
+        }
+        let names = names.expect("expected an AvailableCommandsUpdate notification");
+        for cmd in ["help", "status", "config"] {
+            assert!(names.iter().any(|n| n == cmd), "missing {cmd} in {names:?}");
+        }
     }
 
     #[test]
