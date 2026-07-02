@@ -207,6 +207,10 @@ agent over stdio (JSON-RPC) — an editor, the Monocle desktop app, or Craft spa
 drives sessions. Tool permission is delegated to the client (`session/request_permission`),
 tool calls stream as `ToolCall`/`ToolCallUpdate` updates, and a client may pick the model
 per session via `_meta.monocle.model` on `session/new` (falls back to the default).
+When the client advertises the matching capabilities, the agent routes **file reads/writes
+through the client** (`fs/read_text_file`/`fs/write_text_file`, so unsaved editor buffers are
+honored) and **runs the shell via the client's terminal** (`terminal/*`); otherwise it falls
+back to local disk and a local subprocess.
 
 ## 🔌 Using Monocle from your own app (OpenAI-compatible SDK)
 

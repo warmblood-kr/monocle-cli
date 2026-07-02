@@ -32,6 +32,7 @@ use crate::agent::providers::{Message, MonocleProvider};
 use crate::agent::runner::{Agent as CoreAgent, Approver, Cancel, Observer, RunStop};
 use crate::agent::tools::{
     shell_invocation, FsBackend, ShellExec, ShellResult, ToolContext, ToolOutcome, ToolRegistry,
+    SHELL_POLL_INTERVAL,
 };
 use crate::agent::{DEFAULT_MAX_STEPS, DEFAULT_MODEL, SYSTEM_PROMPT};
 use crate::auth::try_access_token;
@@ -195,8 +196,10 @@ impl Agent for MonocleAgent {
         let sid = args.session_id.clone();
 
         // Route tool file I/O through the client only when it advertises BOTH fs
-        // read and write; otherwise fall back to local disk (default LocalFs). Read
-        // the caps here (brief borrow) so the blocking closure captures plain data.
+        // read AND write. It's all-or-nothing on purpose: `edit_file`'s read+write
+        // must hit the SAME backend, so we never read from the client but write to
+        // disk (or vice versa), which would produce inconsistent edits. Read the
+        // caps here (brief borrow) so the blocking closure captures plain data.
         let use_client_fs = {
             let caps = self.client_caps.borrow();
             caps.fs.read_text_file && caps.fs.write_text_file
@@ -204,10 +207,11 @@ impl Agent for MonocleAgent {
         // Route the shell tool through the client's terminal when it advertises the
         // `terminal` capability; otherwise run a local subprocess (default LocalShell).
         let use_client_terminal = self.client_caps.borrow().terminal;
-        let fs_calls = self.updates.clone();
-        let fs_sid = args.session_id.clone();
-        let term_calls = self.updates.clone();
-        let term_sid = args.session_id.clone();
+        // Only clone the sender/session id when the cap is actually advertised (the
+        // backend is moved into the blocking closure below); no cap → no clone.
+        let fs_backend = use_client_fs.then(|| (self.updates.clone(), args.session_id.clone()));
+        let term_backend =
+            use_client_terminal.then(|| (self.updates.clone(), args.session_id.clone()));
 
         // Run the SYNC agent-core loop off the async thread; stream updates back,
         // and route side-effecting tool permission to the client (the editor
@@ -233,16 +237,18 @@ impl Agent for MonocleAgent {
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
             let mut ctx = ToolContext::new(cwd).with_cancel(cancel.clone());
-            if use_client_fs {
+            if let Some((calls, sid)) = fs_backend {
                 ctx = ctx.with_fs(Arc::new(AcpClientFs {
-                    calls: fs_calls,
-                    sid: fs_sid,
+                    calls,
+                    sid,
+                    cancel: cancel.clone(),
                 }));
             }
-            if use_client_terminal {
+            if let Some((calls, sid)) = term_backend {
                 ctx = ctx.with_shell(Arc::new(AcpClientShell {
-                    calls: term_calls,
-                    sid: term_sid,
+                    calls,
+                    sid,
+                    cancel: cancel.clone(),
                 }));
             }
             let agent = CoreAgent::with_max_steps(&provider, &tools, ctx, model, DEFAULT_MAX_STEPS);
@@ -407,49 +413,88 @@ impl Approver for AcpApprover {
     }
 }
 
+/// Queue a [`ClientCall`] and block for its ack, but poll so a cancel can break
+/// the wait — the shared body behind `AcpClientFs`/`AcpClientShell`'s round trips
+/// (dedup). Without this, a connected-but-silent client that never answers an
+/// `fs/*` or `terminal/*` call would park this `spawn_blocking` thread forever:
+/// `session/cancel` (only checked at step boundaries) and disconnect-shutdown
+/// couldn't free it and the session's `running` guard would stay set. Mirrors
+/// `AcpApprover::approve`'s cancel-aware poll — `try_recv` + 20ms sleep instead of
+/// `blocking_recv` (the sleep is fine on a blocking-pool thread). Send/recv
+/// failure (forwarding task or connection gone) collapses to `unavailable`; a
+/// cancel while waiting yields `"<op> cancelled"`.
+fn client_round_trip<T>(
+    calls: &mpsc::UnboundedSender<ClientCall>,
+    call: ClientCall,
+    mut rx: oneshot::Receiver<std::result::Result<T, String>>,
+    cancel: &Cancel,
+    op: &str,
+    unavailable: &str,
+) -> std::result::Result<T, String> {
+    if calls.send(call).is_err() {
+        return Err(unavailable.to_string());
+    }
+    loop {
+        match rx.try_recv() {
+            Ok(res) => return res,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                if cancel.is_cancelled() {
+                    return Err(format!("{op} cancelled"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(oneshot::error::TryRecvError::Closed) => return Err(unavailable.to_string()),
+        }
+    }
+}
+
 /// Client-mediated [`FsBackend`]: the read/write/edit tools' file I/O is routed
 /// through the ACP client (`fs/read_text_file`, `fs/write_text_file`) instead of
 /// local disk, so the editor can serve unsaved buffers and track changes. Wired
 /// in only when the client advertises both fs capabilities (see `prompt()`).
 ///
 /// These methods run on the loop's `spawn_blocking` thread, so they block on the
-/// paired oneshot; the async forwarding task (owning the connection) performs the
-/// actual RPC. Paths passed in are already absolute (`ToolContext::resolve`).
+/// paired oneshot (cancel-aware, via `client_round_trip`); the async forwarding
+/// task (owning the connection) performs the actual RPC. Paths passed in are
+/// already absolute (`ToolContext::resolve`).
+///
+/// NOTE (TOCTOU): `edit_file` reads, modifies, then writes back through this same
+/// client backend. Because ACP `fs/write_text_file` carries no version/etag guard,
+/// a user edit in the editor between our read and write is silently clobbered
+/// (last-writer-wins). Acceptable for the agent's own edits; a known limitation.
 struct AcpClientFs {
     calls: mpsc::UnboundedSender<ClientCall>,
     sid: acp::SessionId,
-}
-
-impl AcpClientFs {
-    /// Send a queued call and block for its ack. Any send/recv failure (the
-    /// forwarding task or connection is gone) collapses to a single unavailable
-    /// message the tool surfaces as an error.
-    fn round_trip<T>(
-        &self,
-        call: ClientCall,
-        rx: oneshot::Receiver<std::result::Result<T, String>>,
-    ) -> std::result::Result<T, String> {
-        if self.calls.send(call).is_err() {
-            return Err("acp client fs unavailable".to_string());
-        }
-        match rx.blocking_recv() {
-            Ok(res) => res,
-            Err(_) => Err("acp client fs unavailable".to_string()),
-        }
-    }
+    /// The turn's cancel flag, so a never-answered fs call breaks (errors) on
+    /// cancel instead of hanging this blocking thread (see `client_round_trip`).
+    cancel: Cancel,
 }
 
 impl FsBackend for AcpClientFs {
     fn read(&self, path: &std::path::Path) -> std::result::Result<String, String> {
         let (tx, rx) = oneshot::channel();
         let req = acp::ReadTextFileRequest::new(self.sid.clone(), path.to_path_buf());
-        self.round_trip(ClientCall::ReadFile(req, tx), rx)
+        client_round_trip(
+            &self.calls,
+            ClientCall::ReadFile(req, tx),
+            rx,
+            &self.cancel,
+            "fs read",
+            "acp client fs unavailable",
+        )
     }
 
     fn write(&self, path: &std::path::Path, content: &str) -> std::result::Result<(), String> {
         let (tx, rx) = oneshot::channel();
         let req = acp::WriteTextFileRequest::new(self.sid.clone(), path.to_path_buf(), content);
-        self.round_trip(ClientCall::WriteFile(req, tx), rx)
+        client_round_trip(
+            &self.calls,
+            ClientCall::WriteFile(req, tx),
+            rx,
+            &self.cancel,
+            "fs write",
+            "acp client fs unavailable",
+        )
     }
 }
 
@@ -465,27 +510,29 @@ impl FsBackend for AcpClientFs {
 struct AcpClientShell {
     calls: mpsc::UnboundedSender<ClientCall>,
     sid: acp::SessionId,
+    /// The turn's cancel flag, so a never-answered terminal call breaks (errors)
+    /// on cancel instead of hanging this blocking thread — so `create`/`kill`/
+    /// `release` can't wedge the session past a cancel (see `client_round_trip`).
+    cancel: Cancel,
 }
 
-/// How often to poll `terminal/output` while the command runs.
-const TERMINAL_POLL: std::time::Duration = std::time::Duration::from_millis(150);
-
 impl AcpClientShell {
-    /// Send a queued call and block for its ack (mirrors `AcpClientFs::round_trip`).
-    /// Any send/recv failure (forwarding task or connection gone) collapses to a
-    /// single unavailable message.
+    /// Send a queued call and block (cancel-aware) for its ack, delegating to the
+    /// shared [`client_round_trip`]. `op` names the operation for the cancel error.
     fn round_trip<T>(
         &self,
+        op: &str,
         call: ClientCall,
         rx: oneshot::Receiver<std::result::Result<T, String>>,
     ) -> std::result::Result<T, String> {
-        if self.calls.send(call).is_err() {
-            return Err("acp client terminal unavailable".to_string());
-        }
-        match rx.blocking_recv() {
-            Ok(res) => res,
-            Err(_) => Err("acp client terminal unavailable".to_string()),
-        }
+        client_round_trip(
+            &self.calls,
+            call,
+            rx,
+            &self.cancel,
+            op,
+            "acp client terminal unavailable",
+        )
     }
 
     fn create(
@@ -494,12 +541,18 @@ impl AcpClientShell {
         cwd: &std::path::Path,
     ) -> std::result::Result<acp::TerminalId, String> {
         let (program, args) = shell_invocation(command);
+        // Forward the agent's environment so the client terminal runs with the same
+        // env as a local subprocess (which inherits it) — parity with LocalShell.
+        let env: Vec<acp::EnvVariable> = std::env::vars()
+            .map(|(name, value)| acp::EnvVariable::new(name, value))
+            .collect();
         let req = acp::CreateTerminalRequest::new(self.sid.clone(), program)
             .args(args)
+            .env(env)
             .cwd(cwd.to_path_buf())
             .output_byte_limit(MAX_TERMINAL_BYTES);
         let (tx, rx) = oneshot::channel();
-        self.round_trip(ClientCall::CreateTerminal(req, tx), rx)
+        self.round_trip("terminal create", ClientCall::CreateTerminal(req, tx), rx)
     }
 
     fn output(
@@ -508,19 +561,19 @@ impl AcpClientShell {
     ) -> std::result::Result<acp::TerminalOutputResponse, String> {
         let req = acp::TerminalOutputRequest::new(self.sid.clone(), terminal_id.clone());
         let (tx, rx) = oneshot::channel();
-        self.round_trip(ClientCall::TerminalOutput(req, tx), rx)
+        self.round_trip("terminal output", ClientCall::TerminalOutput(req, tx), rx)
     }
 
     fn kill(&self, terminal_id: &acp::TerminalId) -> std::result::Result<(), String> {
         let req = acp::KillTerminalCommandRequest::new(self.sid.clone(), terminal_id.clone());
         let (tx, rx) = oneshot::channel();
-        self.round_trip(ClientCall::KillTerminal(req, tx), rx)
+        self.round_trip("terminal kill", ClientCall::KillTerminal(req, tx), rx)
     }
 
     fn release(&self, terminal_id: &acp::TerminalId) -> std::result::Result<(), String> {
         let req = acp::ReleaseTerminalRequest::new(self.sid.clone(), terminal_id.clone());
         let (tx, rx) = oneshot::channel();
-        self.round_trip(ClientCall::ReleaseTerminal(req, tx), rx)
+        self.round_trip("terminal release", ClientCall::ReleaseTerminal(req, tx), rx)
     }
 }
 
@@ -586,7 +639,9 @@ impl AcpClientShell {
                             cancelled: true,
                         };
                     }
-                    std::thread::sleep(TERMINAL_POLL);
+                    // Match the local subprocess poll cadence so client-mediated
+                    // shell isn't slower to detect exit/cancel (shared const).
+                    std::thread::sleep(SHELL_POLL_INTERVAL);
                 }
                 Err(e) => {
                     return ShellResult {
@@ -908,6 +963,7 @@ mod tests {
         let fs = AcpClientFs {
             calls: tx,
             sid: acp::SessionId::new("s"),
+            cancel: Cancel::new(),
         };
         let got = fs.read(std::path::Path::new("/abs/file.txt"));
         responder.join().unwrap();
@@ -927,6 +983,7 @@ mod tests {
         let fs = AcpClientFs {
             calls: tx,
             sid: acp::SessionId::new("s"),
+            cancel: Cancel::new(),
         };
         let got = fs.write(std::path::Path::new("/abs/out.txt"), "payload");
         responder.join().unwrap();
@@ -942,8 +999,27 @@ mod tests {
         let fs = AcpClientFs {
             calls: tx,
             sid: acp::SessionId::new("s"),
+            cancel: Cancel::new(),
         };
         assert!(fs.read(std::path::Path::new("/abs/file.txt")).is_err());
+    }
+
+    #[test]
+    fn client_fs_read_returns_err_without_hanging_when_cancelled_and_no_answer() {
+        // The client is connected but never answers the read (rx kept, never
+        // drained), yet the turn is cancelled — read() must break the wait and
+        // error, not park this thread forever (mirrors the approver's behavior).
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientCall>();
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let fs = AcpClientFs {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+            cancel,
+        };
+        let start = std::time::Instant::now();
+        assert!(fs.read(std::path::Path::new("/abs/file.txt")).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
@@ -976,6 +1052,7 @@ mod tests {
         let shell = AcpClientShell {
             calls: tx,
             sid: acp::SessionId::new("s"),
+            cancel: Cancel::new(),
         };
         let r = shell.exec("echo hi", std::path::Path::new("/work"), &Cancel::new());
         responder.join().unwrap();
@@ -1024,6 +1101,7 @@ mod tests {
         let shell = AcpClientShell {
             calls: tx,
             sid: acp::SessionId::new("s"),
+            cancel: cancel.clone(),
         };
         let start = std::time::Instant::now();
         let r = shell.exec("sleep 5", std::path::Path::new("/work"), &cancel);
@@ -1049,10 +1127,32 @@ mod tests {
         let shell = AcpClientShell {
             calls: tx,
             sid: acp::SessionId::new("s"),
+            cancel: Cancel::new(),
         };
         let r = shell.exec("echo hi", std::path::Path::new("/work"), &Cancel::new());
         assert!(!r.cancelled);
         assert_eq!(r.exit_code, None);
         assert!(r.output.contains("unavailable"), "{}", r.output);
+    }
+
+    #[test]
+    fn client_shell_round_trip_returns_err_without_hanging_when_cancelled_and_no_answer() {
+        // The client is connected but never answers (rx kept, never drained), yet
+        // the turn is cancelled — an individual round_trip (create) must break the
+        // wait and error rather than parking this thread forever, so create/kill/
+        // release can't wedge the session past a cancel.
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientCall>();
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let shell = AcpClientShell {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+            cancel,
+        };
+        let start = std::time::Instant::now();
+        assert!(shell
+            .create("echo hi", std::path::Path::new("/work"))
+            .is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 }

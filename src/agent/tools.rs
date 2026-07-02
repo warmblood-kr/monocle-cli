@@ -7,10 +7,10 @@
 //! seam (see `loop`); tools here just execute. Paths resolve relative to the
 //! tool context's working directory.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -96,6 +96,24 @@ pub fn shell_invocation(command: &str) -> (String, Vec<String>) {
 /// Default backend: run the command as a local subprocess (today's behavior).
 pub struct LocalShell;
 
+/// How often the shell poll loops re-check for exit/cancel — shared by the local
+/// subprocess ([`LocalShell`]) and the ACP client terminal (`acp::AcpClientShell`)
+/// so client-mediated shell reacts to cancel/exit as fast as local, not slower.
+pub const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Read a child pipe to EOF on its own thread, returning the bytes. One generic
+/// drainer for both stdout and stderr so a chatty command can't deadlock the poll
+/// loop by filling a pipe buffer.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
 impl ShellExec for LocalShell {
     fn exec(&self, command: &str, cwd: &Path, cancel: &Cancel) -> ShellResult {
         // Honor a cancel that landed before we even spawned — don't start work.
@@ -128,28 +146,8 @@ impl ShellExec for LocalShell {
 
         // Drain stdout/stderr on their own threads so a chatty long-running command
         // can't deadlock the poll loop by filling a pipe buffer.
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        let drain = |pipe: Option<std::process::ChildStdout>| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut p) = pipe {
-                    let _ = p.read_to_end(&mut buf);
-                }
-                buf
-            })
-        };
-        let drain_err = |pipe: Option<std::process::ChildStderr>| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut p) = pipe {
-                    let _ = p.read_to_end(&mut buf);
-                }
-                buf
-            })
-        };
-        let out_handle = drain(stdout_pipe);
-        let err_handle = drain_err(stderr_pipe);
+        let out_handle = drain(child.stdout.take());
+        let err_handle = drain(child.stderr.take());
 
         // Poll: exit → done; cancel → kill+reap; else nap and re-check.
         let mut cancelled = false;
@@ -163,7 +161,7 @@ impl ShellExec for LocalShell {
                         cancelled = true;
                         break None;
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(SHELL_POLL_INTERVAL);
                 }
                 Err(e) => {
                     let _ = child.wait();
