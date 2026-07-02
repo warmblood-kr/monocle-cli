@@ -113,7 +113,7 @@ describe('claudeCommand', () => {
     expect(callArgs.slice(2)).toEqual(['--model', 'opus']);
   });
 
-  it('should default model to sonnet in inline settings', async () => {
+  it('should default model to sonnet[1m] in inline settings', async () => {
     const { spawnFn } = makeMockSpawn();
 
     await claudeCommand([], {
@@ -124,7 +124,7 @@ describe('claudeCommand', () => {
 
     const callArgs = spawnFn.mock.calls[0][1] as string[];
     const parsed = JSON.parse(callArgs[1]);
-    expect(parsed.model).toBe('sonnet');
+    expect(parsed.model).toBe('sonnet[1m]');
   });
 
   it('should let user --model override the default', async () => {

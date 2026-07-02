@@ -31,11 +31,11 @@ export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<
 
   // Inline settings scoped to this child only — avoids mutating ~/.claude/settings.json.
   // `apiKeyHelper` keeps tokens fresh across long sessions by re-invoking `monocle token`.
-  // `model` defaults to Sonnet to avoid surprise Opus costs; a user `--model` flag (forwarded
-  // after --settings) still wins, since the CLI flag outranks the settings field.
+  // `model` defaults to the 1M-context Sonnet to avoid surprise Opus costs; a user `--model` flag
+  // (forwarded after --settings) still wins, since the CLI flag outranks the settings field.
   const inlineSettings = JSON.stringify({
     apiKeyHelper: 'monocle token',
-    model: 'sonnet',
+    model: 'sonnet[1m]',
   });
 
   // Build child env — strip conflicting vars, inject base URL.
