@@ -11,10 +11,12 @@
 //!
 //! Scope: initialize / new_session / prompt / cancel; tool file I/O is routed
 //! through the client when it advertises `fs` capabilities (editor-mediated
-//! read/write), else runs on local disk; tool permission is delegated to the
-//! client via `session/request_permission`; tool calls stream as correlated
-//! `ToolCall`/`ToolCallUpdate` lifecycle updates. Follow-ups: client terminal
-//! callbacks.
+//! read/write), else runs on local disk; the shell tool runs through the client's
+//! terminal (`terminal/create` → poll `terminal/output` → `terminal/kill` on
+//! cancel → `terminal/release`) when it advertises the `terminal` capability, else
+//! runs a local subprocess; tool permission is delegated to the client via
+//! `session/request_permission`; tool calls stream as correlated
+//! `ToolCall`/`ToolCallUpdate` lifecycle updates.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,7 +30,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::providers::{Message, MonocleProvider};
 use crate::agent::runner::{Agent as CoreAgent, Approver, Cancel, Observer, RunStop};
-use crate::agent::tools::{FsBackend, ToolContext, ToolOutcome, ToolRegistry};
+use crate::agent::tools::{
+    shell_invocation, FsBackend, ShellExec, ShellResult, ToolContext, ToolOutcome, ToolRegistry,
+};
 use crate::agent::{DEFAULT_MAX_STEPS, DEFAULT_MODEL, SYSTEM_PROMPT};
 use crate::auth::try_access_token;
 use crate::credentials::Credentials;
@@ -56,6 +60,22 @@ enum ClientCall {
     ),
     WriteFile(
         acp::WriteTextFileRequest,
+        oneshot::Sender<std::result::Result<(), String>>,
+    ),
+    CreateTerminal(
+        acp::CreateTerminalRequest,
+        oneshot::Sender<std::result::Result<acp::TerminalId, String>>,
+    ),
+    TerminalOutput(
+        acp::TerminalOutputRequest,
+        oneshot::Sender<std::result::Result<acp::TerminalOutputResponse, String>>,
+    ),
+    KillTerminal(
+        acp::KillTerminalCommandRequest,
+        oneshot::Sender<std::result::Result<(), String>>,
+    ),
+    ReleaseTerminal(
+        acp::ReleaseTerminalRequest,
         oneshot::Sender<std::result::Result<(), String>>,
     ),
 }
@@ -181,8 +201,13 @@ impl Agent for MonocleAgent {
             let caps = self.client_caps.borrow();
             caps.fs.read_text_file && caps.fs.write_text_file
         };
+        // Route the shell tool through the client's terminal when it advertises the
+        // `terminal` capability; otherwise run a local subprocess (default LocalShell).
+        let use_client_terminal = self.client_caps.borrow().terminal;
         let fs_calls = self.updates.clone();
         let fs_sid = args.session_id.clone();
+        let term_calls = self.updates.clone();
+        let term_sid = args.session_id.clone();
 
         // Run the SYNC agent-core loop off the async thread; stream updates back,
         // and route side-effecting tool permission to the client (the editor
@@ -212,6 +237,12 @@ impl Agent for MonocleAgent {
                 ctx = ctx.with_fs(Arc::new(AcpClientFs {
                     calls: fs_calls,
                     sid: fs_sid,
+                }));
+            }
+            if use_client_terminal {
+                ctx = ctx.with_shell(Arc::new(AcpClientShell {
+                    calls: term_calls,
+                    sid: term_sid,
                 }));
             }
             let agent = CoreAgent::with_max_steps(&provider, &tools, ctx, model, DEFAULT_MAX_STEPS);
@@ -422,6 +453,153 @@ impl FsBackend for AcpClientFs {
     }
 }
 
+/// Client-mediated [`ShellExec`]: the shell tool runs THROUGH the ACP client's
+/// terminal (`terminal/create` → poll `terminal/output` → `terminal/kill` on
+/// cancel → `terminal/release`) instead of a local subprocess, so the editor owns
+/// and mediates the terminal. Wired in only when the client advertises the
+/// `terminal` capability (see `prompt()`).
+///
+/// Like [`AcpClientFs`], `exec` runs on the loop's `spawn_blocking` thread and
+/// blocks on paired oneshots; the async forwarding task (owning the connection)
+/// performs the actual RPCs. The `cwd` passed in is already absolute.
+struct AcpClientShell {
+    calls: mpsc::UnboundedSender<ClientCall>,
+    sid: acp::SessionId,
+}
+
+/// How often to poll `terminal/output` while the command runs.
+const TERMINAL_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+
+impl AcpClientShell {
+    /// Send a queued call and block for its ack (mirrors `AcpClientFs::round_trip`).
+    /// Any send/recv failure (forwarding task or connection gone) collapses to a
+    /// single unavailable message.
+    fn round_trip<T>(
+        &self,
+        call: ClientCall,
+        rx: oneshot::Receiver<std::result::Result<T, String>>,
+    ) -> std::result::Result<T, String> {
+        if self.calls.send(call).is_err() {
+            return Err("acp client terminal unavailable".to_string());
+        }
+        match rx.blocking_recv() {
+            Ok(res) => res,
+            Err(_) => Err("acp client terminal unavailable".to_string()),
+        }
+    }
+
+    fn create(
+        &self,
+        command: &str,
+        cwd: &std::path::Path,
+    ) -> std::result::Result<acp::TerminalId, String> {
+        let (program, args) = shell_invocation(command);
+        let req = acp::CreateTerminalRequest::new(self.sid.clone(), program)
+            .args(args)
+            .cwd(cwd.to_path_buf())
+            .output_byte_limit(MAX_TERMINAL_BYTES);
+        let (tx, rx) = oneshot::channel();
+        self.round_trip(ClientCall::CreateTerminal(req, tx), rx)
+    }
+
+    fn output(
+        &self,
+        terminal_id: &acp::TerminalId,
+    ) -> std::result::Result<acp::TerminalOutputResponse, String> {
+        let req = acp::TerminalOutputRequest::new(self.sid.clone(), terminal_id.clone());
+        let (tx, rx) = oneshot::channel();
+        self.round_trip(ClientCall::TerminalOutput(req, tx), rx)
+    }
+
+    fn kill(&self, terminal_id: &acp::TerminalId) -> std::result::Result<(), String> {
+        let req = acp::KillTerminalCommandRequest::new(self.sid.clone(), terminal_id.clone());
+        let (tx, rx) = oneshot::channel();
+        self.round_trip(ClientCall::KillTerminal(req, tx), rx)
+    }
+
+    fn release(&self, terminal_id: &acp::TerminalId) -> std::result::Result<(), String> {
+        let req = acp::ReleaseTerminalRequest::new(self.sid.clone(), terminal_id.clone());
+        let (tx, rx) = oneshot::channel();
+        self.round_trip(ClientCall::ReleaseTerminal(req, tx), rx)
+    }
+}
+
+/// Byte cap requested from the client's terminal (the client truncates from the
+/// front). The shell tool caps again for the LLM channel; this just bounds what
+/// the client retains.
+const MAX_TERMINAL_BYTES: u64 = 1_000_000;
+
+impl ShellExec for AcpClientShell {
+    fn exec(&self, command: &str, cwd: &std::path::Path, cancel: &Cancel) -> ShellResult {
+        // Honor a cancel that landed before we created the terminal.
+        if cancel.is_cancelled() {
+            return ShellResult {
+                output: String::new(),
+                exit_code: None,
+                cancelled: true,
+            };
+        }
+
+        let terminal_id = match self.create(command, cwd) {
+            Ok(id) => id,
+            Err(e) => {
+                return ShellResult {
+                    output: e,
+                    exit_code: None,
+                    cancelled: false,
+                }
+            }
+        };
+
+        // Poll the client's terminal until it exits, we're cancelled, or the RPC
+        // fails. Always release the terminal afterwards (best-effort).
+        let result = self.poll(&terminal_id, cancel);
+        let _ = self.release(&terminal_id);
+        result
+    }
+}
+
+impl AcpClientShell {
+    /// Poll `terminal/output` until exit / cancel / RPC failure, returning the
+    /// accumulated [`ShellResult`] (release is the caller's job).
+    fn poll(&self, terminal_id: &acp::TerminalId, cancel: &Cancel) -> ShellResult {
+        loop {
+            match self.output(terminal_id) {
+                Ok(resp) => {
+                    if let Some(status) = resp.exit_status {
+                        return ShellResult {
+                            output: resp.output,
+                            exit_code: status.exit_code.map(|c| c as i32),
+                            cancelled: false,
+                        };
+                    }
+                    if cancel.is_cancelled() {
+                        // Kill, then grab whatever partial output the client has.
+                        let _ = self.kill(terminal_id);
+                        let output = self
+                            .output(terminal_id)
+                            .map(|r| r.output)
+                            .unwrap_or(resp.output);
+                        return ShellResult {
+                            output,
+                            exit_code: None,
+                            cancelled: true,
+                        };
+                    }
+                    std::thread::sleep(TERMINAL_POLL);
+                }
+                Err(e) => {
+                    return ShellResult {
+                        output: e,
+                        exit_code: None,
+                        cancelled: false,
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Extract the plain-text portion of an ACP prompt (Text blocks joined).
 fn prompt_text(blocks: &[acp::ContentBlock]) -> String {
     blocks
@@ -499,6 +677,46 @@ async fn run() {
                     tokio::task::spawn_local(async move {
                         let res = conn
                             .write_text_file(req)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        let _ = ack.send(res);
+                    });
+                }
+                ClientCall::CreateTerminal(req, ack) => {
+                    let conn = std::rc::Rc::clone(&conn);
+                    tokio::task::spawn_local(async move {
+                        let res = conn
+                            .create_terminal(req)
+                            .await
+                            .map(|r| r.terminal_id)
+                            .map_err(|e| e.to_string());
+                        let _ = ack.send(res);
+                    });
+                }
+                ClientCall::TerminalOutput(req, ack) => {
+                    let conn = std::rc::Rc::clone(&conn);
+                    tokio::task::spawn_local(async move {
+                        let res = conn.terminal_output(req).await.map_err(|e| e.to_string());
+                        let _ = ack.send(res);
+                    });
+                }
+                ClientCall::KillTerminal(req, ack) => {
+                    let conn = std::rc::Rc::clone(&conn);
+                    tokio::task::spawn_local(async move {
+                        let res = conn
+                            .kill_terminal_command(req)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        let _ = ack.send(res);
+                    });
+                }
+                ClientCall::ReleaseTerminal(req, ack) => {
+                    let conn = std::rc::Rc::clone(&conn);
+                    tokio::task::spawn_local(async move {
+                        let res = conn
+                            .release_terminal(req)
                             .await
                             .map(|_| ())
                             .map_err(|e| e.to_string());
@@ -726,5 +944,115 @@ mod tests {
             sid: acp::SessionId::new("s"),
         };
         assert!(fs.read(std::path::Path::new("/abs/file.txt")).is_err());
+    }
+
+    #[test]
+    fn client_shell_happy_path_returns_output_and_exit() {
+        // Scripted client: create → terminal id, first output → exited with code 0
+        // and "hi", release → ok. Mirrors the fs responder style (exec blocks on
+        // each ack from its spawn_blocking thread).
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
+        let responder = std::thread::spawn(move || {
+            while let Some(call) = rx.blocking_recv() {
+                match call {
+                    ClientCall::CreateTerminal(req, ack) => {
+                        // The shell wrapping flows through as command + args.
+                        assert_eq!(req.cwd, Some(std::path::PathBuf::from("/work")));
+                        let _ = ack.send(Ok(acp::TerminalId::new("t1")));
+                    }
+                    ClientCall::TerminalOutput(_req, ack) => {
+                        let resp = acp::TerminalOutputResponse::new("hi", false)
+                            .exit_status(acp::TerminalExitStatus::new().exit_code(0u32));
+                        let _ = ack.send(Ok(resp));
+                    }
+                    ClientCall::ReleaseTerminal(_req, ack) => {
+                        let _ = ack.send(Ok(()));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let shell = AcpClientShell {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+        };
+        let r = shell.exec("echo hi", std::path::Path::new("/work"), &Cancel::new());
+        responder.join().unwrap();
+        assert_eq!(r.output, "hi");
+        assert_eq!(r.exit_code, Some(0));
+        assert!(!r.cancelled);
+    }
+
+    #[test]
+    fn client_shell_cancel_kills_terminal() {
+        // The command never exits (output always exit_status=None); the turn is
+        // cancelled shortly after start → exec must kill the terminal and return
+        // cancelled=true promptly.
+        use std::sync::atomic::AtomicBool;
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
+        let killed = std::sync::Arc::new(AtomicBool::new(false));
+        let killed2 = std::sync::Arc::clone(&killed);
+        let responder = std::thread::spawn(move || {
+            while let Some(call) = rx.blocking_recv() {
+                match call {
+                    ClientCall::CreateTerminal(_req, ack) => {
+                        let _ = ack.send(Ok(acp::TerminalId::new("t1")));
+                    }
+                    ClientCall::TerminalOutput(_req, ack) => {
+                        // Still running: no exit status.
+                        let _ = ack.send(Ok(acp::TerminalOutputResponse::new("partial", false)));
+                    }
+                    ClientCall::KillTerminal(_req, ack) => {
+                        killed2.store(true, Ordering::SeqCst);
+                        let _ = ack.send(Ok(()));
+                    }
+                    ClientCall::ReleaseTerminal(_req, ack) => {
+                        let _ = ack.send(Ok(()));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let cancel = Cancel::new();
+        let flip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flip.cancel();
+        });
+        let shell = AcpClientShell {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+        };
+        let start = std::time::Instant::now();
+        let r = shell.exec("sleep 5", std::path::Path::new("/work"), &cancel);
+        responder.join().unwrap();
+        assert!(r.cancelled, "should report cancelled");
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "a KillTerminal must have been requested"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "cancel should be prompt, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn client_shell_errors_when_forwarder_gone() {
+        // No receiver → create_terminal can't be delivered → surface an error as
+        // output instead of blocking the tool forever.
+        let (tx, rx) = mpsc::unbounded_channel::<ClientCall>();
+        drop(rx);
+        let shell = AcpClientShell {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+        };
+        let r = shell.exec("echo hi", std::path::Path::new("/work"), &Cancel::new());
+        assert!(!r.cancelled);
+        assert_eq!(r.exit_code, None);
+        assert!(r.output.contains("unavailable"), "{}", r.output);
     }
 }
