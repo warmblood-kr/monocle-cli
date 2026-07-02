@@ -5,7 +5,7 @@
 //! stderr, and the final answer to stdout.
 
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -19,7 +19,7 @@ use crate::colors as c;
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
-use crate::util::home_dir;
+use crate::util::{home_dir, now_ms, parse_iso_ms};
 
 pub struct AgentOptions {
     pub prompt: Option<String>,
@@ -75,6 +75,30 @@ struct Repl<'a> {
 }
 
 impl Repl<'_> {
+    /// The `--session` name, if this REPL is persisting a conversation.
+    /// Derived from the session file stem (`<name>.jsonl`).
+    fn session_name(&self) -> Option<&str> {
+        self.session
+            .as_ref()
+            .and_then(|s| s.path().file_stem())
+            .and_then(|s| s.to_str())
+    }
+
+    /// Build a plain login snapshot from stored credentials, without calling
+    /// `get_access_token` (which would refresh / exit the process). Reads only.
+    fn login_view(&self) -> Option<LoginView> {
+        let data = self.creds.read()?;
+        let expired = match parse_iso_ms(&data.access_token_expires_at) {
+            Some(exp) => now_ms() + EXPIRY_BUFFER_MS > exp,
+            None => true,
+        };
+        Some(LoginView {
+            tenant: format!("{} ({})", data.tenant_name, data.tenant_domain),
+            email: data.email,
+            expired,
+        })
+    }
+
     fn run_turn(&mut self, user: String) -> Result<()> {
         // Fresh token each turn (get_access_token refreshes if near expiry).
         let auth = get_access_token(self.client, self.creds);
@@ -114,6 +138,90 @@ impl Repl<'_> {
         }
         Ok(())
     }
+}
+
+/// A slash command typed into the interactive REPL. Management commands are
+/// handled locally (never sent to the agent/LLM); anything else is a turn.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Help,
+    Config,
+    Status,
+    Quit,
+    Unknown(String),
+    /// Not a slash command — send it to the agent as a normal turn.
+    Turn,
+}
+
+/// Pure classifier for a trimmed input line. Only lines starting with `/` are
+/// management commands; everything else is a turn for the agent.
+fn dispatch_command(input: &str) -> Command {
+    if !input.starts_with('/') {
+        return Command::Turn;
+    }
+    match input {
+        "/help" => Command::Help,
+        "/config" => Command::Config,
+        "/status" => Command::Status,
+        "/exit" | "/quit" => Command::Quit,
+        other => Command::Unknown(other.to_string()),
+    }
+}
+
+/// Plain login snapshot for `/status`, built by the REPL from `creds.read()` so
+/// the formatter stays pure (no IO / no `Credentials` dependency).
+struct LoginView {
+    tenant: String,
+    email: String,
+    expired: bool,
+}
+
+/// Same 5-minute buffer the auth refresh path uses, so "expired" here matches
+/// when a turn would actually trigger a refresh.
+const EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
+
+fn help_text() -> String {
+    [
+        "commands:",
+        "  /help    show this help",
+        "  /config  show session config (model, max-steps, workdir, session)",
+        "  /status  show login status and session config",
+        "  /exit    quit the REPL (also /quit, Ctrl-D)",
+    ]
+    .join("\n")
+}
+
+fn config_text(model: &str, max_steps: usize, workdir: &Path, session: Option<&str>) -> String {
+    format!(
+        "model:     {}\nmax-steps: {}\nworkdir:   {}\nsession:   {}",
+        model,
+        max_steps,
+        workdir.display(),
+        session.unwrap_or("(none)"),
+    )
+}
+
+fn status_text(
+    login: Option<&LoginView>,
+    model: &str,
+    max_steps: usize,
+    workdir: &Path,
+    session: Option<&str>,
+) -> String {
+    let head = match login {
+        Some(v) => format!(
+            "logged in as {} — {}\naccess token: {}",
+            v.email,
+            v.tenant,
+            if v.expired { "expired" } else { "valid" },
+        ),
+        None => "not logged in".to_string(),
+    };
+    format!(
+        "{}\n{}",
+        head,
+        config_text(model, max_steps, workdir, session)
+    )
 }
 
 pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -> Result<()> {
@@ -196,7 +304,9 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
 
     eprintln!(
         "{}",
-        c::dim("Interactive — Ctrl-C aborts the turn; Ctrl-D or /exit to quit.")
+        c::dim(
+            "Interactive — /help for commands; Ctrl-C aborts the turn; Ctrl-D or /exit to quit."
+        )
     );
     let stdin = std::io::stdin();
     loop {
@@ -211,13 +321,45 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         if msg.is_empty() {
             continue;
         }
-        if msg == "/exit" || msg == "/quit" {
-            eprintln!("Bye.");
-            break;
-        }
-        // A transient per-turn error must not tear down the interactive session.
-        if let Err(e) = repl.run_turn(msg.to_string()) {
-            eprintln!("{} {e}", c::red("Error:"));
+        // Slash commands are handled locally (never sent to the agent/LLM), and
+        // printed to stderr so stdout stays the clean answer channel.
+        match dispatch_command(msg) {
+            Command::Quit => {
+                eprintln!("Bye.");
+                break;
+            }
+            Command::Help => eprintln!("{}", help_text()),
+            Command::Config => eprintln!(
+                "{}",
+                config_text(
+                    &repl.model,
+                    repl.max_steps,
+                    &repl.workdir,
+                    repl.session_name()
+                )
+            ),
+            Command::Status => {
+                let login = repl.login_view();
+                eprintln!(
+                    "{}",
+                    status_text(
+                        login.as_ref(),
+                        &repl.model,
+                        repl.max_steps,
+                        &repl.workdir,
+                        repl.session_name(),
+                    )
+                );
+            }
+            Command::Unknown(cmd) => {
+                eprintln!("unknown command: {cmd} (try /help)");
+            }
+            Command::Turn => {
+                // A transient per-turn error must not tear down the interactive session.
+                if let Err(e) = repl.run_turn(msg.to_string()) {
+                    eprintln!("{} {e}", c::red("Error:"));
+                }
+            }
         }
     }
     Ok(())
@@ -231,5 +373,90 @@ fn one_line(s: &str, max: usize) -> String {
         format!("{head}…")
     } else {
         collapsed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn dispatch_recognizes_management_commands() {
+        assert_eq!(dispatch_command("/help"), Command::Help);
+        assert_eq!(dispatch_command("/config"), Command::Config);
+        assert_eq!(dispatch_command("/status"), Command::Status);
+        assert_eq!(dispatch_command("/quit"), Command::Quit);
+        assert_eq!(dispatch_command("/exit"), Command::Quit);
+    }
+
+    #[test]
+    fn dispatch_flags_unknown_slash_command() {
+        assert_eq!(
+            dispatch_command("/bogus"),
+            Command::Unknown("/bogus".to_string())
+        );
+    }
+
+    #[test]
+    fn dispatch_passes_through_plain_text() {
+        assert_eq!(dispatch_command("hello world"), Command::Turn);
+        assert_eq!(dispatch_command("summarize the /etc dir"), Command::Turn);
+    }
+
+    #[test]
+    fn help_text_lists_each_command() {
+        let h = help_text();
+        for cmd in ["/help", "/config", "/status", "/exit"] {
+            assert!(h.contains(cmd), "help missing {cmd}: {h}");
+        }
+    }
+
+    #[test]
+    fn config_text_shows_fields_and_none_session() {
+        let wd = PathBuf::from("/tmp/work");
+        let out = config_text("claude-x", 12, &wd, None);
+        assert!(out.contains("claude-x"), "{out}");
+        assert!(out.contains("12"), "{out}");
+        assert!(out.contains("/tmp/work"), "{out}");
+        assert!(out.contains("(none)"), "{out}");
+    }
+
+    #[test]
+    fn config_text_shows_named_session() {
+        let wd = PathBuf::from("/tmp/work");
+        let out = config_text("claude-x", 12, &wd, Some("mysess"));
+        assert!(out.contains("mysess"), "{out}");
+        assert!(!out.contains("(none)"), "{out}");
+    }
+
+    #[test]
+    fn status_text_logged_out() {
+        let wd = PathBuf::from("/tmp/work");
+        let out = status_text(None, "m", 3, &wd, None);
+        assert!(out.contains("not logged in"), "{out}");
+        // Config block is still shown.
+        assert!(out.contains("/tmp/work"), "{out}");
+    }
+
+    #[test]
+    fn status_text_logged_in_valid_and_expired() {
+        let wd = PathBuf::from("/tmp/work");
+        let view = LoginView {
+            tenant: "Acme (acme.example.com)".to_string(),
+            email: "a@b.com".to_string(),
+            expired: false,
+        };
+        let out = status_text(Some(&view), "m", 3, &wd, None);
+        assert!(out.contains("logged in as a@b.com"), "{out}");
+        assert!(out.contains("Acme (acme.example.com)"), "{out}");
+        assert!(out.contains("valid"), "{out}");
+
+        let expired = LoginView {
+            expired: true,
+            ..view
+        };
+        let out = status_text(Some(&expired), "m", 3, &wd, None);
+        assert!(out.contains("expired"), "{out}");
     }
 }

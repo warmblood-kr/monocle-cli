@@ -196,6 +196,11 @@ tools in a working directory. Give it a task as an argument, pipe it via stdin, 
 it for an interactive REPL. Progress goes to stderr, the answer to stdout; `--session
 <name>` persists/resumes a conversation.
 
+In the interactive REPL, lines starting with `/` are local management commands (handled
+without calling the model, printed to stderr): `/help` lists them, `/config` shows the
+session config (model, max-steps, workdir, session), `/status` adds your login status,
+and `/exit` (or `/quit`, Ctrl-D) quits.
+
 ```bash
 monocle agent "summarize the TODOs in this repo" --workdir .
 ```
