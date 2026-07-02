@@ -26,6 +26,9 @@ irm https://raw.githubusercontent.com/warmblood-kr/monocle-cli/main/install.ps1 
 monocle login
 ```
 
+> **Prebuilt binaries:** macOS (Apple Silicon), Linux (x86-64 / arm64), and Windows (x64).
+> Intel Macs are not shipped as a prebuilt binary — build from source (below).
+
 A browser opens — sign in with your organization account. In headless/SSH
 environments it falls back automatically to device-code login (or force it with
 `monocle login --device-code`).
