@@ -26,6 +26,9 @@ irm https://raw.githubusercontent.com/warmblood-kr/monocle-cli/main/install.ps1 
 monocle login
 ```
 
+> **미리 빌드된 바이너리:** macOS (Apple Silicon), Linux (x86-64 / arm64), Windows (x64).
+> Intel Mac은 미리 빌드된 바이너리를 제공하지 않아요 — 아래 소스 빌드를 이용해 주세요.
+
 브라우저가 열리면 회사 계정으로 로그인해 주세요. SSH·헤드리스 환경에서는
 자동으로 device-code 로그인으로 전환돼요 (`monocle login --device-code`로 강제할 수도 있어요).
 

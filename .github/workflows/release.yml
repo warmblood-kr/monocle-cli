@@ -31,9 +31,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: monocle-macos-arm64
-          - target: x86_64-apple-darwin
-            os: macos-13
-            name: monocle-macos-x64
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: monocle-linux-x64
@@ -91,7 +88,6 @@ jobs:
         with:
           files: |
             monocle-macos-arm64.tar.gz
-            monocle-macos-x64.tar.gz
             monocle-linux-x64.tar.gz
             monocle-linux-arm64.tar.gz
             monocle-windows-x64.zip

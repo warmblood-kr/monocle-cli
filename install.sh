@@ -38,7 +38,7 @@ detect_platform() {
     Darwin)
       case "$ARCH" in
         arm64|aarch64) echo "macos-arm64" ;;
-        x86_64|amd64) echo "macos-x64" ;;
+        x86_64|amd64) echo "unsupported: macOS Intel (x86_64) is not shipped — use an Apple Silicon Mac or build from source" && exit 1 ;;
         *) echo "unsupported: macOS $ARCH" && exit 1 ;;
       esac
       ;;
