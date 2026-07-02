@@ -6,6 +6,9 @@
 //! unused helpers here are expected.)
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::Value;
@@ -14,6 +17,8 @@ use tiny_http::{Response, Server};
 use monocle_cli::agent::providers::{
     ChatRequest, ChatResponse, FunctionCall, LlmProvider, ToolCall,
 };
+use monocle_cli::agent::runner::{Cancel, Observer};
+use monocle_cli::agent::tools::{FsBackend, ShellExec, ShellResult, ToolOutcome};
 use monocle_cli::error::Result;
 
 // ── mock LLM (isolated loop testing — no network) ───────────────────────────
@@ -143,4 +148,172 @@ where
         }
     });
     Stub { addr }
+}
+
+// ── tool-layer virtualization testkit ────────────────────────────────────────
+//
+// The same seam the ACP surface uses to inject a client-mediated shell/fs (see
+// `tools::ToolContext::with_shell`/`with_fs`) lets a test swap in *mock* backends:
+// capture the exact commands / file writes the agent makes and assert on them,
+// with NO real process spawn and NO disk I/O. Paired with `FakeProvider` (scripts
+// the model) and `RecordingObserver` (captures the loop's callbacks), a whole
+// tool-calling loop runs deterministically. Mirrors `FakeProvider`'s Arc/closure
+// style. See `tests/agent_virtual_tools.rs` for the end-to-end demonstrator.
+
+/// A mock [`ShellExec`] that records every command it's asked to run and serves a
+/// canned [`ShellResult`] — never spawns a real process. Wrap in `Arc` and keep a
+/// clone (`Arc<RecordingShell>` coerces to `Arc<dyn ShellExec>` at `with_shell`)
+/// to read [`commands`](RecordingShell::commands) back after the run.
+pub struct RecordingShell {
+    commands: Arc<Mutex<Vec<String>>>,
+    stdout: String,
+    exit_code: Option<i32>,
+}
+
+impl RecordingShell {
+    /// Records commands; every `exec` returns success with empty output.
+    pub fn new() -> Self {
+        Self {
+            commands: Arc::new(Mutex::new(Vec::new())),
+            stdout: String::new(),
+            exit_code: Some(0),
+        }
+    }
+
+    /// Like [`new`](RecordingShell::new) but serves canned stdout + exit code.
+    pub fn with_output(stdout: impl Into<String>, exit_code: i32) -> Self {
+        Self {
+            commands: Arc::new(Mutex::new(Vec::new())),
+            stdout: stdout.into(),
+            exit_code: Some(exit_code),
+        }
+    }
+
+    /// The commands passed to `exec`, in order — for assertions.
+    pub fn commands(&self) -> Vec<String> {
+        self.commands.lock().unwrap().clone()
+    }
+}
+
+impl Default for RecordingShell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShellExec for RecordingShell {
+    fn exec(&self, command: &str, _cwd: &Path, _cancel: &Cancel) -> ShellResult {
+        self.commands.lock().unwrap().push(command.to_string());
+        ShellResult {
+            output: self.stdout.clone(),
+            exit_code: self.exit_code,
+            cancelled: false,
+        }
+    }
+}
+
+/// A mock [`FsBackend`] backed by an in-memory `HashMap<PathBuf, String>` — the
+/// read/write/edit tools hit this instead of disk. Files are keyed by the tool's
+/// *resolved* absolute path (`workdir.join(path)`), so seed / assert with the same
+/// resolved path. Wrap in `Arc` and keep a clone to inspect it after the run.
+pub struct InMemoryFs {
+    files: Arc<Mutex<HashMap<PathBuf, String>>>,
+    writes: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+impl InMemoryFs {
+    /// Empty filesystem.
+    pub fn new() -> Self {
+        Self {
+            files: Arc::new(Mutex::new(HashMap::new())),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Pre-seed files (each `(resolved-path, contents)`).
+    pub fn seeded(entries: impl IntoIterator<Item = (PathBuf, String)>) -> Self {
+        let fs = Self::new();
+        {
+            let mut files = fs.files.lock().unwrap();
+            for (path, content) in entries {
+                files.insert(path, content);
+            }
+        }
+        fs
+    }
+
+    /// Current contents of `path` (the resolved absolute path), if present.
+    pub fn get(&self, path: &Path) -> Option<String> {
+        self.files.lock().unwrap().get(path).cloned()
+    }
+
+    /// The paths written via `write`, in order — for assertions.
+    pub fn writes(&self) -> Vec<PathBuf> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl Default for InMemoryFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FsBackend for InMemoryFs {
+    fn read(&self, path: &Path) -> std::result::Result<String, String> {
+        self.files
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            // Same shape the trait expects for a missing file: a human-readable
+            // String error the tool drops into `ToolOutcome::error`.
+            .ok_or_else(|| format!("{}: no such file (in-memory)", path.display()))
+    }
+
+    fn write(&self, path: &Path, content: &str) -> std::result::Result<(), String> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), content.to_string());
+        self.writes.lock().unwrap().push(path.to_path_buf());
+        Ok(())
+    }
+}
+
+/// An [`Observer`] that records a compact string for each loop callback, so a test
+/// can assert exactly which tool calls the agent made and in what order:
+/// - `call:<name>:<args-compact-json>`
+/// - `result:<name>:<is_error>`
+/// - `text:<delta>` · `notice:<msg>`
+#[derive(Default)]
+pub struct RecordingObserver {
+    events: Vec<String>,
+}
+
+impl RecordingObserver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The recorded events, in order — for assertions.
+    pub fn events(&self) -> Vec<String> {
+        self.events.clone()
+    }
+}
+
+impl Observer for RecordingObserver {
+    fn on_text_delta(&mut self, delta: &str) {
+        self.events.push(format!("text:{delta}"));
+    }
+    fn on_tool_call(&mut self, _id: &str, name: &str, args: &Value) {
+        self.events.push(format!("call:{name}:{args}"));
+    }
+    fn on_tool_result(&mut self, _id: &str, name: &str, outcome: &ToolOutcome) {
+        self.events
+            .push(format!("result:{name}:{}", outcome.is_error));
+    }
+    fn on_notice(&mut self, msg: &str) {
+        self.events.push(format!("notice:{msg}"));
+    }
 }

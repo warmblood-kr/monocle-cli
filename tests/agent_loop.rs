@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use common::{
     has_tool_result, text_response, tool_call_response, tool_call_response_raw, FakeProvider,
+    RecordingObserver,
 };
 use monocle_cli::agent::providers::Message;
 use monocle_cli::agent::runner::{
@@ -45,16 +46,9 @@ fn loop_executes_tool_then_returns_final_answer() {
     let dir = tempfile::tempdir().unwrap();
     let agent = agent(&provider, &tools, dir.path(), 20);
 
-    #[derive(Default)]
-    struct Rec {
-        calls: Vec<String>,
-    }
-    impl Observer for Rec {
-        fn on_tool_call(&mut self, _id: &str, name: &str, _args: &Value) {
-            self.calls.push(name.to_string());
-        }
-    }
-    let mut rec = Rec::default();
+    // Reuse the shared RecordingObserver from the testkit (tests/common) instead
+    // of a bespoke inline observer.
+    let mut rec = RecordingObserver::new();
 
     let mut convo = vec![
         Message::system("be helpful"),
@@ -67,7 +61,15 @@ fn loop_executes_tool_then_returns_final_answer() {
     // A plain text answer ends the turn normally; the final text lands in the convo.
     assert!(matches!(stop, RunStop::EndTurn));
     assert_eq!(convo.last().unwrap().content.as_deref(), Some("done"));
-    assert_eq!(rec.calls, vec!["write_file"]);
+    let calls: Vec<String> = rec
+        .events()
+        .into_iter()
+        .filter(|e| e.starts_with("call:"))
+        .collect();
+    assert_eq!(
+        calls,
+        vec!["call:write_file:{\"path\":\"out.txt\",\"content\":\"hi\"}"]
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
         "hi"
