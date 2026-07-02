@@ -7,15 +7,196 @@
 //! seam (see `loop`); tools here just execute. Paths resolve relative to the
 //! tool context's working directory.
 
-use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::agent::providers::ToolDef;
 use crate::agent::runner::Cancel;
+
+/// Filesystem backend for the read/write/edit tools. The default ([`LocalFs`])
+/// is plain local disk I/O; under ACP, when the client advertises fs
+/// capabilities, an editor-mediated backend is injected instead so unsaved
+/// buffers and change-tracking flow through the client (see `acp::AcpClientFs`).
+/// Errors are already-human-readable messages the tool drops into
+/// [`ToolOutcome::error`].
+pub trait FsBackend: Send + Sync {
+    fn read(&self, path: &Path) -> std::result::Result<String, String>;
+    fn write(&self, path: &Path, content: &str) -> std::result::Result<(), String>;
+}
+
+/// Default backend: read/write straight to local disk (today's behavior).
+pub struct LocalFs;
+
+impl FsBackend for LocalFs {
+    fn read(&self, path: &Path) -> std::result::Result<String, String> {
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }
+
+    fn write(&self, path: &Path, content: &str) -> std::result::Result<(), String> {
+        // Create parent directories as needed (moved here from the write_file tool).
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(path, content).map_err(|e| e.to_string())
+    }
+}
+
+/// Outcome of running a shell command through a [`ShellExec`] backend: combined
+/// stdout+stderr (`output`), the process exit code (`None` if killed / no code),
+/// and whether the run was cut short by a cancel. The shell tool formats this into
+/// a [`ToolOutcome`] (cap + `[exit code: N]` / `exit N` / cancelled → error).
+pub struct ShellResult {
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub cancelled: bool,
+}
+
+/// Executes a shell command for the shell tool. The default ([`LocalShell`])
+/// spawns a local subprocess (today's behavior); under ACP, when the client
+/// advertises the `terminal` capability, an editor-mediated backend is injected
+/// instead so the client owns/mediates the terminal (see `acp::AcpClientShell`).
+pub trait ShellExec: Send + Sync {
+    /// Run `command` (the raw shell command string the tool received) in `cwd`,
+    /// honoring `cancel` (both before starting and mid-run).
+    fn exec(&self, command: &str, cwd: &Path, cancel: &Cancel) -> ShellResult;
+}
+
+/// The platform shell invocation for a raw command string: `(program, args)`.
+/// `bash -c <cmd>` on unix, `powershell … -Command <cmd>` on Windows. Shared by
+/// both the local subprocess backend and the ACP client-terminal backend so the
+/// shell wrapping is defined once.
+pub fn shell_invocation(command: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        (
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                command.to_string(),
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        (
+            "bash".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )
+    }
+}
+
+/// Default backend: run the command as a local subprocess (today's behavior).
+pub struct LocalShell;
+
+/// How often the shell poll loops re-check for exit/cancel — shared by the local
+/// subprocess ([`LocalShell`]) and the ACP client terminal (`acp::AcpClientShell`)
+/// so client-mediated shell reacts to cancel/exit as fast as local, not slower.
+pub const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Read a child pipe to EOF on its own thread, returning the bytes. One generic
+/// drainer for both stdout and stderr so a chatty command can't deadlock the poll
+/// loop by filling a pipe buffer.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+impl ShellExec for LocalShell {
+    fn exec(&self, command: &str, cwd: &Path, cancel: &Cancel) -> ShellResult {
+        // Honor a cancel that landed before we even spawned — don't start work.
+        if cancel.is_cancelled() {
+            return ShellResult {
+                output: String::new(),
+                exit_code: None,
+                cancelled: true,
+            };
+        }
+
+        let (program, args) = shell_invocation(command);
+        let mut cmd = Command::new(program);
+        cmd.args(&args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return ShellResult {
+                    output: format!("failed to run shell: {e}"),
+                    exit_code: None,
+                    cancelled: false,
+                }
+            }
+        };
+
+        // Drain stdout/stderr on their own threads so a chatty long-running command
+        // can't deadlock the poll loop by filling a pipe buffer.
+        let out_handle = drain(child.stdout.take());
+        let err_handle = drain(child.stderr.take());
+
+        // Poll: exit → done; cancel → kill+reap; else nap and re-check.
+        let mut cancelled = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if cancel.is_cancelled() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cancelled = true;
+                        break None;
+                    }
+                    std::thread::sleep(SHELL_POLL_INTERVAL);
+                }
+                Err(e) => {
+                    let _ = child.wait();
+                    return ShellResult {
+                        output: format!("failed to wait on shell: {e}"),
+                        exit_code: None,
+                        cancelled: false,
+                    };
+                }
+            }
+        };
+
+        // Reader threads finish once the pipes close (on exit or kill).
+        let stdout = out_handle.join().unwrap_or_default();
+        let stderr = err_handle.join().unwrap_or_default();
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        let mut combined = String::new();
+        if !stdout.is_empty() {
+            combined.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&stderr);
+        }
+
+        ShellResult {
+            output: combined,
+            exit_code: status.and_then(|s| s.code()),
+            cancelled,
+        }
+    }
+}
 
 /// Execution context shared by all tools (the working directory the agent acts in,
 /// plus the turn's [`Cancel`] flag so long-running tools can be interrupted mid-run).
@@ -26,6 +207,14 @@ pub struct ToolContext {
     /// sites and tests keep working; the real callers attach the turn's flag via
     /// [`ToolContext::with_cancel`].
     pub cancel: Cancel,
+    /// Filesystem backend for the read/write/edit tools. Defaults to [`LocalFs`]
+    /// (local disk) so every existing caller/test is unaffected; the ACP surface
+    /// swaps in a client-mediated backend via [`ToolContext::with_fs`].
+    pub fs: Arc<dyn FsBackend>,
+    /// Shell backend for the shell tool. Defaults to [`LocalShell`] (local
+    /// subprocess) so every existing caller/test is unaffected; the ACP surface
+    /// swaps in a client-terminal backend via [`ToolContext::with_shell`].
+    pub shell: Arc<dyn ShellExec>,
 }
 
 impl ToolContext {
@@ -33,6 +222,8 @@ impl ToolContext {
         Self {
             workdir: workdir.into(),
             cancel: Cancel::new(),
+            fs: Arc::new(LocalFs),
+            shell: Arc::new(LocalShell),
         }
     }
 
@@ -40,6 +231,20 @@ impl ToolContext {
     /// interrupted mid-run instead of only at the step boundary.
     pub fn with_cancel(mut self, cancel: Cancel) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    /// Route the read/write/edit tools through a custom filesystem backend
+    /// (e.g. an ACP client-mediated one) instead of the default local disk.
+    pub fn with_fs(mut self, fs: Arc<dyn FsBackend>) -> Self {
+        self.fs = fs;
+        self
+    }
+
+    /// Route the shell tool through a custom shell backend (e.g. an ACP
+    /// client-mediated terminal) instead of the default local subprocess.
+    pub fn with_shell(mut self, shell: Arc<dyn ShellExec>) -> Self {
+        self.shell = shell;
         self
     }
 
@@ -158,7 +363,7 @@ impl Tool for ReadFile {
             Ok(p) => p,
             Err(e) => return e,
         };
-        match std::fs::read_to_string(ctx.resolve(path)) {
+        match ctx.fs.read(&ctx.resolve(path)) {
             // Cap large reads so one file can't blow the model's context window.
             Ok(content) => {
                 let total = content.chars().count();
@@ -212,16 +417,7 @@ impl Tool for WriteFile {
             Ok(c) => c,
             Err(e) => return e,
         };
-        let full = ctx.resolve(path);
-        if let Some(parent) = full.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return ToolOutcome::error(format!(
-                    "write_file failed to create {}: {e}",
-                    parent.display()
-                ));
-            }
-        }
-        match std::fs::write(&full, content) {
+        match ctx.fs.write(&ctx.resolve(path), content) {
             Ok(()) => ToolOutcome::ok(format!("Wrote {} bytes to {path}", content.len())),
             Err(e) => ToolOutcome::error(format!("write_file failed for {path}: {e}")),
         }
@@ -263,7 +459,7 @@ impl Tool for EditFile {
             Err(e) => return e,
         };
         let full = ctx.resolve(path);
-        let original = match std::fs::read_to_string(&full) {
+        let original = match ctx.fs.read(&full) {
             Ok(c) => c,
             Err(e) => return ToolOutcome::error(format!("edit_file failed to read {path}: {e}")),
         };
@@ -277,7 +473,7 @@ impl Tool for EditFile {
             ));
         }
         let updated = original.replacen(old, new, 1);
-        match std::fs::write(&full, updated) {
+        match ctx.fs.write(&full, &updated) {
             Ok(()) => ToolOutcome::ok(format!("Edited {path}")),
             Err(e) => ToolOutcome::error(format!("edit_file failed to write {path}: {e}")),
         }
@@ -321,98 +517,14 @@ impl Tool for Shell {
             Err(e) => return e,
         };
 
-        // Honor a cancel that landed before we even spawned — don't start work.
-        if ctx.cancel.is_cancelled() {
-            return ToolOutcome::error("shell command cancelled before it started");
-        }
+        // Run through the context's shell backend (local subprocess by default,
+        // ACP client terminal when the client advertises `terminal`).
+        let result = ctx.shell.exec(command, &ctx.workdir, &ctx.cancel);
 
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = Command::new("bash");
-            c.arg("-c").arg(command);
-            c
-        };
-        cmd.current_dir(&ctx.workdir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return ToolOutcome::error(format!("failed to run shell: {e}")),
-        };
-
-        // Drain stdout/stderr on their own threads so a chatty long-running command
-        // can't deadlock the poll loop by filling a pipe buffer.
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        let drain = |pipe: Option<std::process::ChildStdout>| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut p) = pipe {
-                    let _ = p.read_to_end(&mut buf);
-                }
-                buf
-            })
-        };
-        let drain_err = |pipe: Option<std::process::ChildStderr>| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut p) = pipe {
-                    let _ = p.read_to_end(&mut buf);
-                }
-                buf
-            })
-        };
-        let out_handle = drain(stdout_pipe);
-        let err_handle = drain_err(stderr_pipe);
-
-        // Poll: exit → done; cancel → kill+reap; else nap and re-check.
-        let mut cancelled = false;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {
-                    if ctx.cancel.is_cancelled() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        cancelled = true;
-                        break None;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => {
-                    let _ = child.wait();
-                    return ToolOutcome::error(format!("failed to wait on shell: {e}"));
-                }
-            }
-        };
-
-        // Reader threads finish once the pipes close (on exit or kill).
-        let stdout = out_handle.join().unwrap_or_default();
-        let stderr = err_handle.join().unwrap_or_default();
-        let stdout = String::from_utf8_lossy(&stdout);
-        let stderr = String::from_utf8_lossy(&stderr);
-        let mut combined = String::new();
-        if !stdout.is_empty() {
-            combined.push_str(&stdout);
-        }
-        if !stderr.is_empty() {
-            if !combined.is_empty() && !combined.ends_with('\n') {
-                combined.push('\n');
-            }
-            combined.push_str(&stderr);
-        }
         // Cap the LLM-facing output (re-sent every turn — §9a).
-        let capped = cap_output(&combined, MAX_SHELL_CHARS);
+        let capped = cap_output(&result.output, MAX_SHELL_CHARS);
 
-        if cancelled {
+        if result.cancelled {
             let partial = if capped.is_empty() {
                 String::new()
             } else {
@@ -422,8 +534,8 @@ impl Tool for Shell {
                 .with_ui("cancelled".to_string());
         }
 
-        let code = status.and_then(|s| s.code()).unwrap_or(-1);
-        let success = status.map(|s| s.success()).unwrap_or(false);
+        let code = result.exit_code.unwrap_or(-1);
+        let success = result.exit_code == Some(0);
         let llm = format!("{capped}\n[exit code: {code}]");
         ToolOutcome {
             llm,
@@ -475,5 +587,98 @@ impl ToolRegistry {
             Some(tool) => tool.run(ctx, args),
             None => ToolOutcome::error(format!("unknown tool: {name}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localfs_write_then_read_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        let fs = LocalFs;
+        fs.write(&path, "hello disk").unwrap();
+        assert_eq!(fs.read(&path).unwrap(), "hello disk");
+    }
+
+    #[test]
+    fn localfs_write_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nested path whose parent directories do not yet exist.
+        let path = dir.path().join("a").join("b").join("deep.txt");
+        let fs = LocalFs;
+        fs.write(&path, "made the dirs").unwrap();
+        assert!(path.exists());
+        assert_eq!(fs.read(&path).unwrap(), "made the dirs");
+    }
+
+    #[test]
+    fn localfs_read_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.txt");
+        assert!(LocalFs.read(&path).is_err());
+    }
+
+    #[test]
+    fn shell_invocation_wraps_the_command() {
+        let (program, args) = shell_invocation("echo hi");
+        #[cfg(windows)]
+        {
+            assert_eq!(program, "powershell");
+            assert_eq!(args.last().unwrap(), "echo hi");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(program, "bash");
+            assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+        }
+    }
+
+    #[test]
+    fn localshell_runs_command_and_reports_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let cmd = "Write-Output hi";
+        #[cfg(not(windows))]
+        let cmd = "echo hi";
+        let r = LocalShell.exec(cmd, dir.path(), &Cancel::new());
+        assert!(r.output.contains("hi"), "{}", r.output);
+        assert_eq!(r.exit_code, Some(0));
+        assert!(!r.cancelled);
+    }
+
+    #[test]
+    fn localshell_honors_cancel_set_before_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = Cancel::new();
+        cancel.cancel();
+        // A pre-set cancel returns immediately without spawning the 5s command.
+        let start = std::time::Instant::now();
+        #[cfg(windows)]
+        let cmd = "Start-Sleep -Seconds 5";
+        #[cfg(not(windows))]
+        let cmd = "sleep 5";
+        let r = LocalShell.exec(cmd, dir.path(), &cancel);
+        assert!(r.cancelled);
+        assert!(r.output.is_empty(), "{}", r.output);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn localshell_is_killed_mid_run_on_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = Cancel::new();
+        let flip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flip.cancel();
+        });
+        let start = std::time::Instant::now();
+        let r = LocalShell.exec("sleep 5", dir.path(), &cancel);
+        assert!(r.cancelled);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 }
