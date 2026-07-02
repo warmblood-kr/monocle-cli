@@ -9,15 +9,18 @@
 //! a swappable adapter — pinning 0.9 vs migrating to 1.0 is a change to this file
 //! only (the ACP *wire protocol* is the stable contract, not the crate API).
 //!
-//! Scope: initialize / new_session / prompt / cancel; tools run locally; tool
-//! permission is delegated to the client via `session/request_permission`; tool
-//! calls stream as correlated `ToolCall`/`ToolCallUpdate` lifecycle updates.
-//! Follow-ups: client fs/terminal callbacks.
+//! Scope: initialize / new_session / prompt / cancel; tool file I/O is routed
+//! through the client when it advertises `fs` capabilities (editor-mediated
+//! read/write), else runs on local disk; tool permission is delegated to the
+//! client via `session/request_permission`; tool calls stream as correlated
+//! `ToolCall`/`ToolCallUpdate` lifecycle updates. Follow-ups: client terminal
+//! callbacks.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use agent_client_protocol::{self as acp, Agent, Client as _};
 use tokio::sync::{mpsc, oneshot};
@@ -25,7 +28,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::providers::{Message, MonocleProvider};
 use crate::agent::runner::{Agent as CoreAgent, Approver, Cancel, Observer, RunStop};
-use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
+use crate::agent::tools::{FsBackend, ToolContext, ToolOutcome, ToolRegistry};
 use crate::agent::{DEFAULT_MAX_STEPS, DEFAULT_MODEL, SYSTEM_PROMPT};
 use crate::auth::try_access_token;
 use crate::credentials::Credentials;
@@ -39,12 +42,21 @@ const PERM_ALLOW: &str = "allow";
 const PERM_REJECT: &str = "reject";
 
 /// A call the (blocking) agent loop needs the async ACP connection to make on
-/// its behalf — either a fire-and-forget update or a permission round-trip.
+/// its behalf — a fire-and-forget update, a permission round-trip, or a
+/// client-mediated filesystem read/write (when the client advertises fs caps).
 enum ClientCall {
     Notify(acp::SessionNotification),
     Permission(
         acp::RequestPermissionRequest,
         oneshot::Sender<acp::RequestPermissionOutcome>,
+    ),
+    ReadFile(
+        acp::ReadTextFileRequest,
+        oneshot::Sender<std::result::Result<String, String>>,
+    ),
+    WriteFile(
+        acp::WriteTextFileRequest,
+        oneshot::Sender<std::result::Result<(), String>>,
     ),
 }
 
@@ -76,6 +88,10 @@ struct MonocleAgent {
     updates: mpsc::UnboundedSender<ClientCall>,
     sessions: RefCell<HashMap<String, SessionState>>,
     next_id: AtomicU64,
+    /// Capabilities the client advertised at `initialize` — notably whether it
+    /// can serve `fs/read_text_file` + `fs/write_text_file`, which gates whether
+    /// tool file I/O is routed through the client (editor-mediated) or local disk.
+    client_caps: RefCell<acp::ClientCapabilities>,
 }
 
 impl MonocleAgent {
@@ -84,6 +100,7 @@ impl MonocleAgent {
             updates,
             sessions: RefCell::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            client_caps: RefCell::new(acp::ClientCapabilities::default()),
         }
     }
 }
@@ -94,6 +111,9 @@ impl Agent for MonocleAgent {
         &self,
         args: acp::InitializeRequest,
     ) -> acp::Result<acp::InitializeResponse> {
+        // Remember what the client can do (fs read/write) so `prompt()` can route
+        // tool file I/O through the client when it advertises those capabilities.
+        *self.client_caps.borrow_mut() = args.client_capabilities.clone();
         Ok(acp::InitializeResponse::new(args.protocol_version)
             .agent_capabilities(acp::AgentCapabilities::new()))
     }
@@ -154,6 +174,16 @@ impl Agent for MonocleAgent {
         let updates = self.updates.clone();
         let sid = args.session_id.clone();
 
+        // Route tool file I/O through the client only when it advertises BOTH fs
+        // read and write; otherwise fall back to local disk (default LocalFs). Read
+        // the caps here (brief borrow) so the blocking closure captures plain data.
+        let use_client_fs = {
+            let caps = self.client_caps.borrow();
+            caps.fs.read_text_file && caps.fs.write_text_file
+        };
+        let fs_calls = self.updates.clone();
+        let fs_sid = args.session_id.clone();
+
         // Run the SYNC agent-core loop off the async thread; stream updates back,
         // and route side-effecting tool permission to the client (the editor
         // decides via session/request_permission). The user message is pushed
@@ -177,13 +207,14 @@ impl Agent for MonocleAgent {
             convo.push(Message::user(user));
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
-            let agent = CoreAgent::with_max_steps(
-                &provider,
-                &tools,
-                ToolContext::new(cwd).with_cancel(cancel.clone()),
-                model,
-                DEFAULT_MAX_STEPS,
-            );
+            let mut ctx = ToolContext::new(cwd).with_cancel(cancel.clone());
+            if use_client_fs {
+                ctx = ctx.with_fs(Arc::new(AcpClientFs {
+                    calls: fs_calls,
+                    sid: fs_sid,
+                }));
+            }
+            let agent = CoreAgent::with_max_steps(&provider, &tools, ctx, model, DEFAULT_MAX_STEPS);
             let result = agent.run(&mut convo, &mut approver, &mut observer, &cancel);
             (convo, result)
         })
@@ -345,6 +376,52 @@ impl Approver for AcpApprover {
     }
 }
 
+/// Client-mediated [`FsBackend`]: the read/write/edit tools' file I/O is routed
+/// through the ACP client (`fs/read_text_file`, `fs/write_text_file`) instead of
+/// local disk, so the editor can serve unsaved buffers and track changes. Wired
+/// in only when the client advertises both fs capabilities (see `prompt()`).
+///
+/// These methods run on the loop's `spawn_blocking` thread, so they block on the
+/// paired oneshot; the async forwarding task (owning the connection) performs the
+/// actual RPC. Paths passed in are already absolute (`ToolContext::resolve`).
+struct AcpClientFs {
+    calls: mpsc::UnboundedSender<ClientCall>,
+    sid: acp::SessionId,
+}
+
+impl AcpClientFs {
+    /// Send a queued call and block for its ack. Any send/recv failure (the
+    /// forwarding task or connection is gone) collapses to a single unavailable
+    /// message the tool surfaces as an error.
+    fn round_trip<T>(
+        &self,
+        call: ClientCall,
+        rx: oneshot::Receiver<std::result::Result<T, String>>,
+    ) -> std::result::Result<T, String> {
+        if self.calls.send(call).is_err() {
+            return Err("acp client fs unavailable".to_string());
+        }
+        match rx.blocking_recv() {
+            Ok(res) => res,
+            Err(_) => Err("acp client fs unavailable".to_string()),
+        }
+    }
+}
+
+impl FsBackend for AcpClientFs {
+    fn read(&self, path: &std::path::Path) -> std::result::Result<String, String> {
+        let (tx, rx) = oneshot::channel();
+        let req = acp::ReadTextFileRequest::new(self.sid.clone(), path.to_path_buf());
+        self.round_trip(ClientCall::ReadFile(req, tx), rx)
+    }
+
+    fn write(&self, path: &std::path::Path, content: &str) -> std::result::Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        let req = acp::WriteTextFileRequest::new(self.sid.clone(), path.to_path_buf(), content);
+        self.round_trip(ClientCall::WriteFile(req, tx), rx)
+    }
+}
+
 /// Extract the plain-text portion of an ACP prompt (Text blocks joined).
 fn prompt_text(blocks: &[acp::ContentBlock]) -> String {
     blocks
@@ -402,6 +479,30 @@ async fn run() {
                             Err(_) => acp::RequestPermissionOutcome::Cancelled,
                         };
                         let _ = ack.send(outcome);
+                    });
+                }
+                ClientCall::ReadFile(req, ack) => {
+                    // Client-mediated read; spawn so it can't head-of-line-block
+                    // other queued calls (same rationale as Permission).
+                    let conn = std::rc::Rc::clone(&conn);
+                    tokio::task::spawn_local(async move {
+                        let res = conn
+                            .read_text_file(req)
+                            .await
+                            .map(|r| r.content)
+                            .map_err(|e| e.to_string());
+                        let _ = ack.send(res);
+                    });
+                }
+                ClientCall::WriteFile(req, ack) => {
+                    let conn = std::rc::Rc::clone(&conn);
+                    tokio::task::spawn_local(async move {
+                        let res = conn
+                            .write_text_file(req)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        let _ = ack.send(res);
                     });
                 }
             }
@@ -520,7 +621,7 @@ mod tests {
     fn next_update(rx: &mut mpsc::UnboundedReceiver<ClientCall>) -> acp::SessionUpdate {
         match rx.try_recv().expect("expected one queued ClientCall") {
             ClientCall::Notify(n) => n.update,
-            ClientCall::Permission(..) => panic!("expected Notify, got Permission"),
+            _ => panic!("expected Notify, got another ClientCall variant"),
         }
     }
 
@@ -573,5 +674,57 @@ mod tests {
             cancel: Cancel::new(),
         };
         assert!(!approver.approve("call_1", "write_file", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn client_fs_read_returns_client_content() {
+        // Scripted client: receive the ReadFile call off-thread and reply with
+        // content, mirroring `approver_with_response` (read() blocks on the ack).
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
+        let responder = std::thread::spawn(move || {
+            if let Some(ClientCall::ReadFile(req, ack)) = rx.blocking_recv() {
+                assert_eq!(req.path, std::path::PathBuf::from("/abs/file.txt"));
+                let _ = ack.send(Ok("hello from client".to_string()));
+            }
+        });
+        let fs = AcpClientFs {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+        };
+        let got = fs.read(std::path::Path::new("/abs/file.txt"));
+        responder.join().unwrap();
+        assert_eq!(got.unwrap(), "hello from client");
+    }
+
+    #[test]
+    fn client_fs_write_acks_ok() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
+        let responder = std::thread::spawn(move || {
+            if let Some(ClientCall::WriteFile(req, ack)) = rx.blocking_recv() {
+                assert_eq!(req.path, std::path::PathBuf::from("/abs/out.txt"));
+                assert_eq!(req.content, "payload");
+                let _ = ack.send(Ok(()));
+            }
+        });
+        let fs = AcpClientFs {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+        };
+        let got = fs.write(std::path::Path::new("/abs/out.txt"), "payload");
+        responder.join().unwrap();
+        assert!(got.is_ok());
+    }
+
+    #[test]
+    fn client_fs_read_errors_when_forwarder_gone() {
+        // No receiver → the queued call can't be delivered → surface an error
+        // instead of blocking the tool forever.
+        let (tx, rx) = mpsc::unbounded_channel::<ClientCall>();
+        drop(rx);
+        let fs = AcpClientFs {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+        };
+        assert!(fs.read(std::path::Path::new("/abs/file.txt")).is_err());
     }
 }

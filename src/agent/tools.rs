@@ -8,14 +8,44 @@
 //! tool context's working directory.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::agent::providers::ToolDef;
 use crate::agent::runner::Cancel;
+
+/// Filesystem backend for the read/write/edit tools. The default ([`LocalFs`])
+/// is plain local disk I/O; under ACP, when the client advertises fs
+/// capabilities, an editor-mediated backend is injected instead so unsaved
+/// buffers and change-tracking flow through the client (see `acp::AcpClientFs`).
+/// Errors are already-human-readable messages the tool drops into
+/// [`ToolOutcome::error`].
+pub trait FsBackend: Send + Sync {
+    fn read(&self, path: &Path) -> std::result::Result<String, String>;
+    fn write(&self, path: &Path, content: &str) -> std::result::Result<(), String>;
+}
+
+/// Default backend: read/write straight to local disk (today's behavior).
+pub struct LocalFs;
+
+impl FsBackend for LocalFs {
+    fn read(&self, path: &Path) -> std::result::Result<String, String> {
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }
+
+    fn write(&self, path: &Path, content: &str) -> std::result::Result<(), String> {
+        // Create parent directories as needed (moved here from the write_file tool).
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(path, content).map_err(|e| e.to_string())
+    }
+}
 
 /// Execution context shared by all tools (the working directory the agent acts in,
 /// plus the turn's [`Cancel`] flag so long-running tools can be interrupted mid-run).
@@ -26,6 +56,10 @@ pub struct ToolContext {
     /// sites and tests keep working; the real callers attach the turn's flag via
     /// [`ToolContext::with_cancel`].
     pub cancel: Cancel,
+    /// Filesystem backend for the read/write/edit tools. Defaults to [`LocalFs`]
+    /// (local disk) so every existing caller/test is unaffected; the ACP surface
+    /// swaps in a client-mediated backend via [`ToolContext::with_fs`].
+    pub fs: Arc<dyn FsBackend>,
 }
 
 impl ToolContext {
@@ -33,6 +67,7 @@ impl ToolContext {
         Self {
             workdir: workdir.into(),
             cancel: Cancel::new(),
+            fs: Arc::new(LocalFs),
         }
     }
 
@@ -40,6 +75,13 @@ impl ToolContext {
     /// interrupted mid-run instead of only at the step boundary.
     pub fn with_cancel(mut self, cancel: Cancel) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    /// Route the read/write/edit tools through a custom filesystem backend
+    /// (e.g. an ACP client-mediated one) instead of the default local disk.
+    pub fn with_fs(mut self, fs: Arc<dyn FsBackend>) -> Self {
+        self.fs = fs;
         self
     }
 
@@ -158,7 +200,7 @@ impl Tool for ReadFile {
             Ok(p) => p,
             Err(e) => return e,
         };
-        match std::fs::read_to_string(ctx.resolve(path)) {
+        match ctx.fs.read(&ctx.resolve(path)) {
             // Cap large reads so one file can't blow the model's context window.
             Ok(content) => {
                 let total = content.chars().count();
@@ -212,16 +254,7 @@ impl Tool for WriteFile {
             Ok(c) => c,
             Err(e) => return e,
         };
-        let full = ctx.resolve(path);
-        if let Some(parent) = full.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return ToolOutcome::error(format!(
-                    "write_file failed to create {}: {e}",
-                    parent.display()
-                ));
-            }
-        }
-        match std::fs::write(&full, content) {
+        match ctx.fs.write(&ctx.resolve(path), content) {
             Ok(()) => ToolOutcome::ok(format!("Wrote {} bytes to {path}", content.len())),
             Err(e) => ToolOutcome::error(format!("write_file failed for {path}: {e}")),
         }
@@ -263,7 +296,7 @@ impl Tool for EditFile {
             Err(e) => return e,
         };
         let full = ctx.resolve(path);
-        let original = match std::fs::read_to_string(&full) {
+        let original = match ctx.fs.read(&full) {
             Ok(c) => c,
             Err(e) => return ToolOutcome::error(format!("edit_file failed to read {path}: {e}")),
         };
@@ -277,7 +310,7 @@ impl Tool for EditFile {
             ));
         }
         let updated = original.replacen(old, new, 1);
-        match std::fs::write(&full, updated) {
+        match ctx.fs.write(&full, &updated) {
             Ok(()) => ToolOutcome::ok(format!("Edited {path}")),
             Err(e) => ToolOutcome::error(format!("edit_file failed to write {path}: {e}")),
         }
@@ -475,5 +508,37 @@ impl ToolRegistry {
             Some(tool) => tool.run(ctx, args),
             None => ToolOutcome::error(format!("unknown tool: {name}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localfs_write_then_read_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        let fs = LocalFs;
+        fs.write(&path, "hello disk").unwrap();
+        assert_eq!(fs.read(&path).unwrap(), "hello disk");
+    }
+
+    #[test]
+    fn localfs_write_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nested path whose parent directories do not yet exist.
+        let path = dir.path().join("a").join("b").join("deep.txt");
+        let fs = LocalFs;
+        fs.write(&path, "made the dirs").unwrap();
+        assert!(path.exists());
+        assert_eq!(fs.read(&path).unwrap(), "made the dirs");
+    }
+
+    #[test]
+    fn localfs_read_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.txt");
+        assert!(LocalFs.read(&path).is_err());
     }
 }
