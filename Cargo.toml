@@ -1,0 +1,53 @@
+[package]
+name = "monocle-cli"
+version = "1.0.0"
+edition = "2021"
+description = "CLI authentication tool for Claude Code with Stark OIDC PKCE integration"
+license = "MIT"
+repository = "https://github.com/warmblood-kr/monocle-cli"
+
+# The binary is `monocle` regardless of the package name.
+[[bin]]
+name = "monocle"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# Blocking HTTP only — keeps tokio out of our code. async stays a two-way door:
+# all network I/O is quarantined behind src/net.rs, so a future async need can be
+# satisfied locally (Runtime::block_on inside net) without coloring the call tree.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: editing the user's ~/.claude/settings.json must not reorder
+# their existing keys (matches JS JSON.parse/stringify insertion order).
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tiny_http = "0.12"
+open = "5"
+ctrlc = "3"
+# Line editing for the interactive `agent` REPL only (arrows/history/Emacs keys).
+# Default features bring the Emacs keymap + FileHistory; used solely on the
+# interactive TTY path (see src/commands/agent.rs) — never in headless/ACP.
+rustyline = "14"
+# ACP server-agent surface (Phase 3). async stays confined to src/acp.rs; the
+# core loop is sync. Pin 0.9 (trait-based `impl Agent`); 1.0 is a builder rewrite.
+agent-client-protocol = "0.9"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "io-std", "macros", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+# Trait-only crate (already in the tree) to name the ACP transport's byte-stream
+# bound (AsyncRead/AsyncWrite), so `acp::serve_over` is generic over the transport
+# — stdio today, socket/WebSocket later (two-way door). No heavy runtime deps.
+futures-io = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1

@@ -6,16 +6,33 @@
 
 ## Prerequisites
 
-- **Node.js** 18+ — check with `node -v`
+None. `monocle` is a single self-contained binary — no Node.js, no npm, no runtime to install.
 
 ## 🚀 Setup
 
+Install with one command (downloads a prebuilt binary from GitHub Releases):
+
+**macOS / Linux**
+
 ```bash
-npm install -g @warmblood/monocle-cli
+curl -fsSL https://raw.githubusercontent.com/warmblood-kr/monocle-cli/main/install.sh | sh
 monocle login
 ```
 
-A browser opens — sign in with your organization account.
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/warmblood-kr/monocle-cli/main/install.ps1 | iex
+monocle login
+```
+
+A browser opens — sign in with your organization account. In headless/SSH
+environments it falls back automatically to device-code login (or force it with
+`monocle login --device-code`).
+
+> Prefer to build from source? With a Rust toolchain installed:
+> `cargo install --git https://github.com/warmblood-kr/monocle-cli` (or
+> `git clone … && cargo build --release` → `target/release/monocle`).
 
 ## ✅ Check status
 
@@ -41,6 +58,8 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
+| `monocle agent [prompt] [--workdir <dir>] [--model <id>] [--max-steps <n>] [--session <name>]` | **Experimental.** Headless agent loop with tools (read/write/edit + shell) |
+| `monocle acp` | **Experimental.** Run as an [ACP](https://agentclientprotocol.com) agent over stdio (for editors / desktop / Craft) |
 
 ## 💬 Chat with models
 
@@ -166,6 +185,41 @@ Other terminals and IDE integrations running plain `claude` are unaffected. To g
 
 > [!NOTE]
 > See **[Claude Code integration details](./docs/claude-code.md)** for `ANTHROPIC_API_KEY` handling, global setup, and troubleshooting.
+
+## 🧪 Experimental: agent & ACP
+
+> These are **experimental** and evolving. They require you to be logged in — every
+> LLM call is routed through Monocle (your chosen model, via `monocle login`).
+
+**`monocle agent`** runs a headless agent loop with file (read/write/edit) and shell
+tools in a working directory. Give it a task as an argument, pipe it via stdin, or omit
+it for an interactive REPL. Progress goes to stderr, the answer to stdout; `--session
+<name>` persists/resumes a conversation.
+
+The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
+and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
+Command history persists across sessions in `~/.monocle/agent_history`.
+
+In the interactive REPL, lines starting with `/` are local management commands (handled
+without calling the model, printed to stderr): `/help` lists them, `/config` shows the
+session config (model, max-steps, workdir, session), `/status` adds your login status,
+and `/exit` (or `/quit`, Ctrl-D) quits.
+
+```bash
+monocle agent "summarize the TODOs in this repo" --workdir .
+```
+
+> ⚠️ Tools are auto-approved (read/write/edit + shell). Run only in a directory you trust.
+
+**`monocle acp`** runs Monocle as an **[Agent Client Protocol](https://agentclientprotocol.com)**
+agent over stdio (JSON-RPC) — an editor, the Monocle desktop app, or Craft spawns it and
+drives sessions. Tool permission is delegated to the client (`session/request_permission`),
+tool calls stream as `ToolCall`/`ToolCallUpdate` updates, and a client may pick the model
+per session via `_meta.monocle.model` on `session/new` (falls back to the default).
+When the client advertises the matching capabilities, the agent routes **file reads/writes
+through the client** (`fs/read_text_file`/`fs/write_text_file`, so unsaved editor buffers are
+honored) and **runs the shell via the client's terminal** (`terminal/*`); otherwise it falls
+back to local disk and a local subprocess.
 
 ## 🔌 Using Monocle from your own app (OpenAI-compatible SDK)
 

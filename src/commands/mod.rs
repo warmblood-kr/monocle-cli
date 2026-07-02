@@ -1,0 +1,13 @@
+pub mod agent;
+pub mod audio_speech;
+pub mod audio_speech_azure;
+pub mod audio_transcribe;
+pub mod audio_transcribe_azure;
+pub mod chat;
+pub mod claude;
+pub mod login;
+pub mod model_list;
+pub mod setup;
+pub mod status;
+pub mod token;
+pub mod unset;
