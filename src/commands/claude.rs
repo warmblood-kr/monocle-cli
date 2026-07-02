@@ -21,11 +21,12 @@ pub fn claude_command(creds: &Credentials, args: &[String]) {
 
     // Inline settings scoped to this child only — avoids mutating
     // ~/.claude/settings.json. `apiKeyHelper` keeps tokens fresh across long
-    // sessions; `model` defaults to Sonnet to avoid surprise Opus costs (a user
-    // `--model` flag still wins, since the CLI flag outranks the settings field).
+    // sessions; `model` defaults to the 1M-context Sonnet to avoid surprise Opus
+    // costs (a user `--model` flag still wins, since the CLI flag outranks the
+    // settings field).
     let inline_settings = json!({
         "apiKeyHelper": "monocle token",
-        "model": "sonnet",
+        "model": "sonnet[1m]",
     })
     .to_string();
 
