@@ -61,7 +61,7 @@ fn call_chat(
     // A mid-stream drop was salvaged into partial output (monocle-cli#59): stdout
     // already holds the partial text, so the notice goes to stderr.
     if resp.truncated {
-        eprintln!("\n⚠ 응답이 중간에 끊겼습니다 (부분 출력).");
+        eprintln!("\n⚠ the response was cut short (partial output shown).");
     }
     Ok(())
 }
@@ -79,7 +79,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     // model's default limit.
     if let Some(raw) = max_tokens_flag {
         if max_tokens.is_none() {
-            eprintln!("⚠ --max-tokens '{raw}' 무시됨 (양의 정수 필요)");
+            eprintln!("⚠ ignoring --max-tokens '{raw}' (a positive integer is required)");
         }
     }
 
