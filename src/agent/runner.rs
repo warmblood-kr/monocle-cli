@@ -169,7 +169,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
             // into the EndTurn path below — just surface a notice. The partial
             // `resp.content` is appended there like any final answer, so a
             // `--session` resume keeps it (no separate append needed).
-            if resp.finish_reason.as_deref() == Some("stream_error") {
+            if resp.truncated {
                 observer.on_notice("[generation was cut short — showing partial output]");
             }
 

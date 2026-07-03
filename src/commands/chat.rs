@@ -19,11 +19,14 @@ pub struct ChatOptions {
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
-/// only when the flag was passed AND parses as an integer; otherwise `None`, so
-/// the request omits `max_tokens` and the router/model uses its own (higher,
-/// model-appropriate) default.
+/// only when the flag was passed AND parses as a **positive** integer; otherwise
+/// `None`, so the request omits `max_tokens` and the router/model uses its own
+/// (higher, model-appropriate) default. Pure: a present-but-invalid flag is
+/// detectable by the caller as `flag.is_some() && resolve_max_tokens(flag) ==
+/// None`, which is where the user-facing warning is emitted.
 fn resolve_max_tokens(flag: Option<&str>) -> Option<i64> {
     flag.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
 }
 
 /// One streaming chat turn via the shared provider (chat-proxy routing): assistant
@@ -47,14 +50,17 @@ fn call_chat(
         max_tokens,
         ..Default::default()
     };
+    // Acquire the stdout lock once for the whole stream rather than per token —
+    // the closure writes+flushes to this single handle (per-delta flush keeps the
+    // output live).
+    let mut out = std::io::stdout().lock();
     let resp = provider.chat_stream(&req, &mut |delta| {
-        let mut out = std::io::stdout();
         let _ = out.write_all(delta.as_bytes());
         let _ = out.flush();
     })?;
     // A mid-stream drop was salvaged into partial output (monocle-cli#59): stdout
     // already holds the partial text, so the notice goes to stderr.
-    if resp.finish_reason.as_deref() == Some("stream_error") {
+    if resp.truncated {
         eprintln!("\n⚠ 응답이 중간에 끊겼습니다 (부분 출력).");
     }
     Ok(())
@@ -66,7 +72,16 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         .as_deref()
         .unwrap_or(DEFAULT_MODEL)
         .to_string();
-    let max_tokens = resolve_max_tokens(options.max_tokens.as_deref());
+    let max_tokens_flag = options.max_tokens.as_deref();
+    let max_tokens = resolve_max_tokens(max_tokens_flag);
+    // The flag was given but didn't resolve to a positive integer — warn (to
+    // stderr) rather than silently omitting it, so a typo isn't mistaken for the
+    // model's default limit.
+    if let Some(raw) = max_tokens_flag {
+        if max_tokens.is_none() {
+            eprintln!("⚠ --max-tokens '{raw}' 무시됨 (양의 정수 필요)");
+        }
+    }
 
     // Resolve system prompt.
     let system_prompt: Option<String> = if let Some(path) = &options.system_prompt_file {
@@ -207,5 +222,13 @@ mod tests {
     fn unparseable_flag_omits() {
         assert_eq!(resolve_max_tokens(Some("x")), None);
         assert_eq!(resolve_max_tokens(Some("")), None);
+    }
+
+    #[test]
+    fn non_positive_flag_omits() {
+        // Present but not a positive integer → None (caller warns).
+        assert_eq!(resolve_max_tokens(Some("0")), None);
+        assert_eq!(resolve_max_tokens(Some("-1")), None);
+        assert_eq!(resolve_max_tokens(Some("  -42 ")), None);
     }
 }

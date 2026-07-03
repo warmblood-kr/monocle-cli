@@ -68,6 +68,9 @@ impl Client {
         // total timeout, since one would cut a long generation mid-stream.
         let inner = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
+            // TCP keepalive lets the OS surface a dead peer on the streaming path
+            // (which has no total timeout) without capping a healthy long stream.
+            .tcp_keepalive(std::time::Duration::from_secs(60))
             .build()
             .expect("failed to build HTTP client");
         Self { inner }
