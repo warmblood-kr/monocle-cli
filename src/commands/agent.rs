@@ -7,13 +7,15 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::history::DefaultHistory;
+use rustyline::{Config, Context, Editor, Helper, Highlighter, Hinter, Validator};
 use serde_json::Value;
 
 use crate::agent::commands::{config_text, help_text, login_view, status_text};
 use crate::agent::providers::{Message, MonocleProvider};
-use crate::agent::runner::{Agent, AllowAll, Cancel, Observer};
+use crate::agent::runner::{Agent, AllowAll, Approver, Cancel, Observer};
 use crate::agent::session::{session_path, SessionStore};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::agent::SYSTEM_PROMPT;
@@ -30,6 +32,9 @@ pub struct AgentOptions {
     pub model: String,
     pub max_steps: usize,
     pub session: Option<String>,
+    /// Skip the per-tool approval prompt (dangerous) — run side-effecting tools
+    /// unattended, as scripts/one-shot already do.
+    pub auto_approve: bool,
 }
 
 struct CliObserver;
@@ -62,6 +67,92 @@ impl Observer for CliObserver {
     }
 }
 
+/// The slash commands the REPL understands, offered by the completer and shown
+/// by `/help`. Kept here (next to the dispatcher) so completion never drifts from
+/// what `dispatch_command` / `parse_model_command` actually handle.
+const SLASH_COMMANDS: &[&str] = &["/help", "/config", "/status", "/model", "/exit", "/quit"];
+
+/// rustyline line helper: Tab-completes slash commands. Hinting/highlighting/
+/// validation are the derived no-op defaults — we only customize completion.
+#[derive(Helper, Hinter, Highlighter, Validator)]
+struct ReplHelper;
+
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // Only offer completion for a slash-command being typed at the line start.
+        let head = &line[..pos];
+        if !head.starts_with('/') {
+            return Ok((0, Vec::new()));
+        }
+        let candidates = SLASH_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.starts_with(head))
+            .map(|cmd| Pair {
+                display: cmd.to_string(),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        // Replace from column 0 (the whole slash token starts there).
+        Ok((0, candidates))
+    }
+}
+
+/// Interactive approver: prompts the user (stderr) before each side-effecting
+/// tool call and reads a y/N answer from stdin. Default (empty / non-y / EOF) is
+/// deny — the safe choice. Only ever constructed on an interactive TTY, where the
+/// terminal is in cooked mode during a turn so a plain `read_line` works.
+struct PromptApprover;
+impl Approver for PromptApprover {
+    fn approve(&mut self, _id: &str, name: &str, args: &Value) -> bool {
+        // For `shell`, the interesting thing is the command; else show the JSON.
+        let summary = if name == "shell" {
+            args.get("command")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| args.to_string())
+        } else {
+            args.to_string()
+        };
+        eprint!(
+            "{} {} {}: {}  {} ",
+            c::yellow("⚠"),
+            c::dim("run"),
+            c::bold(name),
+            c::dim(&one_line(&summary, 120)),
+            c::yellow("[y/N]"),
+        );
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => false, // EOF → deny
+            Ok(_) => approve_answer(&line),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Pure y/N decision for an approval prompt: an answer counts as "yes" only if,
+/// after leading whitespace, it starts with `y`/`Y`. Everything else (empty,
+/// `n`, a stray word) is "no" — the safe default.
+fn approve_answer(input: &str) -> bool {
+    matches!(input.trim_start().chars().next(), Some('y') | Some('Y'))
+}
+
+/// Approver-selection policy: use the interactive [`PromptApprover`] only on an
+/// interactive TTY without `--auto-approve`. Non-interactive (piped / one-shot)
+/// and `--auto-approve` keep today's `AllowAll` behavior (they already print the
+/// experimental warning and have no TTY to prompt on).
+fn use_prompt_approver(auto_approve: bool, interactive: bool) -> bool {
+    interactive && !auto_approve
+}
+
 /// Per-session driver. Rebuilds the provider each turn so a fresh (auto-refreshed)
 /// token is used — a long-lived interactive session never sends a stale bearer.
 struct Repl<'a> {
@@ -75,6 +166,10 @@ struct Repl<'a> {
     session: Option<SessionStore>,
     convo: Vec<Message>,
     persisted: usize,
+    /// `--auto-approve`: run side-effecting tools without prompting.
+    auto_approve: bool,
+    /// Whether this session runs on an interactive TTY (can prompt for approval).
+    interactive: bool,
 }
 
 impl Repl<'_> {
@@ -103,12 +198,17 @@ impl Repl<'_> {
         self.cancel.reset();
         let mark = self.convo.len();
         self.convo.push(Message::user(user));
-        if let Err(e) = agent.run(
-            &mut self.convo,
-            &mut AllowAll,
-            &mut CliObserver,
-            &self.cancel,
-        ) {
+        // Gate side-effecting tools behind the user in interactive mode; scripts
+        // / one-shot / `--auto-approve` keep the unattended `AllowAll` behavior.
+        let mut allow = AllowAll;
+        let mut prompt = PromptApprover;
+        let approver: &mut dyn Approver =
+            if use_prompt_approver(self.auto_approve, self.interactive) {
+                &mut prompt
+            } else {
+                &mut allow
+            };
+        if let Err(e) = agent.run(&mut self.convo, approver, &mut CliObserver, &self.cancel) {
             // Roll back this failed turn's (partial) messages so a retry — and the
             // persisted session — stay well-formed.
             self.convo.truncate(mark);
@@ -156,21 +256,45 @@ fn dispatch_command(input: &str) -> Command {
     }
 }
 
+/// Pure parser for the `/model` command. Returns:
+/// - `None` — not a `/model` invocation (let normal dispatch handle it);
+/// - `Some(None)` — bare `/model` (show the current model);
+/// - `Some(Some(id))` — `/model <id>` (switch to `id`).
+fn parse_model_command(input: &str) -> Option<Option<String>> {
+    let trimmed = input.trim();
+    if trimmed == "/model" {
+        return Some(None);
+    }
+    let rest = trimmed.strip_prefix("/model ")?.trim();
+    if rest.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(rest.to_string()))
+    }
+}
+
 pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -> Result<()> {
     let workdir = opts
         .workdir
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
+    let interactive = std::io::stdin().is_terminal();
+
     eprintln!(
         "{} {}",
         c::dim("agent · workdir"),
         c::dim(&workdir.display().to_string())
     );
-    eprintln!(
-        "{}",
-        c::yellow("⚠ experimental: tools auto-approved (read/write/edit + shell). Run only in a directory you trust.")
-    );
+    // Interactive sessions gate side-effecting tools behind a y/N prompt (unless
+    // `--auto-approve`); scripts / one-shot / piped runs have no TTY to prompt on
+    // and keep running tools unattended, so the warning differs by mode.
+    let warning = if use_prompt_approver(opts.auto_approve, interactive) {
+        "⚠ experimental: side-effecting tools (write/edit + shell) require approval before each run. Run only in a directory you trust."
+    } else {
+        "⚠ experimental: tools auto-approved (read/write/edit + shell). Run only in a directory you trust."
+    };
+    eprintln!("{}", c::yellow(warning));
 
     // Ctrl-C cancels the *current turn* (not the process); Ctrl-D / /exit quits.
     let cancel = Cancel::new();
@@ -212,9 +336,9 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         session,
         convo,
         persisted,
+        auto_approve: opts.auto_approve,
+        interactive,
     };
-
-    let interactive = std::io::stdin().is_terminal();
 
     // Seed the first turn from the prompt arg, or (non-interactive) piped stdin.
     if let Some(p) = opts.prompt {
@@ -237,7 +361,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     eprintln!(
         "{}",
         c::dim(
-            "Interactive — ↑/↓ history, ←/→ & Ctrl-A/E/K/Y editing; /help for commands; Ctrl-C aborts the turn; Ctrl-D or /exit to quit."
+            "Interactive — ↑/↓ history, ←/→ & Ctrl-A/E/K/Y editing, Tab completes /commands; /help for commands; Ctrl-C aborts the turn; Ctrl-D or /exit to quit."
         )
     );
 
@@ -247,7 +371,19 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     // above never touch it, keeping the engine UI-free (CLAUDE.md 설계 원칙:
     // rich UI is the host's job via `monocle acp`). This is input-line editing
     // only; it does not take over scrollback/paging.
-    let mut rl = DefaultEditor::new().map_err(|e| crate::error::AppError::new(e.to_string()))?;
+    //
+    // `bracketed_paste(true)` makes a multi-line paste arrive as a SINGLE input
+    // buffer (submitted only on Enter) instead of each embedded newline being read
+    // as a separate accept-line → separate turn. This is already rustyline 14's
+    // default (`Config::default().enable_bracketed_paste == true`), so on a
+    // terminal that supports bracketed paste it worked before too; we set it
+    // explicitly (via `Editor::with_config`, replacing `DefaultEditor`) to make
+    // the guarantee visible and stop line-splitting regressing if the default
+    // changes. The `ReplHelper` adds Tab-completion of slash commands.
+    let config = Config::builder().bracketed_paste(true).build();
+    let mut rl: Editor<ReplHelper, DefaultHistory> =
+        Editor::with_config(config).map_err(|e| crate::error::AppError::new(e.to_string()))?;
+    rl.set_helper(Some(ReplHelper));
     let history_path = home_dir().join(".monocle").join("agent_history");
     if let Some(parent) = history_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -270,6 +406,18 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
                     continue;
                 }
                 let _ = rl.add_history_entry(line.as_str());
+                // `/model` switches the model for subsequent turns (handled before
+                // the general dispatch since it carries an argument).
+                if let Some(model_cmd) = parse_model_command(msg) {
+                    match model_cmd {
+                        Some(id) => {
+                            eprintln!("{}", c::dim(&format!("model → {id}")));
+                            repl.model = id;
+                        }
+                        None => eprintln!("{}", c::dim(&format!("model: {}", repl.model))),
+                    }
+                    continue;
+                }
                 // Slash commands are handled locally (never sent to the agent/LLM),
                 // and printed to stderr so stdout stays the clean answer channel.
                 match dispatch_command(msg) {
@@ -365,5 +513,50 @@ mod tests {
     fn dispatch_passes_through_plain_text() {
         assert_eq!(dispatch_command("hello world"), Command::Turn);
         assert_eq!(dispatch_command("summarize the /etc dir"), Command::Turn);
+    }
+
+    #[test]
+    fn approve_answer_treats_y_prefix_as_yes() {
+        for yes in ["y", "yes", "Y", "YES", "yeah", "  y", "y\n"] {
+            assert!(approve_answer(yes), "expected yes for {yes:?}");
+        }
+    }
+
+    #[test]
+    fn approve_answer_defaults_to_no() {
+        for no in ["", "n", "no", "N", "find", "\n", "  ", "1", "sure"] {
+            assert!(!approve_answer(no), "expected no for {no:?}");
+        }
+    }
+
+    #[test]
+    fn approver_policy_prompts_only_on_interactive_non_auto() {
+        // Prompt only when interactive AND not --auto-approve.
+        assert!(use_prompt_approver(false, true));
+        // --auto-approve, non-interactive, or both → AllowAll (no prompt).
+        assert!(!use_prompt_approver(true, true));
+        assert!(!use_prompt_approver(false, false));
+        assert!(!use_prompt_approver(true, false));
+    }
+
+    #[test]
+    fn parse_model_command_variants() {
+        // Not a /model command.
+        assert_eq!(parse_model_command("hello"), None);
+        assert_eq!(parse_model_command("/models"), None);
+        assert_eq!(parse_model_command("/help"), None);
+        // Bare /model (with or without surrounding / trailing space) shows current.
+        assert_eq!(parse_model_command("/model"), Some(None));
+        assert_eq!(parse_model_command("  /model  "), Some(None));
+        assert_eq!(parse_model_command("/model   "), Some(None));
+        // /model <id> switches.
+        assert_eq!(
+            parse_model_command("/model gpt-4o"),
+            Some(Some("gpt-4o".to_string()))
+        );
+        assert_eq!(
+            parse_model_command("/model  claude-x  "),
+            Some(Some("claude-x".to_string()))
+        );
     }
 }

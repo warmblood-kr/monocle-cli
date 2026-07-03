@@ -31,7 +31,7 @@ ctrlc = "3"
 # Line editing for the interactive `agent` REPL only (arrows/history/Emacs keys).
 # Default features bring the Emacs keymap + FileHistory; used solely on the
 # interactive TTY path (see src/commands/agent.rs) — never in headless/ACP.
-rustyline = "14"
+rustyline = { version = "14", features = ["derive"] }
 # ACP server-agent surface (Phase 3). async stays confined to src/acp.rs; the
 # core loop is sync. Pin 0.9 (trait-based `impl Agent`); 1.0 is a builder rewrite.
 agent-client-protocol = "0.9"

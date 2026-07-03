@@ -61,7 +61,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
-| `monocle agent [prompt] [--workdir <dir>] [--model <id>] [--max-steps <n>] [--session <name>]` | **Experimental.** Headless agent loop with tools (read/write/edit + shell) |
+| `monocle agent [prompt] [--workdir <dir>] [--model <id>] [--max-steps <n>] [--session <name>] [--auto-approve]` | **Experimental.** Headless agent loop with tools (read/write/edit + shell) |
 | `monocle acp` | **Experimental.** Run as an [ACP](https://agentclientprotocol.com) agent over stdio (for editors / desktop / Craft) |
 
 ## 💬 Chat with models
@@ -201,18 +201,25 @@ it for an interactive REPL. Progress goes to stderr, the answer to stdout; `--se
 
 The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
 and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
-Command history persists across sessions in `~/.monocle/agent_history`.
+Tab completes slash commands, and a multi-line paste is inserted as a single input
+(submitted only on Enter). Command history persists across sessions in
+`~/.monocle/agent_history`.
 
 In the interactive REPL, lines starting with `/` are local management commands (handled
 without calling the model, printed to stderr): `/help` lists them, `/config` shows the
 session config (model, max-steps, workdir, session), `/status` adds your login status,
-and `/exit` (or `/quit`, Ctrl-D) quits.
+`/model` shows the current model (or `/model <id>` switches it for later turns), and
+`/exit` (or `/quit`, Ctrl-D) quits.
 
 ```bash
 monocle agent "summarize the TODOs in this repo" --workdir .
 ```
 
-> ⚠️ Tools are auto-approved (read/write/edit + shell). Run only in a directory you trust.
+> ⚠️ In an interactive session, each side-effecting tool call (write/edit + shell) asks
+> for a `[y/N]` confirmation before it runs; anything but `y` denies it. Pass
+> `--auto-approve` to skip the prompt (dangerous). Non-interactive runs (a prompt
+> argument or piped stdin) have no TTY to prompt on and run tools unattended, so run
+> those only in a directory you trust.
 
 **`monocle acp`** runs Monocle as an **[Agent Client Protocol](https://agentclientprotocol.com)**
 agent over stdio (JSON-RPC) — an editor, the Monocle desktop app, or Craft spawns it and

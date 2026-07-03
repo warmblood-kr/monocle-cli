@@ -83,6 +83,9 @@ enum Commands {
         /// Named session to persist/resume (~/.monocle/agent/<name>.jsonl)
         #[arg(long)]
         session: Option<String>,
+        /// Skip the per-tool approval prompt (dangerous)
+        #[arg(long = "auto-approve")]
+        auto_approve: bool,
     },
     /// Call audio (STT / TTS) endpoints directly for debugging
     Audio {
@@ -255,6 +258,7 @@ fn main() {
             model,
             max_steps,
             session,
+            auto_approve,
         } => agent_command(
             &client,
             &creds,
@@ -264,6 +268,7 @@ fn main() {
                 model,
                 max_steps,
                 session,
+                auto_approve,
             },
         ),
         Commands::Audio { command } => run_audio(&client, &creds, command),
