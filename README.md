@@ -112,6 +112,11 @@ monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
 ```
 
 > [!NOTE]
+> The reply **streams** to stdout as it is generated. `--max-tokens` is
+> **omitted by default** so the model/router uses its own (model-appropriate)
+> output limit — pass `--max-tokens <n>` only to cap it.
+
+> [!NOTE]
 > `monocle model chat` / `monocle model list` still work but are deprecated and will be removed in a future release.
 
 ## 🔊 Audio (STT / TTS)

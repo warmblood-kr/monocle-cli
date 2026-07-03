@@ -60,7 +60,14 @@ impl Default for Client {
 
 impl Client {
     pub fn new() -> Self {
+        // Timeout split: `connect_timeout` bounds only connection establishment,
+        // so a hung/unreachable endpoint fails fast — but it does NOT limit body
+        // read time, which keeps it safe for long streaming generations. The total
+        // per-request `.timeout()` is applied only to non-streaming calls in
+        // `send()`; the streaming path (`post_json_stream`) deliberately gets no
+        // total timeout, since one would cut a long generation mid-stream.
         let inner = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
         Self { inner }
@@ -168,6 +175,10 @@ impl Client {
 }
 
 fn send(req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
+    // Total request timeout — non-streaming only (see `Client::new`). Streaming
+    // (`post_json_stream`) builds and sends its own request without this, so a
+    // long generation is never cut short.
+    let req = req.timeout(std::time::Duration::from_secs(120));
     let resp = req.send().map_err(|e| AppError(e.to_string()))?;
     let status = resp.status().as_u16();
     let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
