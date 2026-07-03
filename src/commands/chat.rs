@@ -47,11 +47,16 @@ fn call_chat(
         max_tokens,
         ..Default::default()
     };
-    provider.chat_stream(&req, &mut |delta| {
+    let resp = provider.chat_stream(&req, &mut |delta| {
         let mut out = std::io::stdout();
         let _ = out.write_all(delta.as_bytes());
         let _ = out.flush();
     })?;
+    // A mid-stream drop was salvaged into partial output (monocle-cli#59): stdout
+    // already holds the partial text, so the notice goes to stderr.
+    if resp.finish_reason.as_deref() == Some("stream_error") {
+        eprintln!("\n⚠ 응답이 중간에 끊겼습니다 (부분 출력).");
+    }
     Ok(())
 }
 
