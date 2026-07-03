@@ -203,7 +203,7 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
                     "current=v{current} latest=v{latest} upgrade_available=unknown"
                 )?;
                 eprintln!(
-                    "⚠ 릴리스 태그 '{latest}'를 해석할 수 없어 최신 여부를 판단할 수 없습니다."
+                    "⚠ could not parse release tag '{latest}'; unable to determine whether an update is available."
                 );
             }
         }
@@ -214,7 +214,7 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
         None => {
             // Don't falsely claim up-to-date and don't blindly replace on an
             // unparseable tag — warn and abort.
-            eprintln!("⚠ 릴리스 태그 '{latest}'를 해석할 수 없어 최신 여부를 판단할 수 없습니다.");
+            eprintln!("⚠ could not parse release tag '{latest}'; unable to determine whether an update is available.");
             return Err(AppError::new(format!(
                 "could not parse release tag '{latest}' as semver"
             )));
