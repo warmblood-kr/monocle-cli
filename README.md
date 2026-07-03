@@ -61,6 +61,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
+| `monocle upgrade [--check]` | Update monocle to the latest release (`--check` only reports current vs latest) |
 | `monocle agent [prompt] [--workdir <dir>] [--model <id>] [--max-steps <n>] [--session <name>] [--auto-approve]` | **Experimental.** Headless agent loop with tools (read/write/edit + shell) |
 | `monocle acp` | **Experimental.** Run as an [ACP](https://agentclientprotocol.com) agent over stdio (for editors / desktop / Craft) |
 
@@ -177,6 +178,24 @@ monocle audio speech-azure \
 ```
 
 On failure each command prints the HTTP status and response body to stderr and exits non-zero, which makes it easy to spot bad parameters or backend errors.
+
+## ⬆️ Upgrading
+
+Update to the latest GitHub Release in place — same prebuilt binary as the
+installer, swapped over the running executable:
+
+```bash
+monocle upgrade
+```
+
+Just check whether a newer version exists (no install):
+
+```bash
+monocle upgrade --check
+```
+
+Intel Macs have no prebuilt binary, so `upgrade` reports an error there — build
+from source instead (see Setup).
 
 ## 🤖 Claude Code integration
 

@@ -17,6 +17,7 @@ use monocle_cli::commands::setup::setup_command;
 use monocle_cli::commands::status::status_command;
 use monocle_cli::commands::token::token_command;
 use monocle_cli::commands::unset::unset_command;
+use monocle_cli::commands::upgrade::upgrade_command;
 use monocle_cli::credentials::Credentials;
 use monocle_cli::error::Result;
 use monocle_cli::net::Client;
@@ -97,6 +98,12 @@ enum Commands {
     Model {
         #[command(subcommand)]
         command: ModelCommands,
+    },
+    /// Update monocle to the latest release
+    Upgrade {
+        /// Only check for a newer version, don't install
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -272,6 +279,7 @@ fn main() {
             },
         ),
         Commands::Audio { command } => run_audio(&client, &creds, command),
+        Commands::Upgrade { check } => upgrade_command(&client, check),
         Commands::Model { command } => {
             match command {
                 ModelCommands::List => {
