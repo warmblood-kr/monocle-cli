@@ -23,11 +23,50 @@ use monocle_cli::error::Result;
 use monocle_cli::net::Client;
 use monocle_cli::util;
 
+// clap 4 has no native way to group subcommands under section headings, so the
+// root command uses a custom help_template that drops the flat auto-generated
+// command list ({options} still renders flags) and prints a hand-grouped list
+// via {after-help}. Only the root sets this template, so subcommand `--help`
+// screens keep clap's default layout.
+const ROOT_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+{usage-heading} {usage}{after-help}
+
+Options:
+{options}";
+
+const ROOT_HELP_COMMANDS: &str = "\
+Commands:
+  Auth & setup:
+    login    Authenticate with Stark OIDC provider
+    token    Output access token to stdout (for apiKeyHelper)
+    setup    Configure Claude Code to use Monocle authentication
+    unset    Remove Monocle configuration from Claude Code
+    status   Show authentication and configuration status
+    claude   Launch Claude Code with Monocle authentication
+
+  Chat & models:
+    chat     Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
+    models   List available models from the Monocle router
+
+  Agent:
+    agent    [Experimental] Headless agent loop with tools (read/write/edit + shell)
+    acp      [Experimental] Run as an ACP agent over stdio (editors / desktop / Craft)
+
+  Audio:
+    audio    Call audio (STT / TTS) endpoints directly for debugging
+
+  Maintenance:
+    upgrade  Update monocle to the latest release
+    help     Print this message or the help of the given subcommand(s)";
+
 #[derive(Parser)]
 #[command(
     name = "monocle",
     version,
-    about = "Control and use Monocle AI from your terminal: log in once, then chat with models, run the agent, or integrate Claude Code."
+    about = "Control and use Monocle AI from your terminal: log in once, then chat with models, run the agent, or integrate Claude Code.",
+    help_template = ROOT_HELP_TEMPLATE,
+    after_help = ROOT_HELP_COMMANDS
 )]
 struct Cli {
     #[command(subcommand)]

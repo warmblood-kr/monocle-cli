@@ -1,8 +1,8 @@
 [package]
 name = "monocle-cli"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
-description = "CLI authentication tool for Claude Code with Stark OIDC PKCE integration"
+description = "Control and use Monocle AI from your terminal: log in, chat with models, run the agent, or integrate Claude Code."
 license = "MIT"
 repository = "https://github.com/warmblood-kr/monocle-cli"
 
