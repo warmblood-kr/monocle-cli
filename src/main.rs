@@ -27,7 +27,7 @@ use monocle_cli::util;
 #[command(
     name = "monocle",
     version,
-    about = "CLI authentication tool for Claude Code with Stark OIDC integration"
+    about = "Control and use Monocle AI from your terminal: log in once, then chat with models, run the agent, or integrate Claude Code."
 )]
 struct Cli {
     #[command(subcommand)]
