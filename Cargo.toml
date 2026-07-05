@@ -42,6 +42,20 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # bound (AsyncRead/AsyncWrite), so `acp::serve_over` is generic over the transport
 # — stdio today, socket/WebSocket later (two-way door). No heavy runtime deps.
 futures-io = "0.3"
+# Self-update (`monocle upgrade`). semver compares release tags; self-replace does
+# the running-binary swap on both unix and windows; flate2+tar unpack the unix
+# `.tar.gz` asset. All downloads still go through the net.rs facade (no extra HTTP
+# client) — these only handle version math and archive extraction.
+semver = "1"
+self-replace = "1"
+flate2 = "1"
+tar = "0.4"
+
+# `zip` is only needed to unpack the windows `.zip` asset — gate it to windows so
+# the unix build (which uses tar.gz) doesn't pull it in. Trim default features to
+# the deflate codec used by the release zips.
+[target.'cfg(windows)'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

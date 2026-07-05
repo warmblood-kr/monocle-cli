@@ -11,3 +11,4 @@ pub mod setup;
 pub mod status;
 pub mod token;
 pub mod unset;
+pub mod upgrade;

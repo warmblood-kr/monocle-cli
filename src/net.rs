@@ -84,6 +84,33 @@ impl Client {
         send(req)
     }
 
+    /// GET a large file download (e.g. the `monocle upgrade` release binary).
+    ///
+    /// This deliberately does NOT route through the shared `send()`: a multi-MB
+    /// binary on a slow link must not inherit the short total timeout that the
+    /// shared API path may carry (it would abort a legitimately slow transfer).
+    /// Instead it applies its own generous per-request timeout (600s).
+    pub fn get_download(&self, url: &str, headers: &[(&str, &str)]) -> Result<Resp> {
+        let mut req = self
+            .inner
+            .get(url)
+            .timeout(std::time::Duration::from_secs(600));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        // Inline send (not the shared `send()`) so the 600s timeout above is the
+        // only cap that applies to the download.
+        let resp = req.send().map_err(|e| AppError(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+        let body = resp.bytes().map_err(|e| AppError(e.to_string()))?.to_vec();
+        Ok(Resp {
+            status,
+            status_text,
+            body,
+        })
+    }
+
     /// POST `application/x-www-form-urlencoded` (token / device-code requests).
     pub fn post_form(
         &self,
