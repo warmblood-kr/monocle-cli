@@ -138,6 +138,12 @@ pub struct ChatResponse {
     /// The model the backend actually served (echoed by the API when present).
     pub model: Option<String>,
     pub finish_reason: Option<String>,
+    /// `true` only when the stream dropped **mid-generation** (before the model
+    /// sent a `finish_reason`) and partial text was salvaged — a typed signal so
+    /// callers can flag the output as cut short without pattern-matching on a
+    /// magic `finish_reason` string. A complete-but-then-dropped stream (the
+    /// model already sent `finish_reason`) is NOT truncated.
+    pub truncated: bool,
 }
 
 /// Ensure every assembled tool call has a non-empty `id`, synthesizing a stable
@@ -175,6 +181,7 @@ fn parse_response_value(data: &Value) -> Result<ChatResponse> {
         tool_calls,
         model,
         finish_reason,
+        truncated: false,
     })
 }
 
@@ -185,6 +192,143 @@ struct ToolCallAcc {
     id: String,
     name: String,
     arguments: String,
+}
+
+/// Assemble a `ChatResponse` from an OpenAI-compatible SSE stream, calling
+/// `next_line` to pull each raw line and emitting content deltas via `on_delta`.
+///
+/// Read-error handling — graceful partial-output on a mid-stream drop
+/// (monocle-cli#59): when `next_line` yields `Err`, the outcome depends on how
+/// far the stream got:
+/// - **Already complete** (`finish_reason.is_some()`): the model sent its final
+///   chunk before the connection dropped (e.g. before `[DONE]`). Treat the error
+///   as a benign end-of-stream — `break` and keep everything as-is (tool calls
+///   preserved, NOT marked truncated). Dropping a valid tool call here would be a
+///   bug.
+/// - **Mid-generation** (`finish_reason` still `None`, but `content` or a tool
+///   call was started): salvage the partial text — mark `truncated = true`, drop
+///   any in-progress tool calls (a tool call cut off mid-stream is unreliable),
+///   and break.
+/// - **Nothing received**: propagate the error (a genuine connection failure with
+///   nothing to salvage).
+///
+/// No-usable-content guard: if the stream ends having produced nothing usable —
+/// no content, no tool calls, no `finish_reason`, and not truncated — it likely
+/// carried an error-shaped `data:` payload (a 200 with `{"error":...}`) rather
+/// than a real completion, so an error is returned rather than a silent empty
+/// `Ok`. A legitimately-empty-but-complete reply carries `finish_reason` and so
+/// passes.
+fn assemble_sse_stream(
+    mut next_line: impl FnMut() -> Result<Option<String>>,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<ChatResponse> {
+    let mut content = String::new();
+    let mut finish_reason: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut tool_acc: Vec<ToolCallAcc> = Vec::new();
+    let mut truncated = false;
+
+    loop {
+        let raw = match next_line() {
+            Ok(Some(raw)) => raw,
+            Ok(None) => break,
+            Err(e) => {
+                if finish_reason.is_some() {
+                    // The model already completed (final chunk arrived); the drop
+                    // is just a missing `[DONE]`. Keep everything as-is.
+                    break;
+                }
+                // Salvage a truncated-but-usable response if anything arrived
+                // mid-generation; otherwise there is nothing to salvage.
+                if !content.is_empty() || !tool_acc.is_empty() {
+                    truncated = true;
+                    tool_acc.clear();
+                    break;
+                }
+                return Err(e);
+            }
+        };
+        let data = match raw.trim_end().strip_prefix("data:") {
+            Some(d) => d.trim_start().to_string(),
+            None => continue,
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let v: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if model.is_none() {
+            model = v["model"].as_str().map(String::from);
+        }
+        let choice = &v["choices"][0];
+        if let Some(fr) = choice["finish_reason"].as_str() {
+            finish_reason = Some(fr.to_string());
+        }
+        let delta = &choice["delta"];
+        if let Some(c) = delta["content"].as_str() {
+            if !c.is_empty() {
+                content.push_str(c);
+                on_delta(c);
+            }
+        }
+        if let Some(tcs) = delta["tool_calls"].as_array() {
+            for tc in tcs {
+                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                while tool_acc.len() <= idx {
+                    tool_acc.push(ToolCallAcc::default());
+                }
+                let acc = &mut tool_acc[idx];
+                if let Some(id) = tc["id"].as_str() {
+                    if !id.is_empty() {
+                        acc.id = id.to_string();
+                    }
+                }
+                if let Some(name) = tc["function"]["name"].as_str() {
+                    if !name.is_empty() {
+                        acc.name = name.to_string();
+                    }
+                }
+                if let Some(args) = tc["function"]["arguments"].as_str() {
+                    acc.arguments.push_str(args);
+                }
+            }
+        }
+    }
+
+    let mut tool_calls: Vec<ToolCall> = tool_acc
+        .into_iter()
+        .filter(|a| !a.name.is_empty())
+        .map(|a| ToolCall {
+            id: a.id,
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: a.name,
+                arguments: a.arguments,
+            },
+        })
+        .collect();
+    ensure_tool_call_ids(&mut tool_calls);
+
+    // No-usable-content guard (parity with the non-streaming `parse_response_value`
+    // "no choices" check): a stream that yielded no content, no tool calls, no
+    // finish_reason, and wasn't truncated never saw a valid choice — most likely
+    // an error-shaped 200 (`data:{"error":...}`). Surface it instead of a silent
+    // empty answer.
+    if content.is_empty() && tool_calls.is_empty() && finish_reason.is_none() && !truncated {
+        return Err(AppError::new(
+            "streaming response contained no completion (possible upstream error)",
+        ));
+    }
+
+    Ok(ChatResponse {
+        content,
+        tool_calls,
+        model,
+        finish_reason,
+        truncated,
+    })
 }
 
 /// The seam the agent loop is built on. Any backend (monocle-routed today, a
@@ -292,81 +436,128 @@ impl LlmProvider for MonocleProvider {
             return Ok(resp);
         }
 
-        // SSE: assemble content + tool calls from `data:` deltas.
-        let mut content = String::new();
-        let mut finish_reason: Option<String> = None;
-        let mut model: Option<String> = None;
-        let mut tool_acc: Vec<ToolCallAcc> = Vec::new();
+        // SSE: assemble content + tool calls from `data:` deltas. A mid-stream
+        // read error is salvaged into a truncated response (see the fn's docs).
+        assemble_sse_stream(|| stream.next_line(), on_delta)
+    }
+}
 
-        while let Some(raw) = stream.next_line()? {
-            let data = match raw.trim_end().strip_prefix("data:") {
-                Some(d) => d.trim_start().to_string(),
-                None => continue,
-            };
-            if data == "[DONE]" {
-                break;
-            }
-            let v: Value = match serde_json::from_str(&data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if model.is_none() {
-                model = v["model"].as_str().map(String::from);
-            }
-            let choice = &v["choices"][0];
-            if let Some(fr) = choice["finish_reason"].as_str() {
-                finish_reason = Some(fr.to_string());
-            }
-            let delta = &choice["delta"];
-            if let Some(c) = delta["content"].as_str() {
-                if !c.is_empty() {
-                    content.push_str(c);
-                    on_delta(c);
-                }
-            }
-            if let Some(tcs) = delta["tool_calls"].as_array() {
-                for tc in tcs {
-                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
-                    while tool_acc.len() <= idx {
-                        tool_acc.push(ToolCallAcc::default());
-                    }
-                    let acc = &mut tool_acc[idx];
-                    if let Some(id) = tc["id"].as_str() {
-                        if !id.is_empty() {
-                            acc.id = id.to_string();
-                        }
-                    }
-                    if let Some(name) = tc["function"]["name"].as_str() {
-                        if !name.is_empty() {
-                            acc.name = name.to_string();
-                        }
-                    }
-                    if let Some(args) = tc["function"]["arguments"].as_str() {
-                        acc.arguments.push_str(args);
-                    }
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let mut tool_calls: Vec<ToolCall> = tool_acc
-            .into_iter()
-            .filter(|a| !a.name.is_empty())
-            .map(|a| ToolCall {
-                id: a.id,
-                kind: "function".to_string(),
-                function: FunctionCall {
-                    name: a.name,
-                    arguments: a.arguments,
-                },
-            })
-            .collect();
-        ensure_tool_call_ids(&mut tool_calls);
+    /// Drive `assemble_sse_stream` from a fixed script of `next_line` outcomes,
+    /// capturing every content delta the callback observed.
+    fn run_stream(script: Vec<Result<Option<String>>>) -> (Result<ChatResponse>, Vec<String>) {
+        let mut it = script.into_iter();
+        let mut deltas: Vec<String> = Vec::new();
+        let resp = assemble_sse_stream(|| it.next().unwrap_or(Ok(None)), &mut |d| {
+            deltas.push(d.to_string())
+        });
+        (resp, deltas)
+    }
 
-        Ok(ChatResponse {
-            content,
-            tool_calls,
-            model,
-            finish_reason,
-        })
+    fn content_line(text: &str) -> Result<Option<String>> {
+        Ok(Some(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}"
+        )))
+    }
+
+    #[test]
+    fn mid_stream_drop_preserves_partial() {
+        let (resp, deltas) = run_stream(vec![
+            content_line("Hello"),
+            content_line(" world"),
+            Err(AppError::new("error decoding response body")),
+        ]);
+        let resp = resp.expect("partial content should be salvaged, not error");
+        assert_eq!(resp.content, "Hello world");
+        assert!(resp.truncated);
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(deltas, vec!["Hello".to_string(), " world".to_string()]);
+    }
+
+    #[test]
+    fn immediate_error_propagates() {
+        let (resp, _deltas) = run_stream(vec![Err(AppError::new("error decoding response body"))]);
+        assert!(
+            resp.is_err(),
+            "an error before any content should propagate"
+        );
+    }
+
+    #[test]
+    fn normal_completion_assembles_content() {
+        let (resp, deltas) = run_stream(vec![
+            content_line("Hello"),
+            content_line(" world"),
+            Ok(Some("data: [DONE]".to_string())),
+            Ok(None),
+        ]);
+        let resp = resp.expect("normal completion should succeed");
+        assert_eq!(resp.content, "Hello world");
+        assert!(!resp.truncated);
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(deltas, vec!["Hello".to_string(), " world".to_string()]);
+    }
+
+    #[test]
+    fn truncation_mid_tool_call_drops_the_tool_call() {
+        // A partial tool_call delta (name + start of arguments), then a drop.
+        let tool_delta = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
+            \"id\":\"call_abc\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]}}]}";
+        let (resp, _deltas) = run_stream(vec![
+            Ok(Some(tool_delta.to_string())),
+            Err(AppError::new("error decoding response body")),
+        ]);
+        let resp = resp.expect("a started tool call should salvage as partial, not error");
+        assert!(
+            resp.tool_calls.is_empty(),
+            "an interrupted tool call must be dropped"
+        );
+        assert!(resp.truncated);
+    }
+
+    #[test]
+    fn complete_tool_call_then_drop_is_not_truncated() {
+        // The model sends a COMPLETE tool call plus `finish_reason:"tool_calls"`,
+        // then the connection drops before `[DONE]`. The response is already
+        // complete, so the drop must not truncate it or discard the tool call.
+        let complete_tool_delta = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
+            \"id\":\"call_abc\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},\
+            \"finish_reason\":\"tool_calls\"}]}";
+        let (resp, _deltas) = run_stream(vec![
+            Ok(Some(complete_tool_delta.to_string())),
+            Err(AppError::new("error decoding response body")),
+        ]);
+        let resp = resp.expect("a completed response should survive a trailing drop");
+        assert!(
+            !resp.truncated,
+            "a completed response must not be truncated"
+        );
+        assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            resp.tool_calls.len(),
+            1,
+            "a completed tool call must be preserved"
+        );
+        assert_eq!(resp.tool_calls[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn error_shaped_stream_with_no_choices_errors() {
+        // A 200 that carries only an error-shaped payload (no valid choice /
+        // finish_reason) then ends: nothing usable was produced, so surface an
+        // error rather than a silent empty `Ok`.
+        let (resp, _deltas) = run_stream(vec![
+            Ok(Some(
+                "data: {\"error\":{\"message\":\"upstream boom\"}}".to_string(),
+            )),
+            Ok(None),
+        ]);
+        assert!(
+            resp.is_err(),
+            "a stream with no usable completion should error"
+        );
     }
 }

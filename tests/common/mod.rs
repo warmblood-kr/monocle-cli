@@ -53,6 +53,7 @@ pub fn text_response(content: &str) -> ChatResponse {
         tool_calls: vec![],
         model: None,
         finish_reason: Some("stop".to_string()),
+        truncated: false,
     }
 }
 
@@ -76,6 +77,7 @@ pub fn tool_call_response_raw(id: &str, name: &str, arguments: &str) -> ChatResp
         }],
         model: None,
         finish_reason: Some("tool_calls".to_string()),
+        truncated: false,
     }
 }
 

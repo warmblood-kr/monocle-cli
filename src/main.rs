@@ -111,9 +111,9 @@ struct ChatArgs {
     /// Load system prompt from file
     #[arg(long = "system-prompt-file")]
     system_prompt_file: Option<String>,
-    /// Maximum output tokens
-    #[arg(long = "max-tokens", default_value = "4096")]
-    max_tokens: String,
+    /// Maximum output tokens (omitted by default → model/router uses its own)
+    #[arg(long = "max-tokens")]
+    max_tokens: Option<String>,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -122,7 +122,7 @@ impl From<ChatArgs> for ChatOptions {
             model: Some(a.model),
             system_prompt: a.system_prompt,
             system_prompt_file: a.system_prompt_file,
-            max_tokens: Some(a.max_tokens),
+            max_tokens: a.max_tokens,
         }
     }
 }

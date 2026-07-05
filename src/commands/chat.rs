@@ -11,8 +11,6 @@ use crate::error::Result;
 use crate::net::Client;
 use crate::origin::auth_headers;
 
-const DEFAULT_MAX_TOKENS: i64 = 4096;
-
 pub struct ChatOptions {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
@@ -20,27 +18,52 @@ pub struct ChatOptions {
     pub max_tokens: Option<String>,
 }
 
-/// One non-streaming chat turn via the shared provider (chat-proxy routing).
+/// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
+/// only when the flag was passed AND parses as a **positive** integer; otherwise
+/// `None`, so the request omits `max_tokens` and the router/model uses its own
+/// (higher, model-appropriate) default. Pure: a present-but-invalid flag is
+/// detectable by the caller as `flag.is_some() && resolve_max_tokens(flag) ==
+/// None`, which is where the user-facing warning is emitted.
+fn resolve_max_tokens(flag: Option<&str>) -> Option<i64> {
+    flag.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// One streaming chat turn via the shared provider (chat-proxy routing): assistant
+/// text deltas are written to stdout (and flushed) as they arrive.
 fn call_chat(
     provider: &MonocleProvider,
     model: &str,
     system_prompt: Option<&str>,
     user_message: &str,
-    max_tokens: i64,
-) -> Result<String> {
+    max_tokens: Option<i64>,
+) -> Result<()> {
     let mut messages = Vec::new();
     if let Some(sp) = system_prompt {
         messages.push(Message::system(sp));
     }
     messages.push(Message::user(user_message));
 
-    let resp = provider.chat(&ChatRequest {
+    let req = ChatRequest {
         model: model.to_string(),
         messages,
-        max_tokens: Some(max_tokens),
+        max_tokens,
         ..Default::default()
+    };
+    // Acquire the stdout lock once for the whole stream rather than per token —
+    // the closure writes+flushes to this single handle (per-delta flush keeps the
+    // output live).
+    let mut out = std::io::stdout().lock();
+    let resp = provider.chat_stream(&req, &mut |delta| {
+        let _ = out.write_all(delta.as_bytes());
+        let _ = out.flush();
     })?;
-    Ok(resp.content)
+    // A mid-stream drop was salvaged into partial output (monocle-cli#59): stdout
+    // already holds the partial text, so the notice goes to stderr.
+    if resp.truncated {
+        eprintln!("\n⚠ the response was cut short (partial output shown).");
+    }
+    Ok(())
 }
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
@@ -49,11 +72,16 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         .as_deref()
         .unwrap_or(DEFAULT_MODEL)
         .to_string();
-    let max_tokens = options
-        .max_tokens
-        .as_deref()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(DEFAULT_MAX_TOKENS);
+    let max_tokens_flag = options.max_tokens.as_deref();
+    let max_tokens = resolve_max_tokens(max_tokens_flag);
+    // The flag was given but didn't resolve to a positive integer — warn (to
+    // stderr) rather than silently omitting it, so a typo isn't mistaken for the
+    // model's default limit.
+    if let Some(raw) = max_tokens_flag {
+        if max_tokens.is_none() {
+            eprintln!("⚠ ignoring --max-tokens '{raw}' (a positive integer is required)");
+        }
+    }
 
     // Resolve system prompt.
     let system_prompt: Option<String> = if let Some(path) = &options.system_prompt_file {
@@ -111,7 +139,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         }
         eprintln!("Using model: {model}");
         eprintln!("Router: {router_url}");
-        let result = call_chat(
+        call_chat(
             &provider,
             &model,
             system_prompt.as_deref(),
@@ -119,8 +147,8 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
             max_tokens,
         )?;
         let mut out = std::io::stdout();
-        out.write_all(result.as_bytes())?;
         out.write_all(b"\n")?;
+        out.flush()?;
         return Ok(());
     }
 
@@ -162,9 +190,8 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
             trimmed,
             max_tokens,
         ) {
-            Ok(result) => {
+            Ok(()) => {
                 let mut out = std::io::stdout();
-                out.write_all(result.as_bytes())?;
                 out.write_all(b"\n\n")?;
                 out.flush()?;
             }
@@ -173,4 +200,35 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_max_tokens;
+
+    #[test]
+    fn absent_flag_omits() {
+        assert_eq!(resolve_max_tokens(None), None);
+    }
+
+    #[test]
+    fn valid_integer_is_used() {
+        assert_eq!(resolve_max_tokens(Some("8000")), Some(8000));
+        // Surrounding whitespace is tolerated.
+        assert_eq!(resolve_max_tokens(Some("  4096 ")), Some(4096));
+    }
+
+    #[test]
+    fn unparseable_flag_omits() {
+        assert_eq!(resolve_max_tokens(Some("x")), None);
+        assert_eq!(resolve_max_tokens(Some("")), None);
+    }
+
+    #[test]
+    fn non_positive_flag_omits() {
+        // Present but not a positive integer → None (caller warns).
+        assert_eq!(resolve_max_tokens(Some("0")), None);
+        assert_eq!(resolve_max_tokens(Some("-1")), None);
+        assert_eq!(resolve_max_tokens(Some("  -42 ")), None);
+    }
 }
