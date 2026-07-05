@@ -24,7 +24,7 @@ pub fn status_command(creds: &Credentials, home: &Path) {
     let creds = match creds.read() {
         Some(c) => c,
         None => {
-            eprintln!("Not logged in.");
+            eprintln!("Not logged in. Run `monocle login --tenant <domain>` first.");
             return;
         }
     };

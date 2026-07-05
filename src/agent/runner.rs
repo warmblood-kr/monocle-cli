@@ -164,6 +164,15 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                 .provider
                 .chat_stream(&req, &mut |delta| observer.on_text_delta(delta))?;
 
+            // A mid-stream drop was salvaged into a truncated response
+            // (monocle-cli#59): tool_calls are already dropped, so this falls
+            // into the EndTurn path below — just surface a notice. The partial
+            // `resp.content` is appended there like any final answer, so a
+            // `--session` resume keeps it (no separate append needed).
+            if resp.truncated {
+                observer.on_notice("[generation was cut short — showing partial output]");
+            }
+
             // No tool calls → this is the final answer (already streamed to the
             // observer; appended to the conversation for multi-turn callers).
             if resp.tool_calls.is_empty() {
