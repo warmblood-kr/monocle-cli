@@ -35,9 +35,20 @@ pub fn log_path() -> PathBuf {
     home_dir().join(".monocle").join("cli.log")
 }
 
-/// Whether a diagnostic line has been written this run.
+/// Whether a diagnostic line has been written since the last [`reset`] (or
+/// since process start, if `reset` was never called).
 pub fn was_logged() -> bool {
     WAS_LOGGED.load(Ordering::Relaxed)
+}
+
+/// Clear the flag. A one-shot command process (e.g. `main.rs`) never needs
+/// this — it exits right after printing its one error. A long-lived REPL
+/// (`monocle agent`, `monocle chat`) must call this at the *start* of each
+/// turn, before that turn's work runs, so a later turn's hint reflects only
+/// whether *that* turn logged a network error — not a stale flag left over
+/// from an earlier turn.
+pub fn reset() {
+    WAS_LOGGED.store(false, Ordering::Relaxed);
 }
 
 /// Append one diagnostic line: timestamp, HTTP method + (redacted) URL, and
@@ -61,6 +72,7 @@ pub fn log_network_error(method: &str, url: &str, err: &str) {
     else {
         return;
     };
+    harden_permissions(&path);
     let line = format!(
         "{} {method} {} — {err}\n",
         to_iso(now_ms()),
@@ -70,6 +82,19 @@ pub fn log_network_error(method: &str, url: &str, err: &str) {
         WAS_LOGGED.store(true, Ordering::Relaxed);
     }
 }
+
+/// Best-effort `chmod 600` on Unix, mirroring `credentials.rs` (no secrets are
+/// logged here, but there's no reason to leave a diagnostics file
+/// world-readable either). A no-op on other platforms; failures are ignored —
+/// same best-effort posture as the rest of this module.
+#[cfg(unix)]
+fn harden_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn harden_permissions(_path: &std::path::Path) {}
 
 /// Strip any query string before logging. Every call site today sends auth
 /// only via the `Authorization` header (never as a URL/query param), so the
@@ -84,7 +109,8 @@ fn redact_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_url;
+    use super::{redact_url, reset, was_logged, WAS_LOGGED};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn redacts_query_string() {
@@ -100,5 +126,16 @@ mod tests {
             redact_url("https://api.example.com/v1/chat"),
             "https://api.example.com/v1/chat"
         );
+    }
+
+    #[test]
+    fn reset_clears_the_flag() {
+        // `WAS_LOGGED` is a process-global, so drive it directly rather than
+        // via `log_network_error` (which would touch the real filesystem and
+        // race other tests running in parallel).
+        WAS_LOGGED.store(true, Ordering::Relaxed);
+        assert!(was_logged());
+        reset();
+        assert!(!was_logged());
     }
 }
