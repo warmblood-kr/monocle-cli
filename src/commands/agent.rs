@@ -455,6 +455,15 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
                         // A transient per-turn error must not tear down the session.
                         if let Err(e) = repl.run_turn(msg.to_string()) {
                             eprintln!("{} {e}", c::red("Error:"));
+                            if crate::diag::was_logged() {
+                                eprintln!(
+                                    "  {}",
+                                    c::dim(&format!(
+                                        "(details logged to {})",
+                                        crate::diag::display_path()
+                                    ))
+                                );
+                            }
                         }
                     }
                 }

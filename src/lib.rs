@@ -8,6 +8,7 @@ pub mod auth;
 pub mod colors;
 pub mod commands;
 pub mod credentials;
+pub mod diag;
 pub mod endpoints;
 pub mod error;
 pub mod net;

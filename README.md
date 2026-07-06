@@ -293,6 +293,12 @@ print(resp.choices[0].message.content)
 **Token expired**
 → `monocle token` auto-refreshes when near expiry. If it's been more than 30 days since your last login, run `monocle login` again.
 
+**"Error: error decoding response body" (or another network/streaming error)**
+→ The request/response context (method, URL, underlying error) is appended to
+`~/.monocle/cli.log` whenever this happens; a hint pointing there is printed alongside
+the error. The file is otherwise never written or referenced — check it only when you
+hit an error and need more detail than the one-line message.
+
 For Claude Code and OpenAI SDK specific issues, see the linked guides above.
 
 ## Help

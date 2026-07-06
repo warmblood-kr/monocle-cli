@@ -19,6 +19,7 @@ use monocle_cli::commands::token::token_command;
 use monocle_cli::commands::unset::unset_command;
 use monocle_cli::commands::upgrade::upgrade_command;
 use monocle_cli::credentials::Credentials;
+use monocle_cli::diag;
 use monocle_cli::error::Result;
 use monocle_cli::net::Client;
 use monocle_cli::util;
@@ -337,6 +338,9 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
+        if diag::was_logged() {
+            eprintln!("  (details logged to {})", diag::display_path());
+        }
         std::process::exit(1);
     }
 }
