@@ -2,7 +2,7 @@ use std::io::Write;
 
 use serde::Deserialize;
 
-use crate::auth::get_access_token;
+use crate::auth::{get_access_token, try_access_token, AuthSession};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::{AppError, Result};
@@ -33,8 +33,13 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
-pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
-    let session = get_access_token(client, creds);
+/// Fetch the full model listing from the router (`GET /v1/models`) given an
+/// already-resolved session, with no printing — the pure data path shared by
+/// `monocle models` and the `agent` REPL's tab-completion (which needs the id
+/// list, not a rendered table). Takes the session rather than resolving it
+/// itself so callers can choose exiting (`get_access_token`) vs. graceful
+/// (`try_access_token`) auth resolution.
+fn fetch_models_with_session(client: &Client, session: &AuthSession) -> Result<Vec<ModelInfo>> {
     let bearer = format!("Bearer {}", session.token);
 
     let resp = client.get(
@@ -50,7 +55,25 @@ pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
         )));
     }
 
-    let models = resp.json::<ModelsResponse>()?.data;
+    Ok(resp.json::<ModelsResponse>()?.data)
+}
+
+/// Fetch just the model ids — what the `agent` REPL's `/model` completer needs.
+/// Uses the non-exiting [`try_access_token`] (not [`get_access_token`]) so a
+/// missing login or a network hiccup returns an `Err` instead of killing the
+/// process; `agent.rs` treats that as "no candidates" and starts the REPL
+/// anyway rather than propagating.
+pub fn fetch_model_ids(client: &Client, creds: &Credentials) -> Result<Vec<String>> {
+    let session = try_access_token(client, creds)?;
+    Ok(fetch_models_with_session(client, &session)?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
+}
+
+pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
+    let session = get_access_token(client, creds);
+    let models = fetch_models_with_session(client, &session)?;
 
     if models.is_empty() {
         eprintln!("No models available.");
