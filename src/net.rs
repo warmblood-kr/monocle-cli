@@ -81,7 +81,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send(req)
+        send("GET", url, req)
     }
 
     /// GET a large file download (e.g. the `monocle upgrade` release binary).
@@ -122,7 +122,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send(req)
+        send("POST", url, req)
     }
 
     /// POST `application/json`.
@@ -131,7 +131,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send(req)
+        send("POST", url, req)
     }
 
     /// POST `multipart/form-data` with one binary file part plus text fields.
@@ -154,7 +154,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send(req)
+        send("POST", url, req)
     }
 
     /// POST a raw body with an explicit `Content-Type` (Azure SSML).
@@ -173,7 +173,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send(req)
+        send("POST", url, req)
     }
 
     /// POST `application/json` and return a streaming line reader over the (SSE)
@@ -200,19 +200,31 @@ impl Client {
             status,
             content_type,
             reader: BufReader::new(resp),
+            request_url: url.to_string(),
         })
     }
 }
 
-fn send(req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
+fn send(method: &str, url: &str, req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
     // Total request timeout — non-streaming only (see `Client::new`). Streaming
     // (`post_json_stream`) builds and sends its own request without this, so a
     // long generation is never cut short.
     let req = req.timeout(std::time::Duration::from_secs(120));
-    let resp = req.send().map_err(|e| AppError(e.to_string()))?;
+    let resp = req.send().map_err(|e| {
+        let msg = e.to_string();
+        crate::diag::log_network_error(method, url, &msg);
+        AppError(msg)
+    })?;
     let status = resp.status().as_u16();
     let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
-    let body = resp.bytes().map_err(|e| AppError(e.to_string()))?.to_vec();
+    let body = resp
+        .bytes()
+        .map_err(|e| {
+            let msg = e.to_string();
+            crate::diag::log_network_error(method, url, &msg);
+            AppError(msg)
+        })?
+        .to_vec();
     Ok(Resp {
         status,
         status_text,
@@ -227,6 +239,9 @@ pub struct EventStream {
     pub status: u16,
     pub content_type: String,
     reader: BufReader<reqwest::blocking::Response>,
+    /// The request URL, kept only for diagnostic logging on a mid-stream read
+    /// failure (see `next_line`).
+    request_url: String,
 }
 
 impl EventStream {
@@ -242,10 +257,11 @@ impl EventStream {
     /// Next line (including the trailing newline), or `None` at end of stream.
     pub fn next_line(&mut self) -> Result<Option<String>> {
         let mut line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|e| AppError(e.to_string()))?;
+        let n = self.reader.read_line(&mut line).map_err(|e| {
+            let msg = e.to_string();
+            crate::diag::log_network_error("POST", &self.request_url, &msg);
+            AppError(msg)
+        })?;
         Ok(if n == 0 { None } else { Some(line) })
     }
 

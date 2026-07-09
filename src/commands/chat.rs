@@ -183,6 +183,11 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         }
 
         eprintln!();
+        // Reset before this turn's work runs, so the hint below reflects only
+        // whether *this* turn logged a network error — not a stale flag left
+        // over from an earlier one (this REPL loops for the life of the process,
+        // same as `monocle agent`'s).
+        crate::diag::reset();
         match call_chat(
             &provider,
             &model,
@@ -195,7 +200,13 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
                 out.write_all(b"\n\n")?;
                 out.flush()?;
             }
-            Err(e) => eprintln!("Error: {e}\n"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                if crate::diag::was_logged() {
+                    eprintln!("  (details logged to {})", crate::diag::display_path());
+                }
+                eprintln!();
+            }
         }
     }
 

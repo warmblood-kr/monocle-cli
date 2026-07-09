@@ -452,9 +452,22 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
                         eprintln!("unknown command: {cmd} (try /help)");
                     }
                     Command::Turn => {
+                        // Reset before this turn's work runs, so the hint below
+                        // reflects only whether *this* turn logged a network
+                        // error — not a stale flag left over from an earlier one.
+                        crate::diag::reset();
                         // A transient per-turn error must not tear down the session.
                         if let Err(e) = repl.run_turn(msg.to_string()) {
                             eprintln!("{} {e}", c::red("Error:"));
+                            if crate::diag::was_logged() {
+                                eprintln!(
+                                    "  {}",
+                                    c::dim(&format!(
+                                        "(details logged to {})",
+                                        crate::diag::display_path()
+                                    ))
+                                );
+                            }
                         }
                     }
                 }
