@@ -53,7 +53,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | Chat with a model (REPL or stdin) |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only) |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
@@ -119,6 +119,52 @@ monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
 
 > [!NOTE]
 > `monocle model chat` / `monocle model list` still work but are deprecated and will be removed in a future release.
+
+### 📎 Attaching files/images
+
+`monocle chat` can attach files (images in v1) to a one-shot (piped) message —
+handy as an eval primitive for comparing how different providers/models handle
+vision input:
+
+```bash
+echo "count the people in this image" | monocle chat --file photo.png --model gpt-4o
+```
+
+- `--file <PATH|URL>` is repeatable. A local path is read, MIME-sniffed by
+  extension, and base64-encoded into a `data:<mime>;base64,...` URI; an
+  `http://`/`https://` value is passed straight through as the remote image
+  URL (no fetch).
+- Only image types are wired to a vision request in v1 (`png`, `jpg`/`jpeg`,
+  `gif`, `webp`). Anything else is a hard error: `unsupported type: <mime>`.
+- You can also reference a file **inband**, inside the piped text itself,
+  with an Org-mode-style `file:<path>` token — **not** a standard `file://`
+  URI (no `//` required, and relative paths are fine):
+
+  ```bash
+  echo "compare file:./a.png and file:./b.png, which is sharper?" | monocle chat --model gpt-4o
+  ```
+
+  The `file:` token is stripped from the text sent to the model. Trailing
+  sentence punctuation (`.,;:!?)'"`) right after the path is trimmed before
+  resolving — a known v1 limitation if your path itself legitimately ends in
+  one of those characters.
+- Explicit `--file` flags resolve first (in the order given), then inband
+  `file:` references in the order they appear in the text.
+- An attachment-only message (no text) is valid.
+- Attachments are **one-shot only** — not supported in the interactive REPL.
+  Passing `--file` while stdin is a terminal is an error asking you to pipe
+  the instruction instead.
+
+This makes `monocle chat` a quick harness for an image-handling eval loop —
+run the same image + instruction across models and diff both the answers and
+the raw provider error messages:
+
+```bash
+for m in gpt-4o claude-sonnet-4-6 gemini-2-flash; do
+  echo "=== $m ==="
+  echo "count the people in this image" | monocle chat --file crowd.jpg --model "$m"
+done
+```
 
 ## 🔊 Audio (STT / TTS)
 

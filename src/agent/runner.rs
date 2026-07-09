@@ -158,6 +158,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
                 messages: conversation.clone(),
                 max_tokens: self.config.max_tokens,
                 tools: defs.clone(),
+                ..Default::default()
             };
             // Stream assistant text to the observer as it arrives.
             let resp = self
