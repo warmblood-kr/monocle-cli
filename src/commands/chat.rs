@@ -101,9 +101,18 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         std::process::exit(1);
     }
 
-    // Read stdin + resolve any attachments up front — cheap, local-only work
-    // that should fail fast (bad path, unsupported MIME) before we ever touch
-    // the network for auth/model validation below.
+    // Auth FIRST — before any local-input validation. Otherwise an expired/
+    // missing-credentials error can be masked by a local failure that happens
+    // to come first (e.g. empty piped stdin reporting "No input provided via
+    // stdin." while the real problem is "Not logged in").
+    let session = get_access_token(client, creds);
+    let token = session.token;
+    let router_url = session.router_url;
+    let bearer = format!("Bearer {token}");
+
+    // Read stdin + resolve any attachments — cheap, local-only work that
+    // should fail fast (bad path, unsupported MIME) before the second network
+    // call (model-ID validation) below, but after the auth check above.
     let one_shot_input: Option<(String, Vec<ImageAttachment>)> = if !stdin_is_tty {
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
@@ -146,11 +155,6 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     } else {
         options.system_prompt.clone()
     };
-
-    let session = get_access_token(client, creds);
-    let token = session.token;
-    let router_url = session.router_url;
-    let bearer = format!("Bearer {token}");
 
     // Validate the model ID against the available models (non-fatal on failure).
     if let Ok(resp) = client.get(

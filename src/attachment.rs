@@ -52,7 +52,9 @@ pub fn resolve(value: &str) -> Result<ImageAttachment> {
         .unwrap_or_default();
     let mime = mime_by_ext(&ext).unwrap_or("application/octet-stream");
     if !mime.starts_with("image/") {
-        return Err(AppError::new(format!("unsupported type: {mime}")));
+        return Err(AppError::new(format!(
+            "unsupported type: {mime} (from extension \"{ext}\" of {value})"
+        )));
     }
 
     let data = std::fs::read(path)?;
@@ -91,18 +93,28 @@ pub fn extract_inband_refs(text: &str) -> (String, Vec<String>) {
             .unwrap_or(after_ws.len());
         let word = &after_ws[..word_end];
 
-        match word.strip_prefix("file:") {
-            Some(path) => {
-                let trimmed = path.trim_end_matches(TRAILING_PUNCT.as_slice());
-                if trimmed.is_empty() {
-                    // "file:" with nothing usable after it — not a real token.
-                    result.push_str(word);
-                } else {
-                    refs.push(trimmed.to_string());
-                    // Token is stripped from the outgoing text entirely.
-                }
+        // Marker match is case-insensitive (`File:`, `FILE:`, ... all count —
+        // mobile autocapitalize / sentence-case habit shouldn't silently drop
+        // an attachment), but only the 5-byte marker itself is case-folded for
+        // the comparison; the path remainder is used verbatim since filesystem
+        // paths are case-sensitive on Linux/macOS.
+        let is_file_marker = word
+            .get(..5)
+            .map(|prefix| prefix.eq_ignore_ascii_case("file:"))
+            .unwrap_or(false);
+
+        if is_file_marker {
+            let path = &word[5..];
+            let trimmed = path.trim_end_matches(TRAILING_PUNCT.as_slice());
+            if trimmed.is_empty() {
+                // "file:" with nothing usable after it — not a real token.
+                result.push_str(word);
+            } else {
+                refs.push(trimmed.to_string());
+                // Token is stripped from the outgoing text entirely.
             }
-            None => result.push_str(word),
+        } else {
+            result.push_str(word);
         }
 
         rest = &after_ws[word_end..];
@@ -149,14 +161,27 @@ mod tests {
     #[test]
     fn non_image_extension_errors_with_typed_message() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("notes.txt");
+        let path = dir.path().join("notes.heic");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"hello").unwrap();
 
         let err = resolve(path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().starts_with("unsupported type:"),
-            "unexpected message: {err}"
+            msg.starts_with("unsupported type:"),
+            "unexpected message: {msg}"
+        );
+        // Regression: the rejected extension (and the offending path) must be
+        // named in the error — otherwise the user has no way to diagnose
+        // "what happened with this file/format" (the whole point of the
+        // feature).
+        assert!(
+            msg.contains("heic"),
+            "error should name the rejected extension: {msg}"
+        );
+        assert!(
+            msg.contains(path.to_str().unwrap()),
+            "error should name the offending path: {msg}"
         );
     }
 
@@ -168,6 +193,23 @@ mod tests {
         assert!(!cleaned.contains("file:"));
         assert!(cleaned.contains("compare"));
         assert!(cleaned.contains("and"));
+    }
+
+    #[test]
+    fn inband_marker_is_case_insensitive_but_path_case_is_preserved() {
+        let (cleaned, refs) = extract_inband_refs("look at File:./Photo.png please");
+        assert_eq!(refs, vec!["./Photo.png".to_string()]);
+        assert!(!cleaned.to_lowercase().contains("file:"));
+        assert!(cleaned.contains("look"));
+        assert!(cleaned.contains("please"));
+
+        let (cleaned2, refs2) = extract_inband_refs("FILE:./B.PNG");
+        assert_eq!(refs2, vec!["./B.PNG".to_string()]);
+        assert!(cleaned2.trim().is_empty());
+
+        // Lowercase marker still works unchanged (regression).
+        let (_, refs3) = extract_inband_refs("file:./a.png");
+        assert_eq!(refs3, vec!["./a.png".to_string()]);
     }
 
     #[test]
