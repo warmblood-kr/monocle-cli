@@ -177,14 +177,45 @@ impl Client {
     }
 
     /// POST `application/json` and return a streaming line reader over the (SSE)
-    /// response body — no buffering. For `stream: true` chat completions.
+    /// response body — no buffering. For `stream: true` chat completions. No
+    /// per-request timeout: a long LLM generation must not be cut mid-stream.
     pub fn post_json_stream(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         body: &Value,
     ) -> Result<EventStream> {
+        self.post_json_stream_impl(url, headers, body, None)
+    }
+
+    /// Same as [`Client::post_json_stream`], but bounds the request (and every
+    /// subsequent read off the body, e.g. each `EventStream::next_line`) with
+    /// `timeout` — reqwest's blocking `Response` re-applies this same duration
+    /// to each individual body read (see `blocking::response::Response`'s `Read`
+    /// impl), so a stalled peer surfaces as a timeout instead of hanging the
+    /// caller forever. For bounded calls that happen to use the streaming
+    /// envelope (e.g. an MCP `tools/call`) rather than an open-ended generation.
+    pub fn post_json_stream_with_timeout(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        timeout: std::time::Duration,
+    ) -> Result<EventStream> {
+        self.post_json_stream_impl(url, headers, body, Some(timeout))
+    }
+
+    fn post_json_stream_impl(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<EventStream> {
         let mut req = self.inner.post(url).json(body);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
         for (k, v) in headers {
             req = req.header(*k, *v);
         }

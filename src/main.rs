@@ -12,6 +12,7 @@ use monocle_cli::commands::audio_transcribe_azure::{
 use monocle_cli::commands::chat::{chat_command, ChatOptions};
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::login::login_command;
+use monocle_cli::commands::mcp::{mcp_connect_command, mcp_exec_command, mcp_ls_command};
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
 use monocle_cli::commands::status::status_command;
@@ -56,6 +57,9 @@ Commands:
 
   Audio:
     audio    Call audio (STT / TTS) endpoints directly for debugging
+
+  MCP:
+    mcp      List, connect (OAuth/API key), and exec MCP (Model Context Protocol) servers
 
   Maintenance:
     upgrade  Update monocle to the latest release
@@ -132,6 +136,11 @@ enum Commands {
     Audio {
         #[command(subcommand)]
         command: AudioCommands,
+    },
+    /// List, connect, and exec MCP (Model Context Protocol) servers
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
     },
     /// [Deprecated] Use `monocle chat` / `monocle models` instead
     #[command(hide = true)]
@@ -268,6 +277,31 @@ enum AudioCommands {
 }
 
 #[derive(Subcommand)]
+enum McpCommands {
+    /// List MCP servers available to your account
+    Ls {
+        /// Print the raw JSON response instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register an MCP server (OAuth browser flow, or an API-key prompt)
+    Connect {
+        /// Catalog server name (see `monocle mcp ls`)
+        name: String,
+    },
+    /// Call a tool on a registered, non-remote MCP server
+    Exec {
+        /// Catalog server name (see `monocle mcp ls`)
+        name: String,
+        /// Tool name to call
+        tool: String,
+        /// Tool argument as key=value (repeatable)
+        #[arg(long = "arg")]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ModelCommands {
     /// [Deprecated] Use `monocle models` instead
     List,
@@ -324,6 +358,7 @@ fn main() {
             },
         ),
         Commands::Audio { command } => run_audio(&client, &creds, command),
+        Commands::Mcp { command } => run_mcp(&client, &creds, command),
         Commands::Upgrade { check } => upgrade_command(&client, check),
         Commands::Model { command } => {
             match command {
@@ -436,6 +471,16 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
     }
 }
 
+fn run_mcp(client: &Client, creds: &Credentials, command: McpCommands) -> Result<()> {
+    match command {
+        McpCommands::Ls { json } => mcp_ls_command(client, creds, json),
+        McpCommands::Connect { name } => mcp_connect_command(client, creds, &name),
+        McpCommands::Exec { name, tool, args } => {
+            mcp_exec_command(client, creds, &name, &tool, &args)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +493,64 @@ mod tests {
                 assert_eq!(args.file, vec!["a.png".to_string(), "b.png".to_string()]);
             }
             _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn mcp_ls_json_flag_parses() {
+        let cli = Cli::parse_from(["monocle", "mcp", "ls", "--json"]);
+        match cli.command {
+            Commands::Mcp {
+                command: McpCommands::Ls { json },
+            } => assert!(json),
+            _ => panic!("expected Mcp Ls command"),
+        }
+    }
+
+    #[test]
+    fn mcp_ls_without_json_flag_defaults_false() {
+        let cli = Cli::parse_from(["monocle", "mcp", "ls"]);
+        match cli.command {
+            Commands::Mcp {
+                command: McpCommands::Ls { json },
+            } => assert!(!json),
+            _ => panic!("expected Mcp Ls command"),
+        }
+    }
+
+    #[test]
+    fn mcp_connect_parses_name() {
+        let cli = Cli::parse_from(["monocle", "mcp", "connect", "github"]);
+        match cli.command {
+            Commands::Mcp {
+                command: McpCommands::Connect { name },
+            } => assert_eq!(name, "github"),
+            _ => panic!("expected Mcp Connect command"),
+        }
+    }
+
+    #[test]
+    fn mcp_exec_parses_name_tool_and_repeated_args() {
+        let cli = Cli::parse_from([
+            "monocle",
+            "mcp",
+            "exec",
+            "github",
+            "search_issues",
+            "--arg",
+            "k=v",
+            "--arg",
+            "k2=v2",
+        ]);
+        match cli.command {
+            Commands::Mcp {
+                command: McpCommands::Exec { name, tool, args },
+            } => {
+                assert_eq!(name, "github");
+                assert_eq!(tool, "search_issues");
+                assert_eq!(args, vec!["k=v".to_string(), "k2=v2".to_string()]);
+            }
+            _ => panic!("expected Mcp Exec command"),
         }
     }
 }
