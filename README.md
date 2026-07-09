@@ -233,7 +233,10 @@ In the interactive REPL, lines starting with `/` are local management commands (
 without calling the model, printed to stderr): `/help` lists them, `/config` shows the
 session config (model, max-steps, workdir, session), `/status` adds your login status,
 `/model` shows the current model (or `/model <id>` switches it for later turns), and
-`/exit` (or `/quit`, Ctrl-D) quits.
+`/exit` (or `/quit`, Ctrl-D) quits. `/model <TAB>` fuzzy-completes against the model ids
+available to your account (fetched once at startup) — e.g. `/model cla<TAB>` narrows to
+matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in or the
+list can't be fetched, completion just offers nothing (typing a full id still works).
 
 ```bash
 monocle agent "summarize the TODOs in this repo" --workdir .
