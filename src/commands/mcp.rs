@@ -42,10 +42,17 @@ const CONNECT_POLL_TIMEOUT_SECS: u64 = 300;
 const EXEC_TIMEOUT_SECS: u64 = 120;
 
 // ---------------------------------------------------------------------------
-// Catalog model — deliberately permissive: we don't have a byte-exact response
-// sample from jarvice (its source isn't in this workspace), only the route and
-// field names confirmed by the Phase 0 spike, so every field is optional/
-// defaulted and unknown extra fields are silently ignored by serde.
+// Catalog model — verified against jarvice + monocle-tool-server source
+// (Phase 1 spike, `../skills`-adjacent scratch clones of both repos on
+// `devel`): jarvice's `routers/mcp.py::list_mcp_servers` (lines 99-107) builds
+// each response entry as `{**server, "enabled", "auth_required",
+// "auth_satisfied", "tools"}` — i.e. it spreads the raw catalog dict from
+// monocle-tool-server's OpenAPI `x-mcp-servers` extension verbatim and only
+// *adds* the four computed fields, so every other key (`auth`, `remote`,
+// `description`, ...) is exactly whatever `servers/{name}/catalog.json` +
+// `scripts/manifest_loader.py` produced. Every field below is still optional/
+// defaulted — unknown extra fields are silently ignored by serde — but the
+// shapes are now grounded, not guessed.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,8 +66,18 @@ struct McpServerEntry {
     auth_satisfied: bool,
     #[serde(default)]
     tools: Vec<McpToolInfo>,
-    /// Presence (non-null) means this is a remote (third-party-hosted) server —
-    /// `exec` refuses these in v1.
+    /// CONFIRMED (monocle-tool-server `scripts/manifest_loader.py`, the
+    /// `load_all_manifests` loop building each catalog `entry`: `entry.update({k:
+    /// v for k, v in catalog.items() if k != "envs"})`): `remote` is copied
+    /// straight from `catalog.json` and is present *only* for servers that
+    /// declare it there. Of the seven real catalog.json files in this repo
+    /// (`servers/{github,dart,image,iros,ms365,model_designer,web}`), only
+    /// `github` has a `remote` key at all (`{"url": ..., "credential": ...}`);
+    /// the other six omit the key entirely — never `"remote": false` or
+    /// `"remote": null`. serde's `Option<T>` already maps a missing JSON key to
+    /// `None` with no `#[serde(default)]` needed, so the original
+    /// `entry.remote.is_some()` check in `mcp_exec_command` was already
+    /// correct — this citation replaces what was an unconfirmed guess.
     remote: Option<Value>,
     auth: Option<McpAuthInfo>,
 }
@@ -70,10 +87,23 @@ struct McpToolInfo {
     name: String,
 }
 
+/// CONFIRMED nested (not flat `auth_type: "..."` fields): jarvice
+/// `utils/mcp_client.py`'s `OAuth2AuthMeta`/`ApiKeyAuthMeta` pydantic models
+/// (lines 83-121) are the typed shape of a catalog `auth` block — always an
+/// object with `type` (`"oauth2"` | `"api_key"`) and `provider`, plus
+/// oauth2-only `authorization_endpoint`/`token_endpoint`/`scopes`. Real
+/// examples: `monocle-tool-server/servers/github/catalog.json` and
+/// `servers/ms365/catalog.json` both declare `"auth": {"type": "oauth2",
+/// "provider": ..., ...}` as a nested object. `routers/mcp.py`'s `**server`
+/// spread (line 101) passes this through to the CLI unchanged, so the
+/// original nested-object guess was correct — only `provider` was missing
+/// from this model, which is needed to resolve the catalog-name-vs-provider
+/// divergence (see `effective_provider` below).
 #[derive(Debug, Clone, Deserialize)]
 struct McpAuthInfo {
     #[serde(rename = "type")]
     auth_type: Option<String>,
+    provider: Option<String>,
 }
 
 /// The catalog list call's root can plausibly be a bare JSON array or an object
@@ -255,6 +285,31 @@ fn connect_kind(entry: &McpServerEntry) -> ConnectKind {
     }
 }
 
+/// The OAuth/API-key provider identifier for `entry`: `auth.provider` if the
+/// catalog declared one explicitly, else the catalog `name` — mirroring
+/// jarvice's own fallback (`utils/mcp_client.py::parse_auth`, lines 146-168:
+/// "provider may be omitted in the catalog and defaults to the server name...
+/// entries where they differ (e.g. ms365 / microsoft) still declare provider
+/// explicitly").
+///
+/// This MUST be used — not `entry.name` — for anything that reads or writes
+/// jarvice's connector state, because `UserConnectorsTable` (jarvice
+/// `models/users.py`) keys every connector row by `provider`
+/// (`get_status_for_user`, lines 653-663: `{r.provider: {...} for r in rows}`),
+/// and `POST /api/v1/connectors/{provider}/token` (`routers/connectors.py`
+/// line 455: `@router.post("/{provider}/token")`) uses its path param
+/// directly with no catalog lookup at all. `servers/ms365/catalog.json` is a
+/// real, confirmed case where the catalog `name` ("ms365") and `auth.provider`
+/// ("microsoft") diverge — using `name` there would silently write/read the
+/// wrong connector row.
+fn effective_provider(entry: &McpServerEntry) -> &str {
+    entry
+        .auth
+        .as_ref()
+        .and_then(|a| a.provider.as_deref())
+        .unwrap_or(entry.name.as_str())
+}
+
 /// Whether `entry` is already fully connected: enabled, and — if it declares
 /// `auth_required` — its auth is already satisfied. Used to short-circuit
 /// `mcp_connect_command` so re-running `connect` on an already-connected server
@@ -281,10 +336,11 @@ pub fn mcp_connect_command(client: &Client, creds: &Credentials, name: &str) -> 
         return Ok(());
     }
 
+    let provider = effective_provider(entry);
     match connect_kind(entry) {
         ConnectKind::NoAuth => enable_server(client, &router_url, &bearer, name),
-        ConnectKind::ApiKey => connect_api_key(client, &router_url, &bearer, name),
-        ConnectKind::OAuth => connect_oauth(client, &router_url, &bearer, name),
+        ConnectKind::ApiKey => connect_api_key(client, &router_url, &bearer, name, provider, entry),
+        ConnectKind::OAuth => connect_oauth(client, &router_url, &bearer, name, provider),
     }
 }
 
@@ -306,7 +362,14 @@ fn enable_server(client: &Client, router_url: &str, bearer: &str, name: &str) ->
     Ok(())
 }
 
-fn connect_api_key(client: &Client, router_url: &str, bearer: &str, name: &str) -> Result<()> {
+fn connect_api_key(
+    client: &Client,
+    router_url: &str,
+    bearer: &str,
+    name: &str,
+    provider: &str,
+    entry: &McpServerEntry,
+) -> Result<()> {
     eprint!("Enter API key for '{name}': ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
@@ -318,12 +381,28 @@ fn connect_api_key(client: &Client, router_url: &str, bearer: &str, name: &str) 
         return Err(AppError::new("No API key provided."));
     }
 
-    // NOTE: the exact request body shape for this endpoint isn't confirmed
-    // (jarvice's `connectors.py` source wasn't available to the Phase 0 spike
-    // beyond the route + purpose); `{"token": ...}` is a reasonable default that
-    // is easy to adjust once the wire contract is verified end-to-end.
-    let path = endpoints::CONNECTOR_TOKEN.replace("{name}", name);
-    let body = json!({ "token": key });
+    // CONFIRMED wire shape (jarvice `routers/connectors.py`): `ManualTokenBody`
+    // (lines 449-452) declares `access_token` (not `token`) plus `auth_type` and
+    // an optional `enable_server`; `set_manual_token` (lines 455-484) persists
+    // via `UserConnectors.upsert(provider=provider, auth_type=body.auth_type,
+    // secret=body.access_token, ...)` and, when `enable_server` is set, also
+    // enables that MCP server in the same request — mirroring the OAuth
+    // callback's auto-enable convenience (`provider_callback`, lines 357-381).
+    // The path param is literally named `provider` (line 455: `@router.post(
+    // "/{provider}/token")`) and is used with NO catalog lookup at all, so it
+    // must be the resolved provider identifier (`effective_provider`), not the
+    // catalog server `name` — they diverge for real entries like ms365/microsoft.
+    let auth_type = entry
+        .auth
+        .as_ref()
+        .and_then(|a| a.auth_type.as_deref())
+        .unwrap_or("api_key");
+    let path = endpoints::CONNECTOR_TOKEN.replace("{name}", provider);
+    let body = json!({
+        "access_token": key,
+        "auth_type": auth_type,
+        "enable_server": name,
+    });
     let resp = client.post_json(&format!("{router_url}{path}"), &auth_headers(bearer), &body)?;
     if !resp.ok() {
         return Err(AppError::new(format!(
@@ -336,7 +415,18 @@ fn connect_api_key(client: &Client, router_url: &str, bearer: &str, name: &str) 
     Ok(())
 }
 
-fn connect_oauth(client: &Client, router_url: &str, bearer: &str, name: &str) -> Result<()> {
+fn connect_oauth(
+    client: &Client,
+    router_url: &str,
+    bearer: &str,
+    name: &str,
+    provider: &str,
+) -> Result<()> {
+    // CONFIRMED: unlike the `/token` route, `GET /{server_name}/connect`
+    // (jarvice `routers/connectors.py`, lines 188-203) takes the CATALOG name
+    // (`_lookup_server` matches `s.get("name") == server_name`, lines 142-151)
+    // and resolves `auth.provider` internally — so `name` (not `provider`) is
+    // the right identifier here. Only the status poll below needs `provider`.
     let path = endpoints::CONNECTOR_CONNECT.replace("{name}", name);
     let query = form_urlencode(&[("enable_server", name)]);
     let url = format!("{router_url}{path}?{query}");
@@ -370,7 +460,7 @@ fn connect_oauth(client: &Client, router_url: &str, bearer: &str, name: &str) ->
         );
     }
 
-    poll_connector_status(client, router_url, bearer, name)
+    poll_connector_status(client, router_url, bearer, name, provider)
 }
 
 #[derive(Deserialize)]
@@ -388,19 +478,28 @@ struct ConnectorStatusEntry {
     connected: bool,
 }
 
-/// Whether `name` shows `connected: true` in a `/api/v1/connectors/status`
-/// response body. Tolerant of either a list-of-entries or a `name -> state` map
-/// shape (bool or `{"connected": bool}`), since we don't have a byte-exact
-/// sample; an unparseable/absent body is treated as "not yet connected" so the
-/// poll loop just keeps waiting until the timeout.
-fn provider_connected(body: &str, name: &str) -> bool {
+/// Whether `provider` shows `connected: true` in a `/api/v1/connectors/status`
+/// response body.
+///
+/// CONFIRMED real shape (jarvice `models/users.py::UserConnectorsTable
+/// .get_status_for_user`, lines 653-663): always a map **keyed by `provider`**
+/// (`{r.provider: {"connected": ..., "scopes": ..., "connected_at": ...} for r
+/// in rows}`) — never a list, and never a bare bool value. The `List` variant
+/// and bare-`bool` map-value case below are kept only as defensive leniency
+/// (harmless if the shape ever changes); the `Map` + object-value branch is
+/// the one that matches reality. Critically, the map key is the OAuth
+/// **provider** (e.g. `"microsoft"`), not the catalog server name (`"ms365"`)
+/// — callers must pass `effective_provider(entry)`, not `entry.name`. An
+/// unparseable/absent body is treated as "not yet connected" so the poll loop
+/// just keeps waiting until the timeout.
+fn provider_connected(body: &str, provider: &str) -> bool {
     match serde_json::from_str::<ConnectorStatusResponse>(body) {
         Ok(ConnectorStatusResponse::List(entries)) => entries
             .iter()
-            .find(|e| e.provider == name)
+            .find(|e| e.provider == provider)
             .map(|e| e.connected)
             .unwrap_or(false),
-        Ok(ConnectorStatusResponse::Map(map)) => match map.get(name) {
+        Ok(ConnectorStatusResponse::Map(map)) => match map.get(provider) {
             Some(Value::Bool(b)) => *b,
             Some(Value::Object(obj)) => obj
                 .get("connected")
@@ -422,6 +521,7 @@ fn poll_connector_status(
     router_url: &str,
     bearer: &str,
     name: &str,
+    provider: &str,
 ) -> Result<()> {
     eprintln!("Waiting for '{name}' authorization to complete...");
     let deadline = Instant::now() + Duration::from_secs(CONNECT_POLL_TIMEOUT_SECS);
@@ -448,7 +548,9 @@ fn poll_connector_status(
                 resp.text()
             )));
         }
-        if provider_connected(&resp.text(), name) {
+        // Looked up by `provider` (e.g. "microsoft"), not the catalog `name`
+        // (e.g. "ms365") — see `provider_connected`'s doc comment.
+        if provider_connected(&resp.text(), provider) {
             eprintln!("{} '{name}' connected.", c::green("✓"));
             return Ok(());
         }
@@ -645,6 +747,181 @@ pub fn mcp_exec_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------
+    // Ground-truth fixtures — built from jarvice + monocle-tool-server's
+    // actual source (Phase 1 spike: scratch clones of both repos on `devel`),
+    // not guessed. See the doc comments on `McpServerEntry`, `McpAuthInfo`,
+    // and `effective_provider`/`provider_connected` above for the exact
+    // file:line citations each shape below is grounded in.
+    // -------------------------------------------------------------------
+
+    /// A `GET /api/v1/mcp/servers` response shaped exactly like jarvice's real
+    /// one (`routers/mcp.py::list_mcp_servers`, lines 99-107: `{**server,
+    /// "enabled", "auth_required", "auth_satisfied", "tools"}`), covering:
+    /// - `github` — OAuth **and** remote (the one real catalog.json with a
+    ///   `remote` key: `monocle-tool-server/servers/github/catalog.json`).
+    /// - `ms365` — OAuth, non-remote, whose `auth.provider` ("microsoft")
+    ///   genuinely diverges from its catalog `name` ("ms365") — the real,
+    ///   confirmed case (`servers/ms365/catalog.json`).
+    /// - `tavily` — api_key auth. No real catalog.json in this repo currently
+    ///   declares `type: "api_key"`, so this entry is synthetic, but its shape
+    ///   follows the documented `ApiKeyAuthMeta` contract (jarvice
+    ///   `utils/mcp_client.py`, lines 106-119).
+    /// - `dart` — no `auth` and no `remote` key at all, matching
+    ///   `servers/dart/catalog.json` verbatim.
+    const REAL_SERVERS_FIXTURE: &str = r#"{
+        "servers": [
+            {
+                "name": "github",
+                "description": "GitHub 공식 리모트 MCP",
+                "auth": {
+                    "type": "oauth2",
+                    "provider": "github",
+                    "authorization_endpoint": "https://github.com/login/oauth/authorize",
+                    "token_endpoint": "https://github.com/login/oauth/access_token"
+                },
+                "remote": {
+                    "url": "https://api.githubcopilot.com/mcp",
+                    "credential": "github"
+                },
+                "builtin": false,
+                "enabled": true,
+                "auth_required": true,
+                "auth_satisfied": true,
+                "tools": [
+                    {"name": "search_issues", "description": "Search issues", "enabled": true}
+                ]
+            },
+            {
+                "name": "ms365",
+                "description": "Microsoft 365 — 파일·메일·캘린더·Teams",
+                "auth": {
+                    "type": "oauth2",
+                    "provider": "microsoft",
+                    "authorization_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+                    "token_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                    "scopes": ["User.Read", "Mail.Read"]
+                },
+                "builtin": false,
+                "enabled": false,
+                "auth_required": true,
+                "auth_satisfied": false,
+                "tools": []
+            },
+            {
+                "name": "tavily",
+                "description": "Synthetic api_key example — no real catalog.json uses this type yet",
+                "auth": {
+                    "type": "api_key",
+                    "provider": "tavily"
+                },
+                "builtin": false,
+                "enabled": false,
+                "auth_required": true,
+                "auth_satisfied": false,
+                "tools": []
+            },
+            {
+                "name": "dart",
+                "description": "한국 기업 전자공시(DART)",
+                "builtin": false,
+                "enabled": true,
+                "auth_required": false,
+                "auth_satisfied": true,
+                "tools": [
+                    {"name": "search_company", "description": "Search company", "enabled": true}
+                ]
+            }
+        ]
+    }"#;
+
+    /// jarvice's real `/api/v1/connectors/status` response shape
+    /// (`models/users.py::UserConnectorsTable.get_status_for_user`, lines
+    /// 653-663): a map keyed by **provider**, never by catalog server name.
+    const REAL_CONNECTOR_STATUS_FIXTURE: &str = r#"{
+        "github": {"connected": true, "scopes": ["repo"], "connected_at": 1751500000},
+        "microsoft": {"connected": true, "scopes": ["User.Read", "Mail.Read"], "connected_at": 1751500001}
+    }"#;
+
+    #[test]
+    fn parse_servers_matches_real_jarvice_shape() {
+        let servers = parse_servers(REAL_SERVERS_FIXTURE).unwrap();
+        assert_eq!(servers.len(), 4);
+        assert_eq!(servers[0].name, "github");
+        assert_eq!(servers[1].name, "ms365");
+        assert_eq!(servers[2].name, "tavily");
+        assert_eq!(servers[3].name, "dart");
+    }
+
+    #[test]
+    fn remote_detection_matches_real_catalog_shapes() {
+        let servers = parse_servers(REAL_SERVERS_FIXTURE).unwrap();
+        // Only github has a `remote` key at all in the real catalog.
+        assert!(
+            servers[0].remote.is_some(),
+            "github is the one real remote example"
+        );
+        assert!(
+            servers[1].remote.is_none(),
+            "ms365's catalog.json has no `remote` key at all (absent, not null/false)"
+        );
+        assert!(
+            servers[3].remote.is_none(),
+            "dart's catalog.json has no `remote` key at all (absent, not null/false)"
+        );
+    }
+
+    #[test]
+    fn connect_kind_matches_real_shapes() {
+        let servers = parse_servers(REAL_SERVERS_FIXTURE).unwrap();
+        assert!(matches!(connect_kind(&servers[0]), ConnectKind::OAuth)); // github
+        assert!(matches!(connect_kind(&servers[1]), ConnectKind::OAuth)); // ms365
+        assert!(matches!(connect_kind(&servers[2]), ConnectKind::ApiKey)); // tavily
+        assert!(matches!(connect_kind(&servers[3]), ConnectKind::NoAuth)); // dart
+    }
+
+    #[test]
+    fn effective_provider_uses_auth_provider_when_it_diverges_from_catalog_name() {
+        let servers = parse_servers(REAL_SERVERS_FIXTURE).unwrap();
+        // Real, confirmed divergence: monocle-tool-server's
+        // servers/ms365/catalog.json declares auth.provider = "microsoft"
+        // while the catalog name (the server directory) is "ms365".
+        assert_eq!(effective_provider(&servers[1]), "microsoft");
+    }
+
+    #[test]
+    fn effective_provider_matches_name_when_auth_provider_equals_it() {
+        let servers = parse_servers(REAL_SERVERS_FIXTURE).unwrap();
+        assert_eq!(effective_provider(&servers[0]), "github");
+    }
+
+    #[test]
+    fn effective_provider_falls_back_to_name_when_auth_omits_provider() {
+        let entry: McpServerEntry =
+            serde_json::from_str(r#"{"name":"x","auth":{"type":"oauth2"}}"#).unwrap();
+        assert_eq!(effective_provider(&entry), "x");
+    }
+
+    #[test]
+    fn effective_provider_falls_back_to_name_when_no_auth_at_all() {
+        let servers = parse_servers(REAL_SERVERS_FIXTURE).unwrap();
+        assert_eq!(effective_provider(&servers[3]), "dart"); // dart has no auth block
+    }
+
+    #[test]
+    fn provider_connected_matches_real_status_shape_keyed_by_provider() {
+        assert!(provider_connected(REAL_CONNECTOR_STATUS_FIXTURE, "github"));
+        assert!(provider_connected(
+            REAL_CONNECTOR_STATUS_FIXTURE,
+            "microsoft"
+        ));
+        // The catalog name "ms365" is NOT a key in the real response — only
+        // its OAuth provider "microsoft" is. A caller that looked this up by
+        // catalog name (the pre-fix bug) would report "not yet connected"
+        // forever for ms365, even after the user completes OAuth.
+        assert!(!provider_connected(REAL_CONNECTOR_STATUS_FIXTURE, "ms365"));
+    }
 
     #[test]
     fn parse_arg_pairs_builds_json_object() {
