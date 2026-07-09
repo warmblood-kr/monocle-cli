@@ -78,6 +78,27 @@ fn call_chat(
     Ok(())
 }
 
+/// Resolve inband `file:<path>` refs in a REPL line into images, mirroring the
+/// one-shot path's resolution (`attachment::extract_inband_refs` +
+/// `attachment::resolve`) but returning a failure as `Err(String)` instead of
+/// exiting the process — a bad ref in the REPL is a per-turn error, not a
+/// reason to kill the whole session. Returns the cleaned text (`file:` tokens
+/// stripped, same as the one-shot path) alongside the resolved attachments;
+/// zero refs is the common case and just passes `line` through unchanged.
+fn resolve_repl_attachments(
+    line: &str,
+) -> std::result::Result<(String, Vec<ImageAttachment>), String> {
+    let (cleaned_text, refs) = attachment::extract_inband_refs(line);
+    let mut images: Vec<ImageAttachment> = Vec::new();
+    for r in &refs {
+        match attachment::resolve(r) {
+            Ok(img) => images.push(img),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok((cleaned_text.trim().to_string(), images))
+}
+
 /// The slash commands the REPL understands — just quitting, for now (chat has
 /// no `/help`/`/model`/`/config`/`/status`, unlike `monocle agent`'s REPL).
 const CHAT_SLASH_COMMANDS: &[&str] = &["/exit", "/quit"];
@@ -286,11 +307,27 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
                 if trimmed.is_empty() {
                     continue;
                 }
+                // History gets the raw typed line (before `file:` tokens are
+                // stripped) — recalling it via ↑ should show what was actually
+                // typed, matching the non-attachment behavior this REPL already
+                // had.
                 let _ = rl.add_history_entry(line.as_str());
                 if trimmed == "/quit" || trimmed == "/exit" {
                     eprintln!("Bye.");
                     break;
                 }
+
+                let (text, images) = match resolve_repl_attachments(trimmed) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Same per-turn recovery as a `call_chat` error below:
+                        // print and go back to the prompt, no `call_chat` call
+                        // for this turn.
+                        eprintln!("Error: {e}");
+                        eprintln!();
+                        continue;
+                    }
+                };
 
                 eprintln!();
                 // Reset before this turn's work runs, so the hint below reflects
@@ -302,9 +339,9 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
                     &provider,
                     &model,
                     system_prompt.as_deref(),
-                    trimmed,
+                    &text,
                     max_tokens,
-                    &[],
+                    &images,
                 ) {
                     Ok(()) => {
                         let mut out = std::io::stdout();
@@ -341,7 +378,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_max_tokens, ChatReplHelper};
+    use super::{resolve_max_tokens, resolve_repl_attachments, ChatReplHelper};
     use rustyline::completion::Completer;
     use rustyline::history::DefaultHistory;
     use rustyline::Context;
@@ -418,5 +455,57 @@ mod tests {
         assert_eq!(resolve_max_tokens(Some("0")), None);
         assert_eq!(resolve_max_tokens(Some("-1")), None);
         assert_eq!(resolve_max_tokens(Some("  -42 ")), None);
+    }
+
+    #[test]
+    fn repl_line_with_no_file_ref_passes_through_unchanged() {
+        let (text, images) = resolve_repl_attachments("hello there").unwrap();
+        assert_eq!(text, "hello there");
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn repl_line_with_valid_file_ref_resolves_and_strips_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        std::fs::write(&path, b"bytes").unwrap();
+        let line = format!("what's in file:{} ?", path.to_str().unwrap());
+
+        let (text, images) = resolve_repl_attachments(&line).unwrap();
+        assert!(!text.contains("file:"));
+        assert!(text.contains("what's in"));
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn repl_line_with_image_only_file_ref_yields_empty_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.png");
+        std::fs::write(&path, b"bytes").unwrap();
+        let line = format!("file:{}", path.to_str().unwrap());
+
+        let (text, images) = resolve_repl_attachments(&line).unwrap();
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn repl_line_with_nonexistent_file_ref_errors_without_panicking() {
+        let err = resolve_repl_attachments("file:/no/such/path.png").unwrap_err();
+        assert!(err.contains("not found"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn repl_line_with_unsupported_extension_errors_with_typed_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.heic");
+        std::fs::write(&path, b"hello").unwrap();
+        let line = format!("file:{}", path.to_str().unwrap());
+
+        let err = resolve_repl_attachments(&line).unwrap_err();
+        assert!(
+            err.starts_with("unsupported type:"),
+            "unexpected message: {err}"
+        );
     }
 }

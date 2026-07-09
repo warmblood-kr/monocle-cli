@@ -157,9 +157,12 @@ echo "count the people in this image" | monocle chat --file photo.png --model gp
 - Explicit `--file` flags resolve first (in the order given), then inband
   `file:` references in the order they appear in the text.
 - An attachment-only message (no text) is valid.
-- Attachments are **one-shot only** — not supported in the interactive REPL.
-  Passing `--file` while stdin is a terminal is an error asking you to pipe
-  the instruction instead.
+- The `--file` flag is **one-shot only** — passing it while stdin is a
+  terminal is an error asking you to pipe the instruction instead. Inband
+  `file:<path>` tokens, however, also work when typed directly into the
+  **interactive REPL**: a resolution failure (bad path, unsupported type)
+  prints an error and returns you to the prompt rather than exiting the
+  session.
 
 This makes `monocle chat` a quick harness for an image-handling eval loop —
 run the same image + instruction across models and diff both the answers and
