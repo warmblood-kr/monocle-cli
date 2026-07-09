@@ -5,9 +5,16 @@
 //! `GET /api/v1/mcp/servers` (catalog + per-user enable/auth state) and
 //! `/api/v1/connectors/*` (OAuth connect + status) accept it as-is (confirmed by
 //! the Phase 0 server-side spike — stark mints the same `aud`/`monocle_token_type`
-//! for every client). `exec` instead calls monocle-tool-server's own JSON-RPC MCP
-//! endpoint (`POST {mcp_base}/{name}/mcp`), which locally shares the same host as
-//! `router_url` (compose sets both to the same URL); see `mcp_base_url` below.
+//! for every client). These jarvice routes are hit at `session.jarvice_url`
+//! (`auth::jarvice_url_for`, always derived from `tenant_domain`) — **not**
+//! `session.router_url`, which is chat-proxy's base URL and a completely
+//! different host in real deployments (confirmed against a live staging
+//! tenant: `router_url` resolved to chat-proxy, which 404s on every jarvice
+//! route). `exec` instead calls monocle-tool-server's own JSON-RPC MCP
+//! endpoint (`POST {mcp_base}/{name}/mcp`), which locally shares the same host
+//! as `router_url` (compose sets both to the same URL); see `mcp_base_url`
+//! below — that one deliberately still uses `router_url` (tracked gap,
+//! stark#1058), unrelated to the jarvice routes above.
 //!
 //! v1 scope: `exec` only supports non-remote (tool-server-hosted) catalog
 //! entries — a `remote` field on the entry means the tool lives behind a
@@ -129,9 +136,9 @@ fn parse_servers(body: &str) -> Result<Vec<McpServerEntry>> {
 /// parsed entries) so callers that also need the exact response body (e.g.
 /// `mcp_ls_command`'s `--json` passthrough) don't have to re-fetch; `Resp::text`
 /// is non-consuming, so it can be read here for parsing and again by the caller.
-fn fetch_servers_response(client: &Client, router_url: &str, bearer: &str) -> Result<Resp> {
+fn fetch_servers_response(client: &Client, jarvice_url: &str, bearer: &str) -> Result<Resp> {
     let resp = client.get(
-        &format!("{router_url}{}", endpoints::MCP_SERVERS),
+        &format!("{jarvice_url}{}", endpoints::MCP_SERVERS),
         &auth_headers(bearer),
     )?;
     if !resp.ok() {
@@ -144,8 +151,8 @@ fn fetch_servers_response(client: &Client, router_url: &str, bearer: &str) -> Re
     Ok(resp)
 }
 
-fn fetch_servers(client: &Client, router_url: &str, bearer: &str) -> Result<Vec<McpServerEntry>> {
-    let resp = fetch_servers_response(client, router_url, bearer)?;
+fn fetch_servers(client: &Client, jarvice_url: &str, bearer: &str) -> Result<Vec<McpServerEntry>> {
+    let resp = fetch_servers_response(client, jarvice_url, bearer)?;
     parse_servers(&resp.text())
 }
 
@@ -252,7 +259,7 @@ pub fn mcp_ls_command(client: &Client, creds: &Credentials, json_out: bool) -> R
     let session = get_access_token(client, creds);
     let bearer = format!("Bearer {}", session.token);
 
-    let resp = fetch_servers_response(client, &session.router_url, &bearer)?;
+    let resp = fetch_servers_response(client, &session.jarvice_url, &bearer)?;
 
     if json_out {
         println!("{}", resp.text());
@@ -322,9 +329,9 @@ fn already_connected(entry: &McpServerEntry) -> bool {
 pub fn mcp_connect_command(client: &Client, creds: &Credentials, name: &str) -> Result<()> {
     let session = get_access_token(client, creds);
     let bearer = format!("Bearer {}", session.token);
-    let router_url = session.router_url.clone();
+    let jarvice_url = session.jarvice_url.clone();
 
-    let servers = fetch_servers(client, &router_url, &bearer)?;
+    let servers = fetch_servers(client, &jarvice_url, &bearer)?;
     let entry = find_entry(&servers, name).ok_or_else(|| {
         AppError::new(format!(
             "Unknown MCP server '{name}'. Run `monocle mcp ls` to see available servers."
@@ -338,16 +345,18 @@ pub fn mcp_connect_command(client: &Client, creds: &Credentials, name: &str) -> 
 
     let provider = effective_provider(entry);
     match connect_kind(entry) {
-        ConnectKind::NoAuth => enable_server(client, &router_url, &bearer, name),
-        ConnectKind::ApiKey => connect_api_key(client, &router_url, &bearer, name, provider, entry),
-        ConnectKind::OAuth => connect_oauth(client, &router_url, &bearer, name, provider),
+        ConnectKind::NoAuth => enable_server(client, &jarvice_url, &bearer, name),
+        ConnectKind::ApiKey => {
+            connect_api_key(client, &jarvice_url, &bearer, name, provider, entry)
+        }
+        ConnectKind::OAuth => connect_oauth(client, &jarvice_url, &bearer, name, provider),
     }
 }
 
-fn enable_server(client: &Client, router_url: &str, bearer: &str, name: &str) -> Result<()> {
+fn enable_server(client: &Client, jarvice_url: &str, bearer: &str, name: &str) -> Result<()> {
     let path = endpoints::MCP_SERVER_ENABLE.replace("{name}", name);
     let resp = client.post_json(
-        &format!("{router_url}{path}"),
+        &format!("{jarvice_url}{path}"),
         &auth_headers(bearer),
         &json!({}),
     )?;
@@ -364,7 +373,7 @@ fn enable_server(client: &Client, router_url: &str, bearer: &str, name: &str) ->
 
 fn connect_api_key(
     client: &Client,
-    router_url: &str,
+    jarvice_url: &str,
     bearer: &str,
     name: &str,
     provider: &str,
@@ -403,7 +412,11 @@ fn connect_api_key(
         "auth_type": auth_type,
         "enable_server": name,
     });
-    let resp = client.post_json(&format!("{router_url}{path}"), &auth_headers(bearer), &body)?;
+    let resp = client.post_json(
+        &format!("{jarvice_url}{path}"),
+        &auth_headers(bearer),
+        &body,
+    )?;
     if !resp.ok() {
         return Err(AppError::new(format!(
             "Failed to save API key for '{name}' (HTTP {}): {}",
@@ -417,7 +430,7 @@ fn connect_api_key(
 
 fn connect_oauth(
     client: &Client,
-    router_url: &str,
+    jarvice_url: &str,
     bearer: &str,
     name: &str,
     provider: &str,
@@ -429,7 +442,7 @@ fn connect_oauth(
     // the right identifier here. Only the status poll below needs `provider`.
     let path = endpoints::CONNECTOR_CONNECT.replace("{name}", name);
     let query = form_urlencode(&[("enable_server", name)]);
-    let url = format!("{router_url}{path}?{query}");
+    let url = format!("{jarvice_url}{path}?{query}");
 
     let resp = client.get(&url, &auth_headers(bearer))?;
     if !resp.ok() {
@@ -460,7 +473,7 @@ fn connect_oauth(
         );
     }
 
-    poll_connector_status(client, router_url, bearer, name, provider)
+    poll_connector_status(client, jarvice_url, bearer, name, provider)
 }
 
 #[derive(Deserialize)]
@@ -518,7 +531,7 @@ fn provider_connected(body: &str, provider: &str) -> bool {
 /// exactly what a stuck poll should do.
 fn poll_connector_status(
     client: &Client,
-    router_url: &str,
+    jarvice_url: &str,
     bearer: &str,
     name: &str,
     provider: &str,
@@ -535,7 +548,7 @@ fn poll_connector_status(
         std::thread::sleep(Duration::from_secs(CONNECT_POLL_INTERVAL_SECS));
 
         let resp = client.get(
-            &format!("{router_url}{}", endpoints::CONNECTOR_STATUS),
+            &format!("{jarvice_url}{}", endpoints::CONNECTOR_STATUS),
             &auth_headers(bearer),
         )?;
         if !resp.ok() {
@@ -722,7 +735,7 @@ pub fn mcp_exec_command(
     let session = get_access_token(client, creds);
     let bearer = format!("Bearer {}", session.token);
 
-    let servers = fetch_servers(client, &session.router_url, &bearer)?;
+    let servers = fetch_servers(client, &session.jarvice_url, &bearer)?;
     let entry = find_entry(&servers, name).ok_or_else(|| {
         AppError::new(format!(
             "Unknown MCP server '{name}'. Run `monocle mcp ls` to see available servers."

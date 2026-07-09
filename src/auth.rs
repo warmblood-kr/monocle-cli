@@ -14,15 +14,36 @@ const EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
 pub struct AuthSession {
     pub token: String,
     pub router_url: String,
+    pub jarvice_url: String,
 }
 
+/// `http` for local dev hosts (`localhost`/`127.0.0.1`), `https` otherwise —
+/// shared by [`router_url_for`]'s legacy fallback and [`jarvice_url_for`], both
+/// of which derive a base URL from the same `tenant_domain`.
+fn scheme_for_tenant_domain(tenant_domain: &str) -> &'static str {
+    let is_local = tenant_domain.starts_with("localhost") || tenant_domain.starts_with("127.0.0.1");
+    if is_local {
+        "http"
+    } else {
+        "https"
+    }
+}
+
+/// chat-proxy's base URL: `creds.router_url` when present, else (legacy
+/// credentials predating that field) `{scheme}://{tenant_domain}`.
 pub fn router_url_for(creds: &CredentialsData) -> String {
     if let Some(url) = &creds.router_url {
         return url.clone();
     }
-    let is_local = creds.tenant_domain.starts_with("localhost")
-        || creds.tenant_domain.starts_with("127.0.0.1");
-    let scheme = if is_local { "http" } else { "https" };
+    let scheme = scheme_for_tenant_domain(&creds.tenant_domain);
+    format!("{scheme}://{}", creds.tenant_domain)
+}
+
+/// jarvice's base URL, always derived from `tenant_domain` — jarvice is a
+/// different host from chat-proxy, so `creds.router_url` (chat-proxy-specific)
+/// must NOT be used here even when present.
+pub fn jarvice_url_for(creds: &CredentialsData) -> String {
+    let scheme = scheme_for_tenant_domain(&creds.tenant_domain);
     format!("{scheme}://{}", creds.tenant_domain)
 }
 
@@ -54,9 +75,11 @@ pub fn try_access_token(client: &Client, creds: &Credentials) -> Result<AuthSess
     }
 
     let router_url = router_url_for(&active);
+    let jarvice_url = jarvice_url_for(&active);
     Ok(AuthSession {
         token: active.access_token,
         router_url,
+        jarvice_url,
     })
 }
 
@@ -73,6 +96,65 @@ pub fn get_access_token(client: &Client, creds: &Credentials) -> AuthSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_creds(tenant_domain: &str, router_url: Option<&str>) -> CredentialsData {
+        CredentialsData {
+            tenant_domain: tenant_domain.to_string(),
+            tenant_name: "acme".to_string(),
+            email: "user@example.com".to_string(),
+            access_token: "at".to_string(),
+            refresh_token: "rt".to_string(),
+            id_token: "it".to_string(),
+            access_token_expires_at: "2099-01-01T00:00:00.000Z".to_string(),
+            refresh_token_expires_at: "2099-01-01T00:00:00.000Z".to_string(),
+            router_url: router_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn jarvice_url_for_uses_https_for_a_real_domain() {
+        let creds = fixture_creds("stg-agent.monocle-ai.com", None);
+        assert_eq!(jarvice_url_for(&creds), "https://stg-agent.monocle-ai.com");
+    }
+
+    #[test]
+    fn jarvice_url_for_uses_http_for_localhost() {
+        let creds = fixture_creds("localhost:8080", None);
+        assert_eq!(jarvice_url_for(&creds), "http://localhost:8080");
+    }
+
+    #[test]
+    fn jarvice_url_for_uses_http_for_127_0_0_1() {
+        let creds = fixture_creds("127.0.0.1:8080", None);
+        assert_eq!(jarvice_url_for(&creds), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn jarvice_url_for_ignores_router_url_even_when_present() {
+        // The bug this function fixes: chat-proxy's `router_url` is NOT
+        // jarvice's base URL, so it must never be consulted here — jarvice is
+        // always resolved straight from `tenant_domain`.
+        let creds = fixture_creds(
+            "stg-agent.monocle-ai.com",
+            Some("https://api-stg.monocle-ai.com"),
+        );
+        assert_eq!(jarvice_url_for(&creds), "https://stg-agent.monocle-ai.com");
+    }
+
+    #[test]
+    fn router_url_for_prefers_stored_router_url_when_present() {
+        let creds = fixture_creds(
+            "stg-agent.monocle-ai.com",
+            Some("https://api-stg.monocle-ai.com"),
+        );
+        assert_eq!(router_url_for(&creds), "https://api-stg.monocle-ai.com");
+    }
+
+    #[test]
+    fn router_url_for_falls_back_to_tenant_domain_for_legacy_credentials() {
+        let creds = fixture_creds("stg-agent.monocle-ai.com", None);
+        assert_eq!(router_url_for(&creds), "https://stg-agent.monocle-ai.com");
+    }
 
     #[test]
     fn try_access_token_errors_when_not_logged_in() {
