@@ -64,6 +64,9 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle upgrade [--check]` | Update monocle to the latest release (`--check` only reports current vs latest) |
 | `monocle agent [prompt] [--workdir <dir>] [--model <id>] [--max-steps <n>] [--session <name>] [--auto-approve]` | **Experimental.** Headless agent loop with tools (read/write/edit + shell) |
 | `monocle acp` | **Experimental.** Run as an [ACP](https://agentclientprotocol.com) agent over stdio (for editors / desktop / Craft) |
+| `monocle mcp ls [--json]` | List MCP servers available to your tenant (enabled/auth state/tools) |
+| `monocle mcp connect <name>` | Register an MCP server: OAuth browser flow, an API-key prompt, or a direct enable, depending on the server's auth |
+| `monocle mcp exec <name> <tool> [--arg key=value]...` | Call a tool on a registered, non-remote MCP server |
 
 ## 💬 Chat with models
 
@@ -312,6 +315,44 @@ When the client advertises the matching capabilities, the agent routes **file re
 through the client** (`fs/read_text_file`/`fs/write_text_file`, so unsaved editor buffers are
 honored) and **runs the shell via the client's terminal** (`terminal/*`); otherwise it falls
 back to local disk and a local subprocess.
+
+## 🧩 MCP servers
+
+> Requires `monocle login`. All three subcommands reuse your existing login token
+> against your tenant's Monocle instance — no separate MCP credentials to manage.
+
+**`monocle mcp ls`** lists the MCP (Model Context Protocol) servers available to your
+tenant, with enable/auth state and the tools each one exposes. Table goes to stdout,
+a summary count to stderr; pass `--json` for the raw API response.
+
+```console
+$ monocle mcp ls
+NAME    ENABLED  AUTH REQ  AUTH OK  REMOTE  TOOLS
+──────  -------  --------  -------  ------  -----
+github  yes      yes       yes      no      search_issues, list_prs
+
+1 MCP server(s).
+```
+
+**`monocle mcp connect <name>`** registers a server: it opens your browser for an
+OAuth authorization (and polls until the connection completes), prompts for a pasted
+API key when the server uses key-based auth, or just enables the server directly when
+it needs no auth at all — whichever the catalog entry calls for. Running it again on
+a server that's already connected prints `'<name>' is already connected.` and exits
+without re-triggering the flow.
+
+**`monocle mcp exec <name> <tool> [--arg key=value]...`** calls one tool on an already
+registered server and prints the JSON-RPC result verbatim to stdout (including a
+JSON-RPC `error`, which is a substantive answer, not a CLI failure — though the process
+still exits non-zero so scripts can detect it). Progress goes to stderr.
+
+```bash
+monocle mcp exec github search_issues --arg query="is:open label:bug" --arg limit=5
+```
+
+> v1 scopes `exec` to **non-remote** (tool-server-hosted) servers only — a catalog entry
+> with a `remote` field (e.g. a github/ms365-style server that talks straight to the
+> third party) isn't supported yet; see monocle-cli#69.
 
 ## 🔌 Using Monocle from your own app (OpenAI-compatible SDK)
 

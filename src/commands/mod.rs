@@ -6,6 +6,7 @@ pub mod audio_transcribe_azure;
 pub mod chat;
 pub mod claude;
 pub mod login;
+pub mod mcp;
 pub mod model_list;
 pub mod setup;
 pub mod status;

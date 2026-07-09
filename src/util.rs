@@ -95,6 +95,19 @@ pub fn parse_query(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Right-pad `s` with spaces to `width` (measured in `chars`, not bytes), for
+/// aligning plain-text table columns. Never truncates — a value wider than
+/// `width` is returned as-is. Shared by every command that prints a table
+/// (`mcp ls`, `models`).
+pub fn pad(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(width - len))
+    }
+}
+
 /// Equivalent of Node's `os.homedir()`. Tests never call this — they thread an
 /// explicit base dir through `Credentials::with_home` / the `home` parameters.
 pub fn home_dir() -> PathBuf {

@@ -8,6 +8,7 @@ use crate::endpoints;
 use crate::error::{AppError, Result};
 use crate::net::Client;
 use crate::origin::auth_headers;
+use crate::util::pad;
 
 #[derive(Deserialize)]
 struct ModelInfo {
@@ -22,15 +23,6 @@ struct ModelInfo {
 struct ModelsResponse {
     #[serde(default)]
     data: Vec<ModelInfo>,
-}
-
-fn pad(s: &str, width: usize) -> String {
-    let len = s.chars().count();
-    if len >= width {
-        s.to_string()
-    } else {
-        format!("{s}{}", " ".repeat(width - len))
-    }
 }
 
 /// Fetch the full model listing from the router (`GET /v1/models`) given an
