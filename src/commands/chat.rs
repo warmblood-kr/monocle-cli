@@ -1,5 +1,9 @@
 use std::io::{IsTerminal, Write};
 
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use rustyline::{Config, Context, Editor, Helper, Highlighter, Hinter, Validator};
 use serde_json::Value;
 
 use crate::agent::providers::{
@@ -13,6 +17,7 @@ use crate::endpoints;
 use crate::error::Result;
 use crate::net::Client;
 use crate::origin::auth_headers;
+use crate::util::home_dir;
 
 pub struct ChatOptions {
     pub model: Option<String>,
@@ -71,6 +76,45 @@ fn call_chat(
         eprintln!("\n⚠ the response was cut short (partial output shown).");
     }
     Ok(())
+}
+
+/// The slash commands the REPL understands — just quitting, for now (chat has
+/// no `/help`/`/model`/`/config`/`/status`, unlike `monocle agent`'s REPL).
+const CHAT_SLASH_COMMANDS: &[&str] = &["/exit", "/quit"];
+
+/// rustyline line helper for `monocle chat`'s REPL: Tab-completes the two
+/// slash commands. Hinting/highlighting/validation are the derived no-op
+/// defaults — multi-line handling comes from `bracketed_paste`, not a custom
+/// `Validator`. Deliberately simpler than `agent.rs`'s `ReplHelper` (no
+/// `/model`-argument fuzzy completion, no model-id list to carry).
+#[derive(Helper, Hinter, Highlighter, Validator)]
+struct ChatReplHelper;
+
+impl Completer for ChatReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // Only offer completion for a slash-command being typed at line start.
+        let head = &line[..pos];
+        if !head.starts_with('/') {
+            return Ok((0, Vec::new()));
+        }
+        let candidates = CHAT_SLASH_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.starts_with(head))
+            .map(|cmd| Pair {
+                display: cmd.to_string(),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        // Replace from column 0 (the whole slash token starts there).
+        Ok((0, candidates))
+    }
 }
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
@@ -211,64 +255,144 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         eprintln!("System prompt loaded ({} chars)", sp.chars().count());
     }
     eprintln!("Type your message. Press Ctrl+D to exit.");
+    eprintln!("↑/↓ history, Tab completes /quit, /exit — a multi-line paste is one input.");
     eprintln!("---");
 
-    let stdin = std::io::stdin();
+    // rustyline gives the input line proper editing (←/→, ↑/↓ history, Emacs
+    // Ctrl-A/E/K/Y) with its default Emacs keymap + file history, mirroring
+    // `monocle agent`'s REPL (`src/commands/agent.rs`). `bracketed_paste(true)`
+    // makes a multi-line paste arrive as a single input buffer (submitted only
+    // on Enter) instead of each embedded newline being read as a separate
+    // accept-line → separate turn.
+    let config = Config::builder().bracketed_paste(true).build();
+    let mut rl: Editor<ChatReplHelper, DefaultHistory> =
+        Editor::with_config(config).map_err(|e| crate::error::AppError::new(e.to_string()))?;
+    rl.set_helper(Some(ChatReplHelper));
+    // Separate history file from `monocle agent`'s — the two REPLs' histories
+    // stay independent.
+    let history_path = home_dir().join(".monocle").join("chat_history");
+    if let Some(parent) = history_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Best-effort history persistence: a missing/unreadable file just means an
+    // empty history this session.
+    let _ = rl.load_history(&history_path);
+
+    let prompt = "> ";
     loop {
-        eprint!("> ");
-        let _ = std::io::stderr().flush();
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(line.as_str());
+                if trimmed == "/quit" || trimmed == "/exit" {
+                    eprintln!("Bye.");
+                    break;
+                }
 
-        let mut line = String::new();
-        let n = stdin.read_line(&mut line)?;
-        if n == 0 {
-            // EOF (Ctrl+D)
-            eprintln!("\nBye.");
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed == "/quit" || trimmed == "/exit" {
-            eprintln!("\nBye.");
-            break;
-        }
-
-        eprintln!();
-        // Reset before this turn's work runs, so the hint below reflects only
-        // whether *this* turn logged a network error — not a stale flag left
-        // over from an earlier one (this REPL loops for the life of the process,
-        // same as `monocle agent`'s).
-        crate::diag::reset();
-        match call_chat(
-            &provider,
-            &model,
-            system_prompt.as_deref(),
-            trimmed,
-            max_tokens,
-            &[],
-        ) {
-            Ok(()) => {
-                let mut out = std::io::stdout();
-                out.write_all(b"\n\n")?;
-                out.flush()?;
+                eprintln!();
+                // Reset before this turn's work runs, so the hint below reflects
+                // only whether *this* turn logged a network error — not a stale
+                // flag left over from an earlier one (this REPL loops for the
+                // life of the process, same as `monocle agent`'s).
+                crate::diag::reset();
+                match call_chat(
+                    &provider,
+                    &model,
+                    system_prompt.as_deref(),
+                    trimmed,
+                    max_tokens,
+                    &[],
+                ) {
+                    Ok(()) => {
+                        let mut out = std::io::stdout();
+                        out.write_all(b"\n\n")?;
+                        out.flush()?;
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        if crate::diag::was_logged() {
+                            eprintln!("  (details logged to {})", crate::diag::display_path());
+                        }
+                        eprintln!();
+                    }
+                }
+            }
+            // Ctrl-C: don't quit — just start a fresh prompt (matches `monocle
+            // agent`'s idle-prompt behavior).
+            Err(ReadlineError::Interrupted) => continue,
+            // Ctrl-D (EOF): quit, matching the previous read_line behavior.
+            Err(ReadlineError::Eof) => {
+                eprintln!("Bye.");
+                break;
             }
             Err(e) => {
                 eprintln!("Error: {e}");
-                if crate::diag::was_logged() {
-                    eprintln!("  (details logged to {})", crate::diag::display_path());
-                }
-                eprintln!();
+                break;
             }
         }
     }
 
+    let _ = rl.save_history(&history_path);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_max_tokens;
+    use super::{resolve_max_tokens, ChatReplHelper};
+    use rustyline::completion::Completer;
+    use rustyline::history::DefaultHistory;
+    use rustyline::Context;
+
+    #[test]
+    fn complete_slash_command_narrows_to_matching_prefix() {
+        let helper = ChatReplHelper;
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/qu";
+        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect::<Vec<_>>(),
+            vec!["/quit".to_string()]
+        );
+    }
+
+    #[test]
+    fn complete_bare_slash_offers_both_commands() {
+        let helper = ChatReplHelper;
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/";
+        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect::<Vec<_>>(),
+            vec!["/exit".to_string(), "/quit".to_string()]
+        );
+    }
+
+    #[test]
+    fn complete_non_slash_text_offers_nothing() {
+        let helper = ChatReplHelper;
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "hello";
+        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert!(candidates.is_empty());
+    }
 
     #[test]
     fn absent_flag_omits() {

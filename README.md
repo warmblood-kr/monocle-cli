@@ -97,6 +97,12 @@ Hello! How can I help you today?
 Bye.
 ```
 
+The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
+and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
+Tab completes `/quit`/`/exit`, and a multi-line paste is inserted as a single input
+(submitted only on Enter, not one turn per line). Command history persists across
+sessions in `~/.monocle/chat_history` (kept separate from `monocle agent`'s history).
+
 One-shot via stdin:
 
 ```console
