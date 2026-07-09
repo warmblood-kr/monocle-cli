@@ -160,6 +160,10 @@ struct ChatArgs {
     /// Maximum output tokens (omitted by default → model/router uses its own)
     #[arg(long = "max-tokens")]
     max_tokens: Option<String>,
+    /// Attach a file/image (repeatable); local path or http(s) URL. One-shot
+    /// (piped stdin) only — see also inband `file:<path>` tokens in the text.
+    #[arg(long = "file")]
+    file: Vec<String>,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -169,6 +173,7 @@ impl From<ChatArgs> for ChatOptions {
             system_prompt: a.system_prompt,
             system_prompt_file: a.system_prompt_file,
             max_tokens: a.max_tokens,
+            files: a.file,
         }
     }
 }
@@ -424,5 +429,21 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
             ssml.as_deref(),
             AudioSpeechAzureOptions { format, output },
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_file_flag_repeats_into_vec() {
+        let cli = Cli::parse_from(["monocle", "chat", "--file", "a.png", "--file", "b.png"]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.file, vec!["a.png".to_string(), "b.png".to_string()]);
+            }
+            _ => panic!("expected Chat command"),
+        }
     }
 }

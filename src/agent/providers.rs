@@ -128,6 +128,20 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub max_tokens: Option<i64>,
     pub tools: Vec<ToolDef>,
+    /// Images to attach to the last user message as OpenAI vision parts (see
+    /// `MonocleProvider::build_body`). Carried on the request rather than
+    /// `Message` because `monocle chat` rebuilds `messages` fresh every turn —
+    /// attachments never need to survive into a later turn (monocle-cli
+    /// file-attach plan).
+    pub images: Vec<ImageAttachment>,
+}
+
+/// One resolved image, ready to drop into an OpenAI `image_url` content part —
+/// either a `data:<mime>;base64,...` URI (local file) or a passthrough remote
+/// `http(s)://` URL.
+#[derive(Debug, Clone)]
+pub struct ImageAttachment {
+    pub url: String,
 }
 
 /// The assistant's reply for one turn.
@@ -374,9 +388,30 @@ impl MonocleProvider {
     }
 
     fn build_body(&self, req: &ChatRequest, stream: bool) -> Value {
+        let mut messages = json!(req.messages);
+        // Vision requests (monocle-cli file-attach plan): rewrite the last
+        // `user` message's `content` from a plain string into the OpenAI
+        // multi-part shape (`[{type:text}, {type:image_url}, ...]`). With no
+        // images the messages serialize exactly as before — this branch is
+        // the only place behavior can diverge.
+        if !req.images.is_empty() {
+            if let Some(arr) = messages.as_array_mut() {
+                if let Some(last_user) = arr.iter_mut().rev().find(|m| m["role"] == "user") {
+                    let mut parts: Vec<Value> = Vec::new();
+                    let text = last_user["content"].as_str().unwrap_or("");
+                    if !text.is_empty() {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    for img in &req.images {
+                        parts.push(json!({"type": "image_url", "image_url": {"url": img.url}}));
+                    }
+                    last_user["content"] = json!(parts);
+                }
+            }
+        }
         let mut body = json!({
             "model": req.model,
-            "messages": req.messages,
+            "messages": messages,
             "stream": stream,
         });
         if let Some(max_tokens) = req.max_tokens {
@@ -559,5 +594,83 @@ mod tests {
             resp.is_err(),
             "a stream with no usable completion should error"
         );
+    }
+
+    fn dummy_provider() -> MonocleProvider {
+        MonocleProvider::new("token", "https://router.example")
+    }
+
+    #[test]
+    fn build_body_with_no_images_is_unchanged() {
+        // The critical regression oracle: an empty `images` vec must produce
+        // exactly the same body as before attachments existed — a plain
+        // string `content`, not an array.
+        let provider = dummy_provider();
+        let req = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message::system("be terse"), Message::user("hello")],
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let body = provider.build_body(&req, false);
+        assert_eq!(body["messages"][0]["content"], json!("be terse"));
+        assert_eq!(body["messages"][1]["content"], json!("hello"));
+        assert!(body["messages"][1]["content"].is_string());
+        assert_eq!(body["max_tokens"], json!(100));
+    }
+
+    #[test]
+    fn build_body_with_images_rewrites_last_user_message_as_parts() {
+        let provider = dummy_provider();
+        let req = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message::system("be terse"), Message::user("count them")],
+            images: vec![
+                ImageAttachment {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                },
+                ImageAttachment {
+                    url: "https://example.com/b.png".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let body = provider.build_body(&req, false);
+
+        // System message untouched.
+        assert_eq!(body["messages"][0]["content"], json!("be terse"));
+
+        // Last user message becomes a parts array: text part then image parts,
+        // in the order the images were given.
+        let parts = body["messages"][1]["content"]
+            .as_array()
+            .expect("user content should be rewritten into an array");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], json!({"type": "text", "text": "count them"}));
+        assert_eq!(
+            parts[1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+        );
+        assert_eq!(
+            parts[2],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/b.png"}})
+        );
+    }
+
+    #[test]
+    fn build_body_with_images_and_empty_text_omits_text_part() {
+        let provider = dummy_provider();
+        let req = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message::user("")],
+            images: vec![ImageAttachment {
+                url: "https://example.com/a.png".to_string(),
+            }],
+            ..Default::default()
+        };
+        let body = provider.build_body(&req, false);
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], json!("image_url"));
     }
 }

@@ -2,8 +2,11 @@ use std::io::{IsTerminal, Write};
 
 use serde_json::Value;
 
-use crate::agent::providers::{ChatRequest, LlmProvider, Message, MonocleProvider};
+use crate::agent::providers::{
+    ChatRequest, ImageAttachment, LlmProvider, Message, MonocleProvider,
+};
 use crate::agent::DEFAULT_MODEL;
+use crate::attachment;
 use crate::auth::get_access_token;
 use crate::credentials::Credentials;
 use crate::endpoints;
@@ -16,6 +19,8 @@ pub struct ChatOptions {
     pub system_prompt: Option<String>,
     pub system_prompt_file: Option<String>,
     pub max_tokens: Option<String>,
+    /// `--file <PATH|URL>` values (repeatable), one-shot only.
+    pub files: Vec<String>,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -37,6 +42,7 @@ fn call_chat(
     system_prompt: Option<&str>,
     user_message: &str,
     max_tokens: Option<i64>,
+    images: &[ImageAttachment],
 ) -> Result<()> {
     let mut messages = Vec::new();
     if let Some(sp) = system_prompt {
@@ -48,6 +54,7 @@ fn call_chat(
         model: model.to_string(),
         messages,
         max_tokens,
+        images: images.to_vec(),
         ..Default::default()
     };
     // Acquire the stdout lock once for the whole stream rather than per token —
@@ -82,6 +89,52 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
             eprintln!("⚠ ignoring --max-tokens '{raw}' (a positive integer is required)");
         }
     }
+
+    let stdin_is_tty = std::io::stdin().is_terminal();
+
+    // Attachments (`--file` / inband `file:<path>`) are one-shot only (piped
+    // stdin), never the interactive REPL.
+    if !options.files.is_empty() && stdin_is_tty {
+        eprintln!(
+            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle chat --file photo.png"
+        );
+        std::process::exit(1);
+    }
+
+    // Read stdin + resolve any attachments up front — cheap, local-only work
+    // that should fail fast (bad path, unsupported MIME) before we ever touch
+    // the network for auth/model validation below.
+    let one_shot_input: Option<(String, Vec<ImageAttachment>)> = if !stdin_is_tty {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        let (cleaned_text, inband_refs) = attachment::extract_inband_refs(input.trim());
+
+        let mut refs: Vec<String> = options.files.clone();
+        refs.extend(inband_refs);
+
+        let mut images: Vec<ImageAttachment> = Vec::new();
+        for r in &refs {
+            match attachment::resolve(r) {
+                Ok(img) => images.push(img),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        let cleaned_text = cleaned_text.trim().to_string();
+        // Image-only messages are valid — only bail when BOTH the text and the
+        // attachments are empty.
+        if cleaned_text.is_empty() && images.is_empty() {
+            eprintln!("No input provided via stdin.");
+            std::process::exit(1);
+        }
+
+        Some((cleaned_text, images))
+    } else {
+        None
+    };
 
     // Resolve system prompt.
     let system_prompt: Option<String> = if let Some(path) = &options.system_prompt_file {
@@ -129,22 +182,17 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
 
     let provider = MonocleProvider::new(token, router_url.clone());
 
-    // Non-interactive: stdin is piped.
-    if !std::io::stdin().is_terminal() {
-        let mut input = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-        if input.trim().is_empty() {
-            eprintln!("No input provided via stdin.");
-            std::process::exit(1);
-        }
+    // Non-interactive: stdin was piped (input + attachments already resolved above).
+    if let Some((text, images)) = one_shot_input {
         eprintln!("Using model: {model}");
         eprintln!("Router: {router_url}");
         call_chat(
             &provider,
             &model,
             system_prompt.as_deref(),
-            input.trim(),
+            &text,
             max_tokens,
+            &images,
         )?;
         let mut out = std::io::stdout();
         out.write_all(b"\n")?;
@@ -189,6 +237,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
             system_prompt.as_deref(),
             trimmed,
             max_tokens,
+            &[],
         ) {
             Ok(()) => {
                 let mut out = std::io::stdout();

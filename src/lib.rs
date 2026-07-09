@@ -3,6 +3,7 @@
 
 pub mod acp;
 pub mod agent;
+pub mod attachment;
 pub mod audio_io;
 pub mod auth;
 pub mod colors;
