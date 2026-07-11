@@ -1,6 +1,6 @@
 [package]
 name = "monocle-cli"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 description = "Control and use Monocle AI from your terminal: log in, chat with models, run the agent, or integrate Claude Code."
 license = "MIT"
@@ -32,6 +32,9 @@ ctrlc = "3"
 # Default features bring the Emacs keymap + FileHistory; used solely on the
 # interactive TTY path (see src/commands/agent.rs) — never in headless/ACP.
 rustyline = { version = "14", features = ["derive"] }
+# Fuzzy-matching for the REPL's `/model <TAB>` completion (skim's algorithm).
+# Small, dependency-light (adds only `thread_local`); default features only.
+fuzzy-matcher = "0.3.7"
 # ACP server-agent surface (Phase 3). async stays confined to src/acp.rs; the
 # core loop is sync. Pin 0.9 (trait-based `impl Agent`); 1.0 is a builder rewrite.
 agent-client-protocol = "0.9"
