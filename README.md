@@ -53,7 +53,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only) |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--thread <id>]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
@@ -102,6 +102,9 @@ and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y t
 Tab completes `/quit`/`/exit`, and a multi-line paste is inserted as a single input
 (submitted only on Enter, not one turn per line). Command history persists across
 sessions in `~/.monocle/chat_history` (kept separate from `monocle agent`'s history).
+The REPL remembers the conversation — each turn resends the full exchange so
+far, the same way `monocle agent` does — so follow-up questions ("what about
+in Python?") work without repeating context.
 
 One-shot via stdin:
 
@@ -174,6 +177,53 @@ for m in gpt-4o claude-sonnet-4-6 gemini-2-flash; do
   echo "count the people in this image" | monocle chat --file crowd.jpg --model "$m"
 done
 ```
+
+### 🧵 `--responses`: server-managed threads (experimental)
+
+`monocle chat --responses` talks to jarvice's custom **Responses API**
+(`/api/responses`) instead of the plain `/v1/chat/completions` path. It's not
+OpenAI's Responses API — it's monocle's own endpoint, named for the similar
+idea: the **server** persists the conversation thread, so the CLI sends only
+the new turn instead of resending the whole exchange.
+
+```bash
+monocle chat --responses --model claude-sonnet-4-6
+```
+
+```console
+Monocle Chat — Responses API (model: claude-sonnet-4-6)
+jarvice: https://acme.monocle-ai.com
+Type your message. Press Ctrl+D to exit.
+---
+> Hello
+Hello! How can I help you today?
+Thread: 3fa3b2c1-...
+
+> /quit
+Bye.
+```
+
+Continue a specific thread later (one-shot or REPL) with `--thread <id>`
+(the id a previous run printed to stderr as `Thread: ...`):
+
+```bash
+echo "and in Python?" | monocle chat --responses --thread 3fa3b2c1-...
+```
+
+Notes:
+
+- **jarvice-only** — this does not go through chat-proxy's router, so it
+  needs jarvice's own tenant URL (derived the same way as the rest of this
+  CLI, from your logged-in tenant domain). It's unrelated to `--model`
+  routing and can't be redirected.
+- **No streaming yet** — the reply is fetched non-streaming and printed once
+  it's fully generated, unlike the plain chat path's live token stream.
+- **`--system-prompt`/`--system-prompt-file`/`--max-tokens` are ignored** — the
+  endpoint has no equivalent fields (a warning is printed if you pass them).
+- **Known auth gap**: this endpoint currently rejects the CLI's access token
+  with a 401 (`JWT missing required claim: email`) against real staging/prod
+  tenants — the same open issue that blocks `monocle mcp` today. It's fine to
+  use against a local/mock dev stack in the meantime.
 
 ## 🔊 Audio (STT / TTS)
 
