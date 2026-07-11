@@ -38,10 +38,17 @@ Write-Host "Installed: $InstallDir\$Binary.exe"
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($userPath -notlike "*$InstallDir*") {
+    $newUserPath = if ($userPath) { "$InstallDir;$userPath" } else { $InstallDir }
+    [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
     Write-Host ""
-    Write-Host "WARNING: $InstallDir is not in your PATH."
-    Write-Host "Add it with:"
-    Write-Host "  [Environment]::SetEnvironmentVariable('Path', `"$InstallDir;`" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')"
+    Write-Host "Added $InstallDir to your PATH."
+}
+
+# SetEnvironmentVariable only persists to the registry for *future* processes —
+# this already-running shell keeps its own PATH snapshot, so `monocle` below
+# would still fail to resolve without also updating this process's $env:Path.
+if ($env:Path -notlike "*$InstallDir*") {
+    $env:Path = "$InstallDir;$env:Path"
 }
 
 Write-Host ""
