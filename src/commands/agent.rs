@@ -458,7 +458,15 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     // is not triggered at the idle prompt (we just start a fresh line). During a
     // turn the terminal is back in cooked mode, so Ctrl-C raises SIGINT and that
     // handler cancels the running turn, exactly as before.
-    let prompt = format!("{} ", c::cyan("»"));
+    // Plain, uncolored — a prompt string handed to `rl.readline()` must not
+    // carry raw ANSI escapes. rustyline computes the prompt's on-screen width
+    // by skipping recognized escape sequences (0-width), but on Windows the
+    // console only interprets those bytes as color if
+    // ENABLE_VIRTUAL_TERMINAL_PROCESSING is active; when that fails to enable,
+    // the escapes print as literal characters, so rustyline's cursor-column
+    // math (0-width) diverges from the terminal's real cursor position —
+    // seen as the cursor sitting ~10 columns in in PowerShell before any input.
+    let prompt = "» ".to_string();
     loop {
         match rl.readline(&prompt) {
             Ok(line) => {
