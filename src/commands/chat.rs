@@ -1,9 +1,7 @@
 use std::io::{IsTerminal, Write};
 
 use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
-use rustyline::history::DefaultHistory;
-use rustyline::{Config, Context, Editor, Helper, Highlighter, Hinter, Validator};
+use rustyline::{Context, Helper, Highlighter, Hinter, Validator};
 use serde_json::Value;
 
 use crate::agent::providers::{
@@ -12,6 +10,7 @@ use crate::agent::providers::{
 use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
 use crate::auth::get_access_token;
+use crate::commands::repl::{run_repl, LoopControl};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
@@ -279,101 +278,58 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     eprintln!("↑/↓ history, Tab completes /quit, /exit — a multi-line paste is one input.");
     eprintln!("---");
 
-    // rustyline gives the input line proper editing (←/→, ↑/↓ history, Emacs
-    // Ctrl-A/E/K/Y) with its default Emacs keymap + file history, mirroring
-    // `monocle agent`'s REPL (`src/commands/agent.rs`). `bracketed_paste(true)`
-    // makes a multi-line paste arrive as a single input buffer (submitted only
-    // on Enter) instead of each embedded newline being read as a separate
-    // accept-line → separate turn.
-    let config = Config::builder().bracketed_paste(true).build();
-    let mut rl: Editor<ChatReplHelper, DefaultHistory> =
-        Editor::with_config(config).map_err(|e| crate::error::AppError::new(e.to_string()))?;
-    rl.set_helper(Some(ChatReplHelper));
     // Separate history file from `monocle agent`'s — the two REPLs' histories
-    // stay independent.
+    // stay independent. The Editor build, bracketed-paste config, history
+    // load/save, and the Ctrl-C/Ctrl-D/error loop itself are shared with
+    // `monocle agent`'s REPL via `commands::repl::run_repl`.
     let history_path = home_dir().join(".monocle").join("chat_history");
-    if let Some(parent) = history_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Best-effort history persistence: a missing/unreadable file just means an
-    // empty history this session.
-    let _ = rl.load_history(&history_path);
 
-    let prompt = "> ";
-    loop {
-        match rl.readline(prompt) {
-            Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // History gets the raw typed line (before `file:` tokens are
-                // stripped) — recalling it via ↑ should show what was actually
-                // typed, matching the non-attachment behavior this REPL already
-                // had.
-                let _ = rl.add_history_entry(line.as_str());
-                if trimmed == "/quit" || trimmed == "/exit" {
-                    eprintln!("Bye.");
-                    break;
-                }
+    run_repl(ChatReplHelper, history_path, "> ", |trimmed| {
+        if trimmed == "/quit" || trimmed == "/exit" {
+            eprintln!("Bye.");
+            return Ok(LoopControl::Quit);
+        }
 
-                let (text, images) = match resolve_repl_attachments(trimmed) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // Same per-turn recovery as a `call_chat` error below:
-                        // print and go back to the prompt, no `call_chat` call
-                        // for this turn.
-                        eprintln!("Error: {e}");
-                        eprintln!();
-                        continue;
-                    }
-                };
-
+        let (text, images) = match resolve_repl_attachments(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                // Same per-turn recovery as a `call_chat` error below: print
+                // and go back to the prompt, no `call_chat` call this turn.
+                eprintln!("Error: {e}");
                 eprintln!();
-                // Reset before this turn's work runs, so the hint below reflects
-                // only whether *this* turn logged a network error — not a stale
-                // flag left over from an earlier one (this REPL loops for the
-                // life of the process, same as `monocle agent`'s).
-                crate::diag::reset();
-                match call_chat(
-                    &provider,
-                    &model,
-                    system_prompt.as_deref(),
-                    &text,
-                    max_tokens,
-                    &images,
-                ) {
-                    Ok(()) => {
-                        let mut out = std::io::stdout();
-                        out.write_all(b"\n\n")?;
-                        out.flush()?;
-                    }
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        if crate::diag::was_logged() {
-                            eprintln!("  (details logged to {})", crate::diag::display_path());
-                        }
-                        eprintln!();
-                    }
-                }
+                return Ok(LoopControl::Continue);
             }
-            // Ctrl-C: don't quit — just start a fresh prompt (matches `monocle
-            // agent`'s idle-prompt behavior).
-            Err(ReadlineError::Interrupted) => continue,
-            // Ctrl-D (EOF): quit, matching the previous read_line behavior.
-            Err(ReadlineError::Eof) => {
-                eprintln!("Bye.");
-                break;
+        };
+
+        eprintln!();
+        // Reset before this turn's work runs, so the hint below reflects only
+        // whether *this* turn logged a network error — not a stale flag left
+        // over from an earlier one (this REPL loops for the life of the
+        // process, same as `monocle agent`'s).
+        crate::diag::reset();
+        match call_chat(
+            &provider,
+            &model,
+            system_prompt.as_deref(),
+            &text,
+            max_tokens,
+            &images,
+        ) {
+            Ok(()) => {
+                let mut out = std::io::stdout();
+                out.write_all(b"\n\n")?;
+                out.flush()?;
             }
             Err(e) => {
                 eprintln!("Error: {e}");
-                break;
+                if crate::diag::was_logged() {
+                    eprintln!("  (details logged to {})", crate::diag::display_path());
+                }
+                eprintln!();
             }
         }
-    }
-
-    let _ = rl.save_history(&history_path);
-    Ok(())
+        Ok(LoopControl::Continue)
+    })
 }
 
 #[cfg(test)]

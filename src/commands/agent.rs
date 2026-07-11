@@ -11,9 +11,7 @@ use std::rc::Rc;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
-use rustyline::history::DefaultHistory;
-use rustyline::{Config, Context, Editor, Helper, Highlighter, Hinter, Validator};
+use rustyline::{Context, Helper, Highlighter, Hinter, Validator};
 use serde_json::Value;
 
 use crate::agent::commands::{config_text, help_text, login_view, status_text};
@@ -25,6 +23,7 @@ use crate::agent::SYSTEM_PROMPT;
 use crate::auth::get_access_token;
 use crate::colors as c;
 use crate::commands::model_list::fetch_model_ids;
+use crate::commands::repl::{run_repl, LoopControl};
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
@@ -429,35 +428,18 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     // ONLY here, on the interactive TTY path — the headless / piped / ACP paths
     // above never touch it, keeping the engine UI-free (CLAUDE.md 설계 원칙:
     // rich UI is the host's job via `monocle acp`). This is input-line editing
-    // only; it does not take over scrollback/paging.
+    // only; it does not take over scrollback/paging. The Editor build,
+    // bracketed-paste config, history load/save, and the Ctrl-C/Ctrl-D/error
+    // loop itself are shared with `monocle chat`'s REPL via
+    // `commands::repl::run_repl`; only the helper (Tab-completion) and the
+    // per-line dispatch below are specific to this REPL.
     //
-    // `bracketed_paste(true)` makes a multi-line paste arrive as a SINGLE input
-    // buffer (submitted only on Enter) instead of each embedded newline being read
-    // as a separate accept-line → separate turn. This is already rustyline 14's
-    // default (`Config::default().enable_bracketed_paste == true`), so on a
-    // terminal that supports bracketed paste it worked before too; we set it
-    // explicitly (via `Editor::with_config`, replacing `DefaultEditor`) to make
-    // the guarantee visible and stop line-splitting regressing if the default
-    // changes. The `ReplHelper` adds Tab-completion of slash commands.
-    let config = Config::builder().bracketed_paste(true).build();
-    let mut rl: Editor<ReplHelper, DefaultHistory> =
-        Editor::with_config(config).map_err(|e| crate::error::AppError::new(e.to_string()))?;
-    rl.set_helper(Some(ReplHelper {
-        models: Rc::new(model_ids),
-    }));
-    let history_path = home_dir().join(".monocle").join("agent_history");
-    if let Some(parent) = history_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Best-effort history persistence: a missing/unreadable file just means an
-    // empty history this session.
-    let _ = rl.load_history(&history_path);
-
     // rustyline reads the prompt in raw mode, where Ctrl-C surfaces as
     // `Interrupted` WITHOUT raising SIGINT — so the `ctrlc` turn-cancel handler
     // is not triggered at the idle prompt (we just start a fresh line). During a
     // turn the terminal is back in cooked mode, so Ctrl-C raises SIGINT and that
     // handler cancels the running turn, exactly as before.
+    //
     // Plain, uncolored — a prompt string handed to `rl.readline()` must not
     // carry raw ANSI escapes. rustyline computes the prompt's on-screen width
     // by skipping recognized escape sequences (0-width), but on Windows the
@@ -466,97 +448,87 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     // the escapes print as literal characters, so rustyline's cursor-column
     // math (0-width) diverges from the terminal's real cursor position —
     // seen as the cursor sitting ~10 columns in in PowerShell before any input.
-    let prompt = "» ".to_string();
-    loop {
-        match rl.readline(&prompt) {
-            Ok(line) => {
-                let msg = line.trim();
-                if msg.is_empty() {
-                    continue;
+    let helper = ReplHelper {
+        models: Rc::new(model_ids),
+    };
+    let history_path = home_dir().join(".monocle").join("agent_history");
+
+    run_repl(helper, history_path, "» ", |msg| {
+        // `/model` switches the model for subsequent turns (handled before
+        // the general dispatch since it carries an argument).
+        if let Some(model_cmd) = parse_model_command(msg) {
+            match model_cmd {
+                Some(id) => {
+                    eprintln!("{}", c::dim(&format!("model → {id}")));
+                    repl.model = id;
                 }
-                let _ = rl.add_history_entry(line.as_str());
-                // `/model` switches the model for subsequent turns (handled before
-                // the general dispatch since it carries an argument).
-                if let Some(model_cmd) = parse_model_command(msg) {
-                    match model_cmd {
-                        Some(id) => {
-                            eprintln!("{}", c::dim(&format!("model → {id}")));
-                            repl.model = id;
-                        }
-                        None => eprintln!("{}", c::dim(&format!("model: {}", repl.model))),
-                    }
-                    continue;
-                }
-                // Slash commands are handled locally (never sent to the agent/LLM),
-                // and printed to stderr so stdout stays the clean answer channel.
-                match dispatch_command(msg) {
-                    Command::Quit => {
-                        eprintln!("Bye.");
-                        break;
-                    }
-                    Command::Help => eprintln!("{}", help_text()),
-                    Command::Config => eprintln!(
-                        "{}",
-                        config_text(
-                            &repl.model,
-                            repl.max_steps,
-                            &repl.workdir,
-                            repl.session_name()
-                        )
-                    ),
-                    Command::Status => {
-                        let login = login_view(repl.creds);
+                None => eprintln!("{}", c::dim(&format!("model: {}", repl.model))),
+            }
+            return Ok(LoopControl::Continue);
+        }
+        // Slash commands are handled locally (never sent to the agent/LLM),
+        // and printed to stderr so stdout stays the clean answer channel.
+        match dispatch_command(msg) {
+            Command::Quit => {
+                eprintln!("Bye.");
+                Ok(LoopControl::Quit)
+            }
+            Command::Help => {
+                eprintln!("{}", help_text());
+                Ok(LoopControl::Continue)
+            }
+            Command::Config => {
+                eprintln!(
+                    "{}",
+                    config_text(
+                        &repl.model,
+                        repl.max_steps,
+                        &repl.workdir,
+                        repl.session_name()
+                    )
+                );
+                Ok(LoopControl::Continue)
+            }
+            Command::Status => {
+                let login = login_view(repl.creds);
+                eprintln!(
+                    "{}",
+                    status_text(
+                        login.as_ref(),
+                        &repl.model,
+                        repl.max_steps,
+                        &repl.workdir,
+                        repl.session_name(),
+                    )
+                );
+                Ok(LoopControl::Continue)
+            }
+            Command::Unknown(cmd) => {
+                eprintln!("unknown command: {cmd} (try /help)");
+                Ok(LoopControl::Continue)
+            }
+            Command::Turn => {
+                // Reset before this turn's work runs, so the hint below
+                // reflects only whether *this* turn logged a network error —
+                // not a stale flag left over from an earlier one.
+                crate::diag::reset();
+                // A transient per-turn error must not tear down the session.
+                if let Err(e) = repl.run_turn(msg.to_string()) {
+                    eprintln!("{} {e}", c::red("Error:"));
+                    if crate::diag::was_logged() {
                         eprintln!(
-                            "{}",
-                            status_text(
-                                login.as_ref(),
-                                &repl.model,
-                                repl.max_steps,
-                                &repl.workdir,
-                                repl.session_name(),
-                            )
+                            "  {}",
+                            c::dim(&format!(
+                                "(details logged to {})",
+                                crate::diag::display_path()
+                            ))
                         );
                     }
-                    Command::Unknown(cmd) => {
-                        eprintln!("unknown command: {cmd} (try /help)");
-                    }
-                    Command::Turn => {
-                        // Reset before this turn's work runs, so the hint below
-                        // reflects only whether *this* turn logged a network
-                        // error — not a stale flag left over from an earlier one.
-                        crate::diag::reset();
-                        // A transient per-turn error must not tear down the session.
-                        if let Err(e) = repl.run_turn(msg.to_string()) {
-                            eprintln!("{} {e}", c::red("Error:"));
-                            if crate::diag::was_logged() {
-                                eprintln!(
-                                    "  {}",
-                                    c::dim(&format!(
-                                        "(details logged to {})",
-                                        crate::diag::display_path()
-                                    ))
-                                );
-                            }
-                        }
-                    }
                 }
-            }
-            // Ctrl-C at the idle prompt: don't quit — just start a fresh prompt.
-            Err(ReadlineError::Interrupted) => continue,
-            // Ctrl-D (EOF): quit, matching the previous read_line behavior.
-            Err(ReadlineError::Eof) => {
-                eprintln!("Bye.");
-                break;
-            }
-            Err(e) => {
-                eprintln!("{} {e}", c::red("Error:"));
-                break;
+                Ok(LoopControl::Continue)
             }
         }
-    }
-
-    let _ = rl.save_history(&history_path);
-    Ok(())
+    })
 }
 
 /// Collapse whitespace and truncate, for compact one-line progress output.
@@ -573,6 +545,7 @@ fn one_line(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::history::DefaultHistory;
 
     #[test]
     fn dispatch_recognizes_management_commands() {
