@@ -7,6 +7,7 @@ pub mod chat;
 pub mod claude;
 pub mod login;
 pub mod model_list;
+pub mod repl;
 pub mod setup;
 pub mod status;
 pub mod token;
