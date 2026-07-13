@@ -1,7 +1,11 @@
+use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
+use std::rc::Rc;
 
 use rustyline::completion::{Completer, Pair};
-use rustyline::{Context, Helper, Highlighter, Hinter, Validator};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::{Context, Helper, Validator};
 use serde_json::Value;
 
 use crate::agent::providers::{
@@ -10,7 +14,9 @@ use crate::agent::providers::{
 use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
 use crate::auth::{get_access_token, jarvice_url_for};
-use crate::commands::repl::{run_repl, LoopControl};
+use crate::colors as c;
+use crate::commands::model_list::{fetch_model_ids, fuzzy_model_candidates, parse_model_command};
+use crate::commands::repl::{dim_hint, hint_from_candidates, run_repl, LoopControl};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
@@ -141,31 +147,42 @@ fn resolve_repl_attachments(
     Ok((cleaned_text.trim().to_string(), images))
 }
 
-/// The slash commands the REPL understands — just quitting, for now (chat has
-/// no `/help`/`/model`/`/config`/`/status`, unlike `monocle agent`'s REPL).
-const CHAT_SLASH_COMMANDS: &[&str] = &["/exit", "/quit"];
+/// The slash commands the REPL understands. `/model` mirrors `monocle
+/// agent`'s REPL (switches the model for subsequent turns); chat still has no
+/// `/help`/`/config`/`/status`.
+const CHAT_SLASH_COMMANDS: &[&str] = &["/model", "/exit", "/quit"];
 
-/// rustyline line helper for `monocle chat`'s REPL: Tab-completes the two
-/// slash commands. Hinting/highlighting/validation are the derived no-op
-/// defaults — multi-line handling comes from `bracketed_paste`, not a custom
-/// `Validator`. Deliberately simpler than `agent.rs`'s `ReplHelper` (no
-/// `/model`-argument fuzzy completion, no model-id list to carry).
-#[derive(Helper, Hinter, Highlighter, Validator)]
-struct ChatReplHelper;
+/// rustyline line helper for `monocle chat`'s REPL: Tab-completes slash
+/// commands as a real dropdown (see `commands::repl::run_repl`'s
+/// `CompletionType::List`), and (for `/model`) fuzzy-completes the argument
+/// against a model id list fetched once at startup — same behavior as
+/// `agent.rs`'s `ReplHelper`, which this mirrors. Also hints the best-ranked
+/// candidate as dim inline ghost text via `Hinter`/`Highlighter`; validation
+/// stays the derived no-op default.
+#[derive(Helper, Validator)]
+struct ChatReplHelper {
+    /// Model ids fetched once before the loop starts. Empty when not logged
+    /// in / the fetch failed — `/model` completion then just offers no
+    /// candidates. `Rc` because `Editor::set_helper` takes ownership and the
+    /// list is read-only for the session's lifetime.
+    models: Rc<Vec<String>>,
+}
 
-impl Completer for ChatReplHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+impl ChatReplHelper {
+    /// Shared by `Completer::complete` and `Hinter::hint` so the two can
+    /// never disagree on what's being completed.
+    fn candidates(&self, line: &str, pos: usize) -> (usize, Vec<Pair>) {
         // Only offer completion for a slash-command being typed at line start.
         let head = &line[..pos];
         if !head.starts_with('/') {
-            return Ok((0, Vec::new()));
+            return (0, Vec::new());
+        }
+        // `/model <partial>` — fuzzy-match the argument against the cached
+        // model ids, anchored just after "/model " (not column 0) so accepting
+        // a candidate replaces only the partial id.
+        if let Some(query) = head.strip_prefix("/model ") {
+            let start = head.len() - query.len();
+            return (start, fuzzy_model_candidates(&self.models, query));
         }
         let candidates = CHAT_SLASH_COMMANDS
             .iter()
@@ -176,7 +193,35 @@ impl Completer for ChatReplHelper {
             })
             .collect();
         // Replace from column 0 (the whole slash token starts there).
-        Ok((0, candidates))
+        (0, candidates)
+    }
+}
+
+impl Completer for ChatReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        Ok(self.candidates(line, pos))
+    }
+}
+
+impl Hinter for ChatReplHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        let (start, candidates) = self.candidates(line, pos);
+        hint_from_candidates(line, start, pos, &candidates)
+    }
+}
+
+impl Highlighter for ChatReplHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        dim_hint(hint)
     }
 }
 
@@ -192,7 +237,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
 /// this REPL accumulating the growing conversation itself (see `convo` below)
 /// and resending it in full each turn.
 fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
-    let model = options
+    let mut model = options
         .model
         .as_deref()
         .unwrap_or(DEFAULT_MODEL)
@@ -244,7 +289,12 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         options.system_prompt.clone()
     };
 
-    // Validate the model ID against the available models (non-fatal on failure).
+    // Validate the model ID against the available models (non-fatal on
+    // failure), and keep the full id list around — reused below as the
+    // interactive REPL's `/model` completion candidates instead of a second
+    // fetch (`agent.rs`'s REPL fetches separately since it has no equivalent
+    // startup validation call to piggyback on).
+    let mut model_ids: Vec<String> = Vec::new();
     if let Ok(resp) = client.get(
         &format!("{router_url}{}", endpoints::MODELS),
         &auth_headers(&bearer),
@@ -268,6 +318,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
                     }
                     std::process::exit(1);
                 }
+                model_ids = ids;
             }
         }
     }
@@ -297,7 +348,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         eprintln!("System prompt loaded ({} chars)", sp.chars().count());
     }
     eprintln!("Type your message. Press Ctrl+D to exit.");
-    eprintln!("↑/↓ history, Tab completes /quit, /exit — a multi-line paste is one input.");
+    eprintln!("↑/↓ history, Tab completes /model, /quit, /exit — a multi-line paste is one input.");
     eprintln!("---");
 
     // Separate history file from `monocle agent`'s — the two REPLs' histories
@@ -305,6 +356,9 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     // load/save, and the Ctrl-C/Ctrl-D/error loop itself are shared with
     // `monocle agent`'s REPL via `commands::repl::run_repl`.
     let history_path = home_dir().join(".monocle").join("chat_history");
+    let helper = ChatReplHelper {
+        models: Rc::new(model_ids),
+    };
 
     // Conversation memory: mirrors `monocle agent`'s `Repl.convo` — grows for
     // the life of the process instead of `call_chat` rebuilding a one-message
@@ -315,10 +369,23 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         convo.push(Message::system(sp));
     }
 
-    run_repl(ChatReplHelper, history_path, "> ", |trimmed| {
+    run_repl(helper, history_path, "> ", |trimmed| {
         if trimmed == "/quit" || trimmed == "/exit" {
             eprintln!("Bye.");
             return Ok(LoopControl::Quit);
+        }
+        // `/model` switches the model for subsequent turns — handled before
+        // the general dispatch since it carries an argument, same as
+        // `monocle agent`'s REPL.
+        if let Some(model_cmd) = parse_model_command(trimmed) {
+            match model_cmd {
+                Some(id) => {
+                    eprintln!("{}", c::dim(&format!("model → {id}")));
+                    model = id;
+                }
+                None => eprintln!("{}", c::dim(&format!("model: {model}"))),
+            }
+            return Ok(LoopControl::Continue);
         }
 
         let (text, images) = match resolve_repl_attachments(trimmed) {
@@ -371,7 +438,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
 /// `--system-prompt`/`--max-tokens` support (the endpoint has no such
 /// fields) — both are warned-and-ignored rather than silently dropped.
 fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
-    let model = options
+    let mut model = options
         .model
         .as_deref()
         .unwrap_or(DEFAULT_MODEL)
@@ -421,7 +488,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     eprintln!("Monocle Chat — Responses API (model: {model})");
     eprintln!("jarvice: {jarvice_url}");
     eprintln!("Type your message. Press Ctrl+D to exit.");
-    eprintln!("↑/↓ history, Tab completes /quit, /exit — a multi-line paste is one input.");
+    eprintln!("↑/↓ history, Tab completes /model, /quit, /exit — a multi-line paste is one input.");
     eprintln!("The server owns this conversation's thread — no local history is resent.");
     eprintln!("---");
 
@@ -429,11 +496,31 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     // Not a `Vec<Message>` like `run_completions_chat`'s `convo` — the server
     // persists the conversation; this is just the id to hand back next turn.
     let mut thread_id: Option<String> = options.thread.clone();
+    // Best-effort, same defensive posture as `agent.rs`'s REPL: this path has
+    // no startup model-list fetch to piggyback on (unlike the completions
+    // path's validation call), so fetch once here for `/model` completion.
+    let model_ids = fetch_model_ids(client, creds).unwrap_or_default();
+    let helper = ChatReplHelper {
+        models: Rc::new(model_ids),
+    };
 
-    run_repl(ChatReplHelper, history_path, "> ", |trimmed| {
+    run_repl(helper, history_path, "> ", |trimmed| {
         if trimmed == "/quit" || trimmed == "/exit" {
             eprintln!("Bye.");
             return Ok(LoopControl::Quit);
+        }
+        // `/model` switches the model for subsequent turns — handled before
+        // the general dispatch since it carries an argument, same as
+        // `monocle agent`'s REPL.
+        if let Some(model_cmd) = parse_model_command(trimmed) {
+            match model_cmd {
+                Some(id) => {
+                    eprintln!("{}", c::dim(&format!("model → {id}")));
+                    model = id;
+                }
+                None => eprintln!("{}", c::dim(&format!("model: {model}"))),
+            }
+            return Ok(LoopControl::Continue);
         }
 
         let (text, images) = match resolve_repl_attachments(trimmed) {
@@ -479,10 +566,13 @@ mod tests {
     use rustyline::completion::Completer;
     use rustyline::history::DefaultHistory;
     use rustyline::Context;
+    use std::rc::Rc;
 
     #[test]
     fn complete_slash_command_narrows_to_matching_prefix() {
-        let helper = ChatReplHelper;
+        let helper = ChatReplHelper {
+            models: Rc::new(vec![]),
+        };
         let history = DefaultHistory::new();
         let ctx = Context::new(&history);
 
@@ -500,7 +590,9 @@ mod tests {
 
     #[test]
     fn complete_bare_slash_offers_both_commands() {
-        let helper = ChatReplHelper;
+        let helper = ChatReplHelper {
+            models: Rc::new(vec![]),
+        };
         let history = DefaultHistory::new();
         let ctx = Context::new(&history);
 
@@ -512,13 +604,19 @@ mod tests {
                 .into_iter()
                 .map(|p| p.replacement)
                 .collect::<Vec<_>>(),
-            vec!["/exit".to_string(), "/quit".to_string()]
+            vec![
+                "/model".to_string(),
+                "/exit".to_string(),
+                "/quit".to_string()
+            ]
         );
     }
 
     #[test]
     fn complete_non_slash_text_offers_nothing() {
-        let helper = ChatReplHelper;
+        let helper = ChatReplHelper {
+            models: Rc::new(vec![]),
+        };
         let history = DefaultHistory::new();
         let ctx = Context::new(&history);
 

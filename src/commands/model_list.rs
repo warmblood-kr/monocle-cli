@@ -1,5 +1,8 @@
 use std::io::Write;
 
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+use rustyline::completion::Pair;
 use serde::Deserialize;
 
 use crate::auth::{get_access_token, try_access_token, AuthSession};
@@ -58,17 +61,60 @@ fn fetch_models_with_session(client: &Client, session: &AuthSession) -> Result<V
     Ok(resp.json::<ModelsResponse>()?.data)
 }
 
-/// Fetch just the model ids — what the `agent` REPL's `/model` completer needs.
-/// Uses the non-exiting [`try_access_token`] (not [`get_access_token`]) so a
-/// missing login or a network hiccup returns an `Err` instead of killing the
-/// process; `agent.rs` treats that as "no candidates" and starts the REPL
-/// anyway rather than propagating.
+/// Fetch just the model ids — what both `chat` and `agent`'s `/model`
+/// completers need. Uses the non-exiting [`try_access_token`] (not
+/// [`get_access_token`]) so a missing login or a network hiccup returns an
+/// `Err` instead of killing the process; callers treat that as "no
+/// candidates" and start the REPL anyway rather than propagating.
 pub fn fetch_model_ids(client: &Client, creds: &Credentials) -> Result<Vec<String>> {
     let session = try_access_token(client, creds)?;
     Ok(fetch_models_with_session(client, &session)?
         .into_iter()
         .map(|m| m.id)
         .collect())
+}
+
+/// Pure parser for the `/model` command, shared by `chat`'s and `agent`'s
+/// REPL dispatch. Returns:
+/// - `None` — not a `/model` invocation (let normal dispatch handle it);
+/// - `Some(None)` — bare `/model` (show the current model);
+/// - `Some(Some(id))` — `/model <id>` (switch to `id`).
+pub fn parse_model_command(input: &str) -> Option<Option<String>> {
+    let trimmed = input.trim();
+    if trimmed == "/model" {
+        return Some(None);
+    }
+    let rest = trimmed.strip_prefix("/model ")?.trim();
+    if rest.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(rest.to_string()))
+    }
+}
+
+/// Fuzzy-match `query` against cached model ids for `/model` tab-completion,
+/// shared by `chat`'s and `agent`'s REPL helpers. An empty query returns the
+/// full list unranked (the "show me what's available" dropdown); otherwise
+/// ids are scored with `fuzzy-matcher`'s skim algorithm (subsequence match,
+/// case-smart), kept only if they match at all, and sorted best match first.
+pub fn fuzzy_model_candidates(models: &[String], query: &str) -> Vec<Pair> {
+    let to_pair = |id: &String| Pair {
+        display: id.clone(),
+        replacement: id.clone(),
+    };
+    if query.is_empty() {
+        return models.iter().map(to_pair).collect();
+    }
+    // `ignore_case` (not the default smart-case) so typing in any case still
+    // narrows the (lowercase-by-convention) model ids — smart-case would make
+    // an all-caps query like "CLAUDE" match nothing.
+    let matcher = SkimMatcherV2::default().ignore_case();
+    let mut scored: Vec<(i64, &String)> = models
+        .iter()
+        .filter_map(|id| matcher.fuzzy_match(id, query).map(|score| (score, id)))
+        .collect();
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.into_iter().map(|(_, id)| to_pair(id)).collect()
 }
 
 pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
@@ -136,4 +182,80 @@ pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
 
     eprintln!("\n{} model(s) available.", models.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_model_command_variants() {
+        // Not a /model command.
+        assert_eq!(parse_model_command("hello"), None);
+        assert_eq!(parse_model_command("/models"), None);
+        assert_eq!(parse_model_command("/help"), None);
+        // Bare /model (with or without surrounding / trailing space) shows current.
+        assert_eq!(parse_model_command("/model"), Some(None));
+        assert_eq!(parse_model_command("  /model  "), Some(None));
+        assert_eq!(parse_model_command("/model   "), Some(None));
+        // /model <id> switches.
+        assert_eq!(
+            parse_model_command("/model gpt-4o"),
+            Some(Some("gpt-4o".to_string()))
+        );
+        assert_eq!(
+            parse_model_command("/model  claude-x  "),
+            Some(Some("claude-x".to_string()))
+        );
+    }
+
+    fn model_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fuzzy_model_candidates_empty_query_returns_full_list_unranked() {
+        let models = model_ids(&["claude-sonnet-4-6", "gpt-4o", "claude-opus-4"]);
+        let got: Vec<String> = fuzzy_model_candidates(&models, "")
+            .into_iter()
+            .map(|p| p.replacement)
+            .collect();
+        assert_eq!(got, models);
+    }
+
+    #[test]
+    fn fuzzy_model_candidates_narrows_by_subsequence() {
+        let models = model_ids(&["claude-sonnet-4-6", "gpt-4o", "claude-opus-4"]);
+        let got: Vec<String> = fuzzy_model_candidates(&models, "cla")
+            .into_iter()
+            .map(|p| p.replacement)
+            .collect();
+        assert_eq!(got, vec!["claude-sonnet-4-6", "claude-opus-4"]);
+    }
+
+    #[test]
+    fn fuzzy_model_candidates_ranks_tighter_match_first() {
+        // "gpt4o" as a subsequence appears in both, but a contiguous match in
+        // "gpt-4o" should outrank the more scattered match in "gpt-4-omni".
+        let models = model_ids(&["gpt-4-omni", "gpt-4o"]);
+        let got: Vec<String> = fuzzy_model_candidates(&models, "gpt4o")
+            .into_iter()
+            .map(|p| p.replacement)
+            .collect();
+        assert_eq!(got.first().map(String::as_str), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn fuzzy_model_candidates_excludes_non_matches() {
+        let models = model_ids(&["claude-sonnet-4-6", "gpt-4o"]);
+        let got = fuzzy_model_candidates(&models, "zzz");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_model_candidates_case_insensitive() {
+        let models = model_ids(&["claude-sonnet-4-6"]);
+        let got = fuzzy_model_candidates(&models, "CLAUDE");
+        assert_eq!(got.len(), 1);
+    }
 }

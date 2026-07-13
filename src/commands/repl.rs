@@ -6,9 +6,11 @@
 //! can't drift on the parts that should behave identically (paste handling,
 //! interrupt/EOF semantics, error reporting).
 
+use rustyline::completion::Pair;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
-use rustyline::{Config, Editor, Helper};
+use rustyline::{CompletionType, Config, Editor, Helper};
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use crate::colors as c;
@@ -18,6 +20,33 @@ use crate::error::Result;
 pub enum LoopControl {
     Continue,
     Quit,
+}
+
+/// Ghost-text hint shared by both REPL helpers' `Hinter` impls: given the
+/// already-typed line, the cursor position, and the same `(start, candidates)`
+/// pair their `Completer::complete` computed for that line/pos, returns the
+/// untyped remainder of the best (first-ranked) candidate — or `None` if the
+/// cursor isn't at the end of the line (mid-line edits shouldn't grow a hint
+/// past the cursor) or there's nothing left to complete.
+pub fn hint_from_candidates(
+    line: &str,
+    start: usize,
+    pos: usize,
+    candidates: &[Pair],
+) -> Option<String> {
+    if pos != line.len() {
+        return None;
+    }
+    let typed = &line[start..pos];
+    let best = candidates.first()?;
+    best.replacement.strip_prefix(typed).map(str::to_string)
+}
+
+/// Dim an inline hint with ANSI, so both REPL helpers' `Highlighter::
+/// highlight_hint` render candidates the same washed-out gray instead of the
+/// default (undimmed) hint color.
+pub fn dim_hint(hint: &str) -> Cow<'_, str> {
+    Cow::Owned(c::dim(hint))
 }
 
 /// Drives an interactive REPL to completion.
@@ -42,7 +71,14 @@ pub fn run_repl<H: Helper>(
     prompt: &str,
     mut on_line: impl FnMut(&str) -> Result<LoopControl>,
 ) -> Result<()> {
-    let config = Config::builder().bracketed_paste(true).build();
+    // `CompletionType::List` shows every matching candidate at once on Tab
+    // (a dropdown), instead of the default `Circular`'s cycle-one-at-a-time —
+    // the actual "dropdown" experience slash-command/model completion is
+    // meant to have.
+    let config = Config::builder()
+        .bracketed_paste(true)
+        .completion_type(CompletionType::List)
+        .build();
     let mut rl: Editor<H, DefaultHistory> =
         Editor::with_config(config).map_err(|e| crate::error::AppError::new(e.to_string()))?;
     rl.set_helper(Some(helper));
