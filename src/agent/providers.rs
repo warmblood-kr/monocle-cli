@@ -130,9 +130,11 @@ pub struct ChatRequest {
     pub tools: Vec<ToolDef>,
     /// Images to attach to the last user message as OpenAI vision parts (see
     /// `MonocleProvider::build_body`). Carried on the request rather than
-    /// `Message` because `monocle chat` rebuilds `messages` fresh every turn —
-    /// attachments never need to survive into a later turn (monocle-cli
-    /// file-attach plan).
+    /// `Message` because attachments are per-turn: both `monocle chat` and
+    /// `monocle agent` grow `messages` across turns, but only the CURRENT
+    /// turn's images are ever passed here — an earlier turn's images are not
+    /// re-embedded into later requests (the assistant's textual reply about
+    /// them is what persists in history).
     pub images: Vec<ImageAttachment>,
 }
 

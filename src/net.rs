@@ -20,6 +20,12 @@ pub struct Resp {
     pub status: u16,
     pub status_text: String,
     body: Vec<u8>,
+    /// Response headers, name lowercased (HTTP header names are case-insensitive)
+    /// — read via `header()`. Most callers only need `status`/`body`; this
+    /// exists for the few responses that carry state in a header instead of
+    /// the JSON body (e.g. jarvice's `/api/responses` returning the server-
+    /// created thread id via `X-Thread-Id`).
+    headers: Vec<(String, String)>,
 }
 
 impl Resp {
@@ -37,6 +43,15 @@ impl Resp {
 
     pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
         Ok(serde_json::from_slice(&self.body)?)
+    }
+
+    /// Look up a response header by name (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -103,11 +118,13 @@ impl Client {
         let resp = req.send().map_err(|e| AppError(e.to_string()))?;
         let status = resp.status().as_u16();
         let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+        let headers = collect_headers(resp.headers());
         let body = resp.bytes().map_err(|e| AppError(e.to_string()))?.to_vec();
         Ok(Resp {
             status,
             status_text,
             body,
+            headers,
         })
     }
 
@@ -217,6 +234,7 @@ fn send(method: &str, url: &str, req: reqwest::blocking::RequestBuilder) -> Resu
     })?;
     let status = resp.status().as_u16();
     let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+    let headers = collect_headers(resp.headers());
     let body = resp
         .bytes()
         .map_err(|e| {
@@ -229,7 +247,23 @@ fn send(method: &str, url: &str, req: reqwest::blocking::RequestBuilder) -> Resu
         status,
         status_text,
         body,
+        headers,
     })
+}
+
+/// Snapshot a `reqwest` header map into owned, lowercased `(name, value)`
+/// pairs — keeps `reqwest::header::HeaderMap` from leaking past this module.
+/// A non-UTF-8 header value is dropped rather than erroring the whole
+/// response over one exotic header.
+fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect()
 }
 
 /// A streaming HTTP response — a blocking line reader over the body. Keeps the

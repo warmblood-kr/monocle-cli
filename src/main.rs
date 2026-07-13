@@ -165,6 +165,17 @@ struct ChatArgs {
     /// (piped stdin) only — see also inband `file:<path>` tokens in the text.
     #[arg(long = "file")]
     file: Vec<String>,
+    /// Experimental: talk to jarvice's `/api/responses` instead of the plain
+    /// `/v1/chat/completions` — the server owns the conversation thread, so
+    /// this CLI doesn't accumulate history itself. jarvice-only (not reachable
+    /// through chat-proxy); no custom `--system-prompt` support (see
+    /// `responses_api` module docs).
+    #[arg(long)]
+    responses: bool,
+    /// With `--responses`, continue this existing server-side thread id
+    /// instead of starting a new one.
+    #[arg(long)]
+    thread: Option<String>,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -175,6 +186,8 @@ impl From<ChatArgs> for ChatOptions {
             system_prompt_file: a.system_prompt_file,
             max_tokens: a.max_tokens,
             files: a.file,
+            responses: a.responses,
+            thread: a.thread,
         }
     }
 }

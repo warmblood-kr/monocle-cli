@@ -16,14 +16,38 @@ pub struct AuthSession {
     pub router_url: String,
 }
 
+/// `http` for a local dev host (`localhost`/`127.0.0.1`), else `https`.
+fn scheme_for_host(host: &str) -> &'static str {
+    let is_local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
+    if is_local {
+        "http"
+    } else {
+        "https"
+    }
+}
+
 pub fn router_url_for(creds: &CredentialsData) -> String {
     if let Some(url) = &creds.router_url {
         return url.clone();
     }
-    let is_local = creds.tenant_domain.starts_with("localhost")
-        || creds.tenant_domain.starts_with("127.0.0.1");
-    let scheme = if is_local { "http" } else { "https" };
-    format!("{scheme}://{}", creds.tenant_domain)
+    format!(
+        "{}://{}",
+        scheme_for_host(&creds.tenant_domain),
+        creds.tenant_domain
+    )
+}
+
+/// jarvice's own base URL, always derived from `tenant_domain` — jarvice is
+/// tenant-host-routed (unlike chat-proxy behind `router_url`), so it is
+/// reachable only at its per-tenant hostname, never through `router_url`.
+/// Deliberately ignores `creds.router_url` (that's chat-proxy's address, a
+/// different host — conflating the two has been a recurring trap here).
+pub fn jarvice_url_for(creds: &CredentialsData) -> String {
+    format!(
+        "{}://{}",
+        scheme_for_host(&creds.tenant_domain),
+        creds.tenant_domain
+    )
 }
 
 /// Non-exiting variant of [`get_access_token`]. Returns an [`AppError`] instead

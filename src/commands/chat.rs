@@ -5,17 +5,18 @@ use rustyline::{Context, Helper, Highlighter, Hinter, Validator};
 use serde_json::Value;
 
 use crate::agent::providers::{
-    ChatRequest, ImageAttachment, LlmProvider, Message, MonocleProvider,
+    ChatRequest, ChatResponse, ImageAttachment, LlmProvider, Message, MonocleProvider,
 };
 use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
-use crate::auth::get_access_token;
+use crate::auth::{get_access_token, jarvice_url_for};
 use crate::commands::repl::{run_repl, LoopControl};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
 use crate::net::Client;
 use crate::origin::auth_headers;
+use crate::responses_api::ResponsesClient;
 use crate::util::home_dir;
 
 pub struct ChatOptions {
@@ -25,6 +26,11 @@ pub struct ChatOptions {
     pub max_tokens: Option<String>,
     /// `--file <PATH|URL>` values (repeatable), one-shot only.
     pub files: Vec<String>,
+    /// `--responses`: talk to jarvice's `/api/responses` (server-managed
+    /// thread) instead of the plain `/v1/chat/completions` path.
+    pub responses: bool,
+    /// `--thread <ID>`: continue an existing `--responses` thread.
+    pub thread: Option<String>,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -39,21 +45,17 @@ fn resolve_max_tokens(flag: Option<&str>) -> Option<i64> {
 }
 
 /// One streaming chat turn via the shared provider (chat-proxy routing): assistant
-/// text deltas are written to stdout (and flushed) as they arrive.
+/// text deltas are written to stdout (and flushed) as they arrive. `messages` is
+/// the full request the caller has already assembled (system prompt + any prior
+/// turns + this turn) — this fn only executes the network call and returns the
+/// assembled response so the caller can append it to its own running history.
 fn call_chat(
     provider: &MonocleProvider,
     model: &str,
-    system_prompt: Option<&str>,
-    user_message: &str,
+    messages: Vec<Message>,
     max_tokens: Option<i64>,
     images: &[ImageAttachment],
-) -> Result<()> {
-    let mut messages = Vec::new();
-    if let Some(sp) = system_prompt {
-        messages.push(Message::system(sp));
-    }
-    messages.push(Message::user(user_message));
-
+) -> Result<ChatResponse> {
     let req = ChatRequest {
         model: model.to_string(),
         messages,
@@ -74,7 +76,48 @@ fn call_chat(
     if resp.truncated {
         eprintln!("\n⚠ the response was cut short (partial output shown).");
     }
-    Ok(())
+    Ok(resp)
+}
+
+/// Read piped stdin (if not a TTY) and resolve `--file` + inband `file:<path>`
+/// tokens into one one-shot turn — shared by both the plain-completions and
+/// `--responses` paths. Returns `None` on an interactive TTY (nothing piped).
+/// Exits the process on a bad attachment ref or empty input, matching this
+/// command's existing fail-fast one-shot behavior.
+fn read_one_shot_input(
+    stdin_is_tty: bool,
+    files: &[String],
+) -> Result<Option<(String, Vec<ImageAttachment>)>> {
+    if stdin_is_tty {
+        return Ok(None);
+    }
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let (cleaned_text, inband_refs) = attachment::extract_inband_refs(input.trim());
+
+    let mut refs: Vec<String> = files.to_vec();
+    refs.extend(inband_refs);
+
+    let mut images: Vec<ImageAttachment> = Vec::new();
+    for r in &refs {
+        match attachment::resolve(r) {
+            Ok(img) => images.push(img),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let cleaned_text = cleaned_text.trim().to_string();
+    // Image-only messages are valid — only bail when BOTH the text and the
+    // attachments are empty.
+    if cleaned_text.is_empty() && images.is_empty() {
+        eprintln!("No input provided via stdin.");
+        std::process::exit(1);
+    }
+
+    Ok(Some((cleaned_text, images)))
 }
 
 /// Resolve inband `file:<path>` refs in a REPL line into images, mirroring the
@@ -138,6 +181,17 @@ impl Completer for ChatReplHelper {
 }
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    if options.responses {
+        run_responses_chat(client, creds, options)
+    } else {
+        run_completions_chat(client, creds, options)
+    }
+}
+
+/// The default path: a stateless `/v1/chat/completions` call per turn, with
+/// this REPL accumulating the growing conversation itself (see `convo` below)
+/// and resending it in full each turn.
+fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
     let model = options
         .model
         .as_deref()
@@ -177,37 +231,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     // Read stdin + resolve any attachments — cheap, local-only work that
     // should fail fast (bad path, unsupported MIME) before the second network
     // call (model-ID validation) below, but after the auth check above.
-    let one_shot_input: Option<(String, Vec<ImageAttachment>)> = if !stdin_is_tty {
-        let mut input = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-        let (cleaned_text, inband_refs) = attachment::extract_inband_refs(input.trim());
-
-        let mut refs: Vec<String> = options.files.clone();
-        refs.extend(inband_refs);
-
-        let mut images: Vec<ImageAttachment> = Vec::new();
-        for r in &refs {
-            match attachment::resolve(r) {
-                Ok(img) => images.push(img),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-
-        let cleaned_text = cleaned_text.trim().to_string();
-        // Image-only messages are valid — only bail when BOTH the text and the
-        // attachments are empty.
-        if cleaned_text.is_empty() && images.is_empty() {
-            eprintln!("No input provided via stdin.");
-            std::process::exit(1);
-        }
-
-        Some((cleaned_text, images))
-    } else {
-        None
-    };
+    let one_shot_input = read_one_shot_input(stdin_is_tty, &options.files)?;
 
     // Resolve system prompt.
     let system_prompt: Option<String> = if let Some(path) = &options.system_prompt_file {
@@ -254,14 +278,12 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     if let Some((text, images)) = one_shot_input {
         eprintln!("Using model: {model}");
         eprintln!("Router: {router_url}");
-        call_chat(
-            &provider,
-            &model,
-            system_prompt.as_deref(),
-            &text,
-            max_tokens,
-            &images,
-        )?;
+        let mut messages = Vec::new();
+        if let Some(sp) = &system_prompt {
+            messages.push(Message::system(sp));
+        }
+        messages.push(Message::user(&text));
+        call_chat(&provider, &model, messages, max_tokens, &images)?;
         let mut out = std::io::stdout();
         out.write_all(b"\n")?;
         out.flush()?;
@@ -283,6 +305,15 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     // load/save, and the Ctrl-C/Ctrl-D/error loop itself are shared with
     // `monocle agent`'s REPL via `commands::repl::run_repl`.
     let history_path = home_dir().join(".monocle").join("chat_history");
+
+    // Conversation memory: mirrors `monocle agent`'s `Repl.convo` — grows for
+    // the life of the process instead of `call_chat` rebuilding a one-message
+    // request every turn (the REPL used to have no memory of earlier turns at
+    // all). Seeded once with the system prompt, if any.
+    let mut convo: Vec<Message> = Vec::new();
+    if let Some(sp) = &system_prompt {
+        convo.push(Message::system(sp));
+    }
 
     run_repl(ChatReplHelper, history_path, "> ", |trimmed| {
         if trimmed == "/quit" || trimmed == "/exit" {
@@ -307,18 +338,128 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         // over from an earlier one (this REPL loops for the life of the
         // process, same as `monocle agent`'s).
         crate::diag::reset();
-        match call_chat(
-            &provider,
-            &model,
-            system_prompt.as_deref(),
-            &text,
-            max_tokens,
-            &images,
-        ) {
-            Ok(()) => {
+        // Roll back this turn's user message on failure (mirrors `monocle
+        // agent`'s `Repl::run_turn` mark/truncate) so a failed turn doesn't
+        // leave a dangling, reply-less user message in the history sent next time.
+        let mark = convo.len();
+        convo.push(Message::user(text));
+        match call_chat(&provider, &model, convo.clone(), max_tokens, &images) {
+            Ok(resp) => {
+                convo.push(Message::assistant(resp.content));
                 let mut out = std::io::stdout();
                 out.write_all(b"\n\n")?;
                 out.flush()?;
+            }
+            Err(e) => {
+                convo.truncate(mark);
+                eprintln!("Error: {e}");
+                if crate::diag::was_logged() {
+                    eprintln!("  (details logged to {})", crate::diag::display_path());
+                }
+                eprintln!();
+            }
+        }
+        Ok(LoopControl::Continue)
+    })
+}
+
+/// `--responses`: jarvice's `/api/responses` (see `responses_api` module
+/// docs). The server owns the conversation thread — this REPL only tracks
+/// the `thread_id` to pass on the next turn, never a local message history.
+///
+/// jarvice-only (not reachable through chat-proxy's `router_url`); no custom
+/// `--system-prompt`/`--max-tokens` support (the endpoint has no such
+/// fields) — both are warned-and-ignored rather than silently dropped.
+fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    let model = options
+        .model
+        .as_deref()
+        .unwrap_or(DEFAULT_MODEL)
+        .to_string();
+
+    if options.max_tokens.is_some() {
+        eprintln!("⚠ --max-tokens is ignored with --responses (jarvice's Responses API has no such field)");
+    }
+    if options.system_prompt.is_some() || options.system_prompt_file.is_some() {
+        eprintln!("⚠ --system-prompt/--system-prompt-file is ignored with --responses (the endpoint has no generic system-prompt field, only a voice-mode speech_system_context)");
+    }
+
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    if !options.files.is_empty() && stdin_is_tty {
+        eprintln!(
+            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle chat --responses --file photo.png"
+        );
+        std::process::exit(1);
+    }
+
+    // Auth FIRST, same rationale as the completions path — an expired/missing
+    // login must surface before any local-input error masks it.
+    let session = get_access_token(client, creds);
+    let stored = creds.read().ok_or_else(|| {
+        crate::error::AppError::new("Not logged in. Run `monocle login --tenant <domain>` first.")
+    })?;
+    // Deliberately `jarvice_url_for`, NOT `session.router_url` — `/api/responses`
+    // is jarvice-only, unreachable through chat-proxy (see `responses_api` docs).
+    let jarvice_url = jarvice_url_for(&stored);
+
+    let one_shot_input = read_one_shot_input(stdin_is_tty, &options.files)?;
+
+    let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
+
+    if let Some((text, images)) = one_shot_input {
+        eprintln!("Using model: {model}");
+        eprintln!("jarvice: {jarvice_url}");
+        let reply = rc.respond(&model, &text, &images, options.thread.as_deref())?;
+        println!("{}", reply.content);
+        if let Some(id) = reply.thread_id {
+            eprintln!("Thread: {id}");
+        }
+        return Ok(());
+    }
+
+    // Interactive REPL.
+    eprintln!("Monocle Chat — Responses API (model: {model})");
+    eprintln!("jarvice: {jarvice_url}");
+    eprintln!("Type your message. Press Ctrl+D to exit.");
+    eprintln!("↑/↓ history, Tab completes /quit, /exit — a multi-line paste is one input.");
+    eprintln!("The server owns this conversation's thread — no local history is resent.");
+    eprintln!("---");
+
+    let history_path = home_dir().join(".monocle").join("chat_history");
+    // Not a `Vec<Message>` like `run_completions_chat`'s `convo` — the server
+    // persists the conversation; this is just the id to hand back next turn.
+    let mut thread_id: Option<String> = options.thread.clone();
+
+    run_repl(ChatReplHelper, history_path, "> ", |trimmed| {
+        if trimmed == "/quit" || trimmed == "/exit" {
+            eprintln!("Bye.");
+            return Ok(LoopControl::Quit);
+        }
+
+        let (text, images) = match resolve_repl_attachments(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                eprintln!();
+                return Ok(LoopControl::Continue);
+            }
+        };
+
+        eprintln!();
+        crate::diag::reset();
+        match rc.respond(&model, &text, &images, thread_id.as_deref()) {
+            Ok(reply) => {
+                println!("{}", reply.content);
+                // Announce the thread id only when it's newly learned (the
+                // first turn) or changed — not on every turn, since it's
+                // normally stable for the rest of the session.
+                if reply.thread_id.is_some() && thread_id != reply.thread_id {
+                    thread_id = reply.thread_id;
+                    if let Some(id) = &thread_id {
+                        eprintln!("Thread: {id}");
+                    }
+                }
+                println!();
             }
             Err(e) => {
                 eprintln!("Error: {e}");
