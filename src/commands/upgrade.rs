@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::Path;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, Result};
 use crate::net::Client;
@@ -52,6 +53,49 @@ fn asset_filename(platform: &str) -> String {
 /// The GitHub Releases download URL for `<vTAG>/<asset>`.
 fn download_url(tag: &str, asset: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/{tag}/{asset}")
+}
+
+/// Parse a `sha256sum`-style SHA256SUMS listing and find the hash for
+/// `asset`. Tolerates the optional `*` binary-mode marker some tools prefix
+/// onto the filename column.
+fn find_checksum<'a>(sums: &'a str, asset: &str) -> Option<&'a str> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        (name == asset).then_some(hash)
+    })
+}
+
+/// Fetch `SHA256SUMS` from the same release tag and verify `bytes` (the
+/// already-downloaded asset) against its entry. Soft-skips (warns, returns
+/// `Ok`) if the sums file can't be fetched or has no matching entry — old
+/// releases predate this and must still be installable. An actual mismatch
+/// is a hard error.
+fn verify_checksum(client: &Client, tag: &str, asset: &str, bytes: &[u8]) -> Result<()> {
+    let url = download_url(tag, "SHA256SUMS");
+    let resp = match client.get(&url, &[("User-Agent", "monocle-cli")]) {
+        Ok(r) if r.ok() => r,
+        _ => {
+            eprintln!("⚠ SHA256SUMS not available, skipping checksum verification");
+            return Ok(());
+        }
+    };
+    let sums = resp.text();
+    let Some(expected) = find_checksum(&sums, asset) else {
+        eprintln!("⚠ no checksum entry for {asset}, skipping checksum verification");
+        return Ok(());
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected {
+        return Err(AppError::new(format!(
+            "checksum verification failed for {asset}: expected {expected}, got {actual}"
+        )));
+    }
+    eprintln!("Checksum verified: {asset}");
+    Ok(())
 }
 
 /// Compare `current` against `latest` as semver. Returns `None` if EITHER string
@@ -243,6 +287,7 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
         )));
     }
     let bytes = resp.bytes();
+    verify_checksum(client, &tag, &asset, bytes)?;
 
     let temp_name = if cfg!(windows) {
         format!("monocle-upgrade-{}.exe", std::process::id())
@@ -305,6 +350,30 @@ mod tests {
     fn asset_platform_rejects_unknown() {
         assert!(asset_platform("linux", "riscv64").is_err());
         assert!(asset_platform("freebsd", "x86_64").is_err());
+    }
+
+    #[test]
+    fn find_checksum_matches_exact_filename() {
+        let sums = "abc123  monocle-linux-x64.tar.gz\ndef456  monocle-macos-arm64.tar.gz\n";
+        assert_eq!(
+            find_checksum(sums, "monocle-linux-x64.tar.gz"),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn find_checksum_handles_binary_mode_marker() {
+        let sums = "abc123 *monocle-linux-x64.tar.gz\n";
+        assert_eq!(
+            find_checksum(sums, "monocle-linux-x64.tar.gz"),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn find_checksum_none_when_missing() {
+        let sums = "abc123  monocle-linux-x64.tar.gz\n";
+        assert_eq!(find_checksum(sums, "monocle-windows-x64.zip"), None);
     }
 
     #[test]

@@ -83,6 +83,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: sha256sum monocle-*.tar.gz monocle-*.zip > SHA256SUMS
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -91,4 +93,5 @@ jobs:
             monocle-linux-x64.tar.gz
             monocle-linux-arm64.tar.gz
             monocle-windows-x64.zip
+            SHA256SUMS
           generate_release_notes: true
