@@ -30,6 +30,31 @@ $Tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP ([System.G
 $Zip = Join-Path $Tmp $Asset
 
 Invoke-WebRequest -Uri $Url -OutFile $Zip
+
+$SumsUrl = "https://github.com/$Repo/releases/download/$Version/SHA256SUMS"
+$SumsFile = Join-Path $Tmp "SHA256SUMS"
+$sumsAvailable = $true
+try {
+    Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsFile -ErrorAction Stop
+} catch {
+    Write-Host "Warning: SHA256SUMS not available, skipping checksum verification."
+    $sumsAvailable = $false
+}
+
+if ($sumsAvailable) {
+    $line = Select-String -Path $SumsFile -Pattern ([regex]::Escape($Asset)) -SimpleMatch | Select-Object -First 1
+    if ($line) {
+        $expected = ($line.Line -split '\s+')[0].ToLower()
+        $actual = (Get-FileHash -Path $Zip -Algorithm SHA256).Hash.ToLower()
+        if ($expected -ne $actual) {
+            throw "Checksum verification failed for $Asset (expected $expected, got $actual)"
+        }
+        Write-Host "Checksum verified: $Asset"
+    } else {
+        Write-Host "Warning: no checksum entry for $Asset, skipping checksum verification."
+    }
+}
+
 Expand-Archive -Path $Zip -DestinationPath $Tmp -Force
 Move-Item -Force (Join-Path $Tmp "$Binary.exe") (Join-Path $InstallDir "$Binary.exe")
 Remove-Item -Recurse -Force $Tmp
