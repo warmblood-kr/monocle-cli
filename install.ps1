@@ -42,7 +42,12 @@ try {
 }
 
 if ($sumsAvailable) {
-    $line = Select-String -Path $SumsFile -Pattern ([regex]::Escape($Asset)) -SimpleMatch | Select-Object -First 1
+    # -SimpleMatch already means "treat -Pattern as a literal string" — passing
+    # a [regex]::Escape()'d value here (as an earlier version of this script
+    # did) is a bug: SimpleMatch doesn't unescape it, so the literal escape
+    # backslashes never match the real unescaped filename, and verification
+    # silently no-ops on every real run. Pass $Asset as-is.
+    $line = Select-String -Path $SumsFile -Pattern $Asset -SimpleMatch | Select-Object -First 1
     if ($line) {
         $expected = ($line.Line -split '\s+')[0].ToLower()
         $actual = (Get-FileHash -Path $Zip -Algorithm SHA256).Hash.ToLower()
