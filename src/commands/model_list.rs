@@ -27,7 +27,7 @@ struct ModelsResponse {
     data: Vec<ModelInfo>,
 }
 
-fn pad(s: &str, width: usize) -> String {
+pub(crate) fn pad(s: &str, width: usize) -> String {
     let len = s.chars().count();
     if len >= width {
         s.to_string()
