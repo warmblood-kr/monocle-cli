@@ -99,12 +99,19 @@ Bye.
 
 The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
 and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
-Tab completes `/quit`/`/exit`, and a multi-line paste is inserted as a single input
-(submitted only on Enter, not one turn per line). Command history persists across
-sessions in `~/.monocle/chat_history` (kept separate from `monocle agent`'s history).
-The REPL remembers the conversation — each turn resends the full exchange so
-far, the same way `monocle agent` does — so follow-up questions ("what about
-in Python?") work without repeating context.
+Tab completes `/model`/`/quit`/`/exit` as a dropdown listing every match (not cycling
+one at a time), with the best match also shown as a dim inline hint as you type; a
+multi-line paste is inserted as a single input (submitted only on Enter, not one turn
+per line). Command history persists across sessions in `~/.monocle/chat_history` (kept
+separate from `monocle agent`'s history). The REPL remembers the conversation — each
+turn resends the full exchange so far, the same way `monocle agent` does — so
+follow-up questions ("what about in Python?") work without repeating context.
+
+Same as `monocle agent`'s REPL, `/model` shows the current model (or `/model <id>`
+switches it for later turns), and `/model <TAB>` fuzzy-completes against the model ids
+available to your account (fetched once at startup) — e.g. `/model cla<TAB>` narrows to
+matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in or the
+list can't be fetched, completion just offers nothing (typing a full id still works).
 
 One-shot via stdin:
 
@@ -330,9 +337,10 @@ it for an interactive REPL. Progress goes to stderr, the answer to stdout; `--se
 
 The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
 and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
-Tab completes slash commands, and a multi-line paste is inserted as a single input
-(submitted only on Enter). Command history persists across sessions in
-`~/.monocle/agent_history`.
+Tab completes slash commands as a dropdown listing every match (not cycling one at a
+time), with the best match also shown as a dim inline hint as you type; a multi-line
+paste is inserted as a single input (submitted only on Enter). Command history
+persists across sessions in `~/.monocle/agent_history`.
 
 In the interactive REPL, lines starting with `/` are local management commands (handled
 without calling the model, printed to stderr): `/help` lists them, `/config` shows the
