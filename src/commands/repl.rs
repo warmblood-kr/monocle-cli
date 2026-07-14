@@ -6,14 +6,17 @@
 //! can't drift on the parts that should behave identically (paste handling,
 //! interrupt/EOF semantics, error reporting).
 
-use rustyline::completion::Pair;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
-use rustyline::{CompletionType, Config, Editor, Helper};
+use rustyline::{CompletionType, Config, Context, Editor, Helper, Validator};
 use std::borrow::Cow;
 use std::path::PathBuf;
 
 use crate::colors as c;
+use crate::commands::model_list::fuzzy_model_candidates;
 use crate::error::Result;
 
 /// What the per-line callback wants the loop to do next.
@@ -61,6 +64,97 @@ pub fn hint_from_candidates(
 /// default (undimmed) hint color.
 pub fn dim_hint(hint: &str) -> Cow<'_, str> {
     Cow::Owned(c::dim(hint))
+}
+
+/// rustyline line helper shared by `monocle chat`'s and `monocle agent`'s
+/// REPLs (`agent.rs`'s former `ReplHelper` and `chat.rs`'s former
+/// `ChatReplHelper` were near-verbatim duplicates, differing only in which
+/// slash commands they offer): Tab-completes slash commands as a real
+/// dropdown (see `run_repl`'s `CompletionType::List`), and (for `/model`)
+/// fuzzy-completes the argument against a model id list fetched once at REPL
+/// startup. Also hints the best-ranked candidate as dim inline ghost text via
+/// `Hinter`/`Highlighter`; validation stays the derived no-op default
+/// (multi-line handling comes from `bracketed_paste`).
+#[derive(Helper, Validator)]
+pub struct ModelReplHelper {
+    /// The slash commands this REPL understands — `agent`'s richer set vs.
+    /// `chat`'s `/model`, `/exit`, `/quit` — offered by command-name
+    /// completion and shown by `/help` where applicable.
+    pub commands: &'static [&'static str],
+    /// Model ids fetched once before the loop starts. Empty when not logged
+    /// in / the fetch failed — `/model` completion then just offers no
+    /// candidates, same defensive posture as the rest of the interactive
+    /// path. Plain `Vec` (not `Rc`): each helper is constructed exactly once
+    /// and moved by value into `Editor::set_helper`, never cloned or shared.
+    pub models: Vec<String>,
+}
+
+impl ModelReplHelper {
+    /// Shared by `Completer::complete` and `Hinter::hint` so the two can
+    /// never disagree on what's being completed.
+    fn candidates(&self, line: &str, pos: usize) -> (usize, Vec<Pair>) {
+        // Only offer completion for a slash-command being typed at the line start.
+        let head = &line[..pos];
+        if !head.starts_with('/') {
+            return (0, Vec::new());
+        }
+        // `/model <partial>` — fuzzy-match the argument against the cached
+        // model ids instead of the flat command-name list, so `/model
+        // cla<TAB>` narrows to matching ids and a bare `/model <TAB>` shows
+        // the full dropdown. Guarded (not a bare `head.strip_prefix("/model
+        // ")`) so a double space (`/model  cla`) still trims down to the
+        // right query instead of leaving a leading space that breaks the
+        // fuzzy match, while `/models` (no separating space) still falls
+        // through to plain command-name completion instead of being
+        // misread as `/model` with argument `s` — the same boundary the
+        // real dispatcher (`parse_model_command`) draws.
+        if let Some(rest) = head.strip_prefix("/model") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let query = rest.trim_start();
+                let start = head.len() - query.len();
+                return (start, fuzzy_model_candidates(&self.models, query));
+            }
+        }
+        let candidates = self
+            .commands
+            .iter()
+            .filter(|cmd| cmd.starts_with(head))
+            .map(|cmd| Pair {
+                display: cmd.to_string(),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        // Replace from column 0 (the whole slash token starts there).
+        (0, candidates)
+    }
+}
+
+impl Completer for ModelReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        Ok(self.candidates(line, pos))
+    }
+}
+
+impl Hinter for ModelReplHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        let (start, candidates) = self.candidates(line, pos);
+        hint_from_candidates(line, start, pos, &candidates)
+    }
+}
+
+impl Highlighter for ModelReplHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        dim_hint(hint)
+    }
 }
 
 /// Drives an interactive REPL to completion.
@@ -133,26 +227,176 @@ pub fn run_repl<H: Helper>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::history::DefaultHistory;
 
-    fn pair(id: &str) -> Pair {
-        Pair {
-            display: id.to_string(),
-            replacement: id.to_string(),
+    /// A representative command list — not either real `SLASH_COMMANDS`
+    /// (`agent.rs`) or `CHAT_SLASH_COMMANDS` (`chat.rs`), just enough
+    /// variety to exercise `ModelReplHelper` generically.
+    const TEST_COMMANDS: &[&str] = &["/help", "/model", "/exit", "/quit"];
+
+    fn model_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn helper(models: &[&str]) -> ModelReplHelper {
+        ModelReplHelper {
+            commands: TEST_COMMANDS,
+            models: model_ids(models),
         }
+    }
+
+    #[test]
+    fn complete_slash_command_narrows_to_matching_prefix() {
+        let h = helper(&[]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/qu";
+        let (start, candidates) = h.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect::<Vec<_>>(),
+            vec!["/quit".to_string()]
+        );
+    }
+
+    #[test]
+    fn complete_bare_slash_offers_all_commands() {
+        let h = helper(&[]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/";
+        let (start, candidates) = h.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect::<Vec<_>>(),
+            vec![
+                "/help".to_string(),
+                "/model".to_string(),
+                "/exit".to_string(),
+                "/quit".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_non_slash_text_offers_nothing() {
+        let h = helper(&[]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "hello";
+        let (start, candidates) = h.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert!(candidates.is_empty());
+    }
+
+    /// The completion `start` offset is what rustyline uses to splice the
+    /// chosen candidate back into the line — get it wrong and accepting a
+    /// completion corrupts the line. For `/model <partial>` it must point
+    /// just past `"/model "`, not column 0 (unlike the command-name path),
+    /// so accepting a candidate replaces only the partial id.
+    #[test]
+    fn complete_model_argument_uses_offset_after_prefix() {
+        let h = helper(&["claude-sonnet-4-6", "gpt-4o"]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/model cla";
+        let (start, candidates) = h.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, "/model ".len());
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect::<Vec<_>>(),
+            vec!["claude-sonnet-4-6".to_string()]
+        );
+
+        // Bare "/model " (empty partial) offers the full dropdown, still
+        // anchored right after the prefix.
+        let line = "/model ";
+        let (start, candidates) = h.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, "/model ".len());
+        assert_eq!(candidates.len(), 2);
+    }
+
+    /// Command-name completion (`/mo<TAB>` → `/model`) must be unaffected by
+    /// the `/model` argument branch.
+    #[test]
+    fn complete_command_name_unaffected_by_model_argument_branch() {
+        let h = helper(&["claude-sonnet-4-6"]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/mo";
+        let (start, candidates) = h.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect::<Vec<_>>(),
+            vec!["/model".to_string()]
+        );
+    }
+
+    /// FIX #2: a double space after `/model` must not leave a leading space
+    /// in the extracted query — that would break the fuzzy match even
+    /// though `parse_model_command` (the real dispatcher) already tolerates
+    /// it via its own final `.trim()`.
+    #[test]
+    fn complete_model_argument_tolerates_double_space() {
+        let h = helper(&["claude-sonnet-4-6", "gpt-4o"]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/model  cla";
+        let (start, candidates) = h.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, line.len() - "cla".len());
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect::<Vec<_>>(),
+            vec!["claude-sonnet-4-6".to_string()]
+        );
+    }
+
+    /// `/models` (no separating space) must not be misread as `/model` with
+    /// argument `s` — same boundary `parse_model_command` draws.
+    #[test]
+    fn complete_does_not_treat_slash_models_as_model_argument() {
+        let h = helper(&["claude-sonnet-4-6"]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/models";
+        let (start, candidates) = h.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, 0);
+        assert!(candidates.is_empty());
     }
 
     /// FIX #1: `fuzzy_model_candidates` matches case-insensitively, so the
     /// top candidate for an all-caps query can differ in case from what was
     /// typed — the hint must still appear, using the candidate's own
-    /// casing for the ghost suffix (not a case-sensitive `strip_prefix`,
-    /// which would silently return `None` here).
+    /// casing for the ghost suffix.
     #[test]
     fn hint_shows_case_insensitive_prefix_match_with_candidate_casing() {
-        let candidates = vec![pair("claude-sonnet-4-6")];
+        let h = helper(&["claude-sonnet-4-6", "gpt-4o"]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
         let line = "/model CLA";
-        let start = line.len() - "CLA".len();
         assert_eq!(
-            hint_from_candidates(line, start, line.len(), &candidates),
+            h.hint(line, line.len(), &ctx),
             Some("ude-sonnet-4-6".to_string())
         );
     }
@@ -161,12 +405,11 @@ mod tests {
     /// suffix — `None` is correct, not a stripped/garbled remainder.
     #[test]
     fn hint_is_none_for_non_prefix_subsequence_match() {
-        let candidates = vec![pair("claude-sonnet-4-6")];
+        let h = helper(&["claude-sonnet-4-6"]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
         let line = "/model sonnet";
-        let start = line.len() - "sonnet".len();
-        assert_eq!(
-            hint_from_candidates(line, start, line.len(), &candidates),
-            None
-        );
+        assert_eq!(h.hint(line, line.len(), &ctx), None);
     }
 }

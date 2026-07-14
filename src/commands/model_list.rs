@@ -74,21 +74,57 @@ pub fn fetch_model_ids(client: &Client, creds: &Credentials) -> Result<Vec<Strin
         .collect())
 }
 
+/// A parsed `/model` REPL invocation, shared by `chat`'s and `agent`'s REPL
+/// dispatch.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModelCommand {
+    /// Not a `/model` invocation at all.
+    NotModel,
+    /// Bare `/model` — show the current model.
+    Show,
+    /// `/model <id>` — switch to `id`.
+    Switch(String),
+}
+
 /// Pure parser for the `/model` command, shared by `chat`'s and `agent`'s
-/// REPL dispatch. Returns:
-/// - `None` — not a `/model` invocation (let normal dispatch handle it);
-/// - `Some(None)` — bare `/model` (show the current model);
-/// - `Some(Some(id))` — `/model <id>` (switch to `id`).
-pub fn parse_model_command(input: &str) -> Option<Option<String>> {
+/// REPL dispatch.
+pub fn parse_model_command(input: &str) -> ModelCommand {
     let trimmed = input.trim();
     if trimmed == "/model" {
-        return Some(None);
+        return ModelCommand::Show;
     }
-    let rest = trimmed.strip_prefix("/model ")?.trim();
-    if rest.is_empty() {
-        Some(None)
-    } else {
-        Some(Some(rest.to_string()))
+    match trimmed.strip_prefix("/model ") {
+        None => ModelCommand::NotModel,
+        Some(rest) => {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                ModelCommand::Show
+            } else {
+                ModelCommand::Switch(rest.to_string())
+            }
+        }
+    }
+}
+
+/// Handle a `/model` line if `trimmed` is one: prints the switch/show
+/// message and updates `*model` in place. Returns `true` if this input was
+/// a `/model` invocation (caller should treat it as consumed and not fall
+/// through to normal dispatch), `false` otherwise. Shared by `chat`'s (both
+/// the completions and `--responses` REPLs) and `agent`'s REPL dispatch so
+/// the "handle `/model` on Enter" logic can't drift between the three call
+/// sites.
+pub fn handle_model_command(trimmed: &str, model: &mut String) -> bool {
+    match parse_model_command(trimmed) {
+        ModelCommand::NotModel => false,
+        ModelCommand::Show => {
+            eprintln!("{}", crate::colors::dim(&format!("model: {model}")));
+            true
+        }
+        ModelCommand::Switch(id) => {
+            eprintln!("{}", crate::colors::dim(&format!("model → {id}")));
+            *model = id;
+            true
+        }
     }
 }
 
@@ -191,22 +227,39 @@ mod tests {
     #[test]
     fn parse_model_command_variants() {
         // Not a /model command.
-        assert_eq!(parse_model_command("hello"), None);
-        assert_eq!(parse_model_command("/models"), None);
-        assert_eq!(parse_model_command("/help"), None);
+        assert_eq!(parse_model_command("hello"), ModelCommand::NotModel);
+        assert_eq!(parse_model_command("/models"), ModelCommand::NotModel);
+        assert_eq!(parse_model_command("/help"), ModelCommand::NotModel);
         // Bare /model (with or without surrounding / trailing space) shows current.
-        assert_eq!(parse_model_command("/model"), Some(None));
-        assert_eq!(parse_model_command("  /model  "), Some(None));
-        assert_eq!(parse_model_command("/model   "), Some(None));
+        assert_eq!(parse_model_command("/model"), ModelCommand::Show);
+        assert_eq!(parse_model_command("  /model  "), ModelCommand::Show);
+        assert_eq!(parse_model_command("/model   "), ModelCommand::Show);
         // /model <id> switches.
         assert_eq!(
             parse_model_command("/model gpt-4o"),
-            Some(Some("gpt-4o".to_string()))
+            ModelCommand::Switch("gpt-4o".to_string())
         );
         assert_eq!(
             parse_model_command("/model  claude-x  "),
-            Some(Some("claude-x".to_string()))
+            ModelCommand::Switch("claude-x".to_string())
         );
+    }
+
+    #[test]
+    fn handle_model_command_switches_shows_and_passes_through() {
+        let mut model = "old-model".to_string();
+
+        // Not a /model line — unconsumed, model untouched.
+        assert!(!handle_model_command("hello", &mut model));
+        assert_eq!(model, "old-model");
+
+        // Bare /model — consumed, just shows (no mutation).
+        assert!(handle_model_command("/model", &mut model));
+        assert_eq!(model, "old-model");
+
+        // /model <id> — consumed, switches.
+        assert!(handle_model_command("/model new-model", &mut model));
+        assert_eq!(model, "new-model");
     }
 
     fn model_ids(ids: &[&str]) -> Vec<String> {

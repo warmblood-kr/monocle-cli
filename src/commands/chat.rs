@@ -1,11 +1,5 @@
-use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
-use std::rc::Rc;
 
-use rustyline::completion::{Completer, Pair};
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::{Context, Helper, Validator};
 use serde_json::Value;
 
 use crate::agent::providers::{
@@ -14,9 +8,8 @@ use crate::agent::providers::{
 use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
 use crate::auth::{get_access_token, jarvice_url_for};
-use crate::colors as c;
-use crate::commands::model_list::{fetch_model_ids, fuzzy_model_candidates, parse_model_command};
-use crate::commands::repl::{dim_hint, hint_from_candidates, run_repl, LoopControl};
+use crate::commands::model_list::{fetch_model_ids, handle_model_command};
+use crate::commands::repl::{run_repl, LoopControl, ModelReplHelper};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
@@ -152,90 +145,6 @@ fn resolve_repl_attachments(
 /// `/help`/`/config`/`/status`.
 const CHAT_SLASH_COMMANDS: &[&str] = &["/model", "/exit", "/quit"];
 
-/// rustyline line helper for `monocle chat`'s REPL: Tab-completes slash
-/// commands as a real dropdown (see `commands::repl::run_repl`'s
-/// `CompletionType::List`), and (for `/model`) fuzzy-completes the argument
-/// against a model id list fetched once at startup — same behavior as
-/// `agent.rs`'s `ReplHelper`, which this mirrors. Also hints the best-ranked
-/// candidate as dim inline ghost text via `Hinter`/`Highlighter`; validation
-/// stays the derived no-op default.
-#[derive(Helper, Validator)]
-struct ChatReplHelper {
-    /// Model ids fetched once before the loop starts. Empty when not logged
-    /// in / the fetch failed — `/model` completion then just offers no
-    /// candidates. `Rc` because `Editor::set_helper` takes ownership and the
-    /// list is read-only for the session's lifetime.
-    models: Rc<Vec<String>>,
-}
-
-impl ChatReplHelper {
-    /// Shared by `Completer::complete` and `Hinter::hint` so the two can
-    /// never disagree on what's being completed.
-    fn candidates(&self, line: &str, pos: usize) -> (usize, Vec<Pair>) {
-        // Only offer completion for a slash-command being typed at line start.
-        let head = &line[..pos];
-        if !head.starts_with('/') {
-            return (0, Vec::new());
-        }
-        // `/model <partial>` — fuzzy-match the argument against the cached
-        // model ids, anchored just after "/model " (not column 0) so accepting
-        // a candidate replaces only the partial id. Guarded (not a bare
-        // `head.strip_prefix("/model ")`) so a double space (`/model  cla`)
-        // still trims down to the right query instead of leaving a leading
-        // space that breaks the fuzzy match — `parse_model_command` (the real
-        // dispatcher) already tolerates this via its own final `.trim()`, so
-        // completion must too. `/models` (no separating space) still falls
-        // through to plain command-name completion below rather than being
-        // misread as `/model` with argument `s` — the same boundary
-        // `parse_model_command` draws.
-        if let Some(rest) = head.strip_prefix("/model") {
-            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                let query = rest.trim_start();
-                let start = head.len() - query.len();
-                return (start, fuzzy_model_candidates(&self.models, query));
-            }
-        }
-        let candidates = CHAT_SLASH_COMMANDS
-            .iter()
-            .filter(|cmd| cmd.starts_with(head))
-            .map(|cmd| Pair {
-                display: cmd.to_string(),
-                replacement: cmd.to_string(),
-            })
-            .collect();
-        // Replace from column 0 (the whole slash token starts there).
-        (0, candidates)
-    }
-}
-
-impl Completer for ChatReplHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        Ok(self.candidates(line, pos))
-    }
-}
-
-impl Hinter for ChatReplHelper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        let (start, candidates) = self.candidates(line, pos);
-        hint_from_candidates(line, start, pos, &candidates)
-    }
-}
-
-impl Highlighter for ChatReplHelper {
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        dim_hint(hint)
-    }
-}
-
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
     if options.responses {
         run_responses_chat(client, creds, options)
@@ -367,8 +276,9 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     // load/save, and the Ctrl-C/Ctrl-D/error loop itself are shared with
     // `monocle agent`'s REPL via `commands::repl::run_repl`.
     let history_path = home_dir().join(".monocle").join("chat_history");
-    let helper = ChatReplHelper {
-        models: Rc::new(model_ids),
+    let helper = ModelReplHelper {
+        commands: CHAT_SLASH_COMMANDS,
+        models: model_ids,
     };
 
     // Conversation memory: mirrors `monocle agent`'s `Repl.convo` — grows for
@@ -388,14 +298,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         // `/model` switches the model for subsequent turns — handled before
         // the general dispatch since it carries an argument, same as
         // `monocle agent`'s REPL.
-        if let Some(model_cmd) = parse_model_command(trimmed) {
-            match model_cmd {
-                Some(id) => {
-                    eprintln!("{}", c::dim(&format!("model → {id}")));
-                    model = id;
-                }
-                None => eprintln!("{}", c::dim(&format!("model: {model}"))),
-            }
+        if handle_model_command(trimmed, &mut model) {
             return Ok(LoopControl::Continue);
         }
 
@@ -511,8 +414,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     // no startup model-list fetch to piggyback on (unlike the completions
     // path's validation call), so fetch once here for `/model` completion.
     let model_ids = fetch_model_ids(client, creds).unwrap_or_default();
-    let helper = ChatReplHelper {
-        models: Rc::new(model_ids),
+    let helper = ModelReplHelper {
+        commands: CHAT_SLASH_COMMANDS,
+        models: model_ids,
     };
 
     run_repl(helper, history_path, "> ", |trimmed| {
@@ -523,14 +427,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         // `/model` switches the model for subsequent turns — handled before
         // the general dispatch since it carries an argument, same as
         // `monocle agent`'s REPL.
-        if let Some(model_cmd) = parse_model_command(trimmed) {
-            match model_cmd {
-                Some(id) => {
-                    eprintln!("{}", c::dim(&format!("model → {id}")));
-                    model = id;
-                }
-                None => eprintln!("{}", c::dim(&format!("model: {model}"))),
-            }
+        if handle_model_command(trimmed, &mut model) {
             return Ok(LoopControl::Continue);
         }
 
@@ -573,93 +470,11 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_max_tokens, resolve_repl_attachments, ChatReplHelper};
-    use rustyline::completion::Completer;
-    use rustyline::history::DefaultHistory;
-    use rustyline::Context;
-    use std::rc::Rc;
+    use super::{resolve_max_tokens, resolve_repl_attachments};
 
-    #[test]
-    fn complete_slash_command_narrows_to_matching_prefix() {
-        let helper = ChatReplHelper {
-            models: Rc::new(vec![]),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/qu";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["/quit".to_string()]
-        );
-    }
-
-    #[test]
-    fn complete_bare_slash_offers_both_commands() {
-        let helper = ChatReplHelper {
-            models: Rc::new(vec![]),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec![
-                "/model".to_string(),
-                "/exit".to_string(),
-                "/quit".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn complete_non_slash_text_offers_nothing() {
-        let helper = ChatReplHelper {
-            models: Rc::new(vec![]),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "hello";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert!(candidates.is_empty());
-    }
-
-    /// FIX #2: a double space after `/model` must not leave a leading space
-    /// in the extracted query — that would break the fuzzy match even
-    /// though `parse_model_command` (the real dispatcher) already tolerates
-    /// it via its own final `.trim()`.
-    #[test]
-    fn complete_model_argument_tolerates_double_space() {
-        let helper = ChatReplHelper {
-            models: Rc::new(vec!["claude-sonnet-4-6".to_string(), "gpt-4o".to_string()]),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/model  cla";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, line.len() - "cla".len());
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["claude-sonnet-4-6".to_string()]
-        );
-    }
+    // The shared `ModelReplHelper` (Completer/Hinter, slash-command +
+    // `/model` fuzzy completion) now lives in `commands::repl` and is
+    // covered there, since that's where its Completer/Hinter impls live.
 
     #[test]
     fn absent_flag_omits() {

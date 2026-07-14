@@ -4,15 +4,9 @@
 //! edit + cross-platform shell) into the agent-core loop, prints progress to
 //! stderr, and the final answer to stdout.
 
-use std::borrow::Cow;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::rc::Rc;
 
-use rustyline::completion::{Completer, Pair};
-use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
-use rustyline::{Context, Helper, Validator};
 use serde_json::Value;
 
 use crate::agent::commands::{config_text, help_text, login_view, status_text};
@@ -23,8 +17,8 @@ use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::agent::SYSTEM_PROMPT;
 use crate::auth::get_access_token;
 use crate::colors as c;
-use crate::commands::model_list::{fetch_model_ids, fuzzy_model_candidates, parse_model_command};
-use crate::commands::repl::{dim_hint, hint_from_candidates, run_repl, LoopControl};
+use crate::commands::model_list::{fetch_model_ids, handle_model_command};
+use crate::commands::repl::{run_repl, LoopControl, ModelReplHelper};
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
@@ -75,91 +69,6 @@ impl Observer for CliObserver {
 /// by `/help`. Kept here (next to the dispatcher) so completion never drifts from
 /// what `dispatch_command` / `parse_model_command` actually handle.
 const SLASH_COMMANDS: &[&str] = &["/help", "/config", "/status", "/model", "/exit", "/quit"];
-
-/// rustyline line helper: Tab-completes slash commands (as a real dropdown —
-/// see `commands::repl::run_repl`'s `CompletionType::List`), and (for
-/// `/model`) fuzzy-completes the argument against a model id list fetched
-/// once at REPL startup. Also hints the best-ranked candidate as dim inline
-/// ghost text via `Hinter`/`Highlighter`; validation stays the derived no-op
-/// default (multi-line handling comes from `bracketed_paste`).
-#[derive(Helper, Validator)]
-struct ReplHelper {
-    /// Model ids fetched once before the loop starts (see `agent_command`).
-    /// Empty when not logged in / the fetch failed — `/model` completion then
-    /// just offers no candidates, same defensive posture as the rest of the
-    /// interactive path. `Rc` because `Editor::set_helper` takes ownership and
-    /// the list is read-only for the session's lifetime (no need for a `Vec`
-    /// clone per keystroke).
-    models: Rc<Vec<String>>,
-}
-
-impl ReplHelper {
-    /// Shared by `Completer::complete` and `Hinter::hint` so the two can never
-    /// disagree on what's being completed.
-    fn candidates(&self, line: &str, pos: usize) -> (usize, Vec<Pair>) {
-        // Only offer completion for a slash-command being typed at the line start.
-        let head = &line[..pos];
-        if !head.starts_with('/') {
-            return (0, Vec::new());
-        }
-        // `/model <partial>` — fuzzy-match the argument against the cached model
-        // ids instead of the flat command-name list, so `/model cla<TAB>` narrows
-        // to matching ids and a bare `/model <TAB>` shows the full dropdown.
-        // Guarded (not a bare `head.strip_prefix("/model ")`) so a double space
-        // (`/model  cla`) still trims down to the right query instead of leaving
-        // a leading space that breaks the fuzzy match — `parse_model_command`
-        // (the real dispatcher) already tolerates this via its own final
-        // `.trim()`, so completion must too. `/models` (no separating space)
-        // still falls through to plain command-name completion below rather
-        // than being misread as `/model` with argument `s` — the same
-        // boundary `parse_model_command` draws.
-        if let Some(rest) = head.strip_prefix("/model") {
-            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                let query = rest.trim_start();
-                let start = head.len() - query.len();
-                return (start, fuzzy_model_candidates(&self.models, query));
-            }
-        }
-        let candidates = SLASH_COMMANDS
-            .iter()
-            .filter(|cmd| cmd.starts_with(head))
-            .map(|cmd| Pair {
-                display: cmd.to_string(),
-                replacement: cmd.to_string(),
-            })
-            .collect();
-        // Replace from column 0 (the whole slash token starts there).
-        (0, candidates)
-    }
-}
-
-impl Completer for ReplHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        Ok(self.candidates(line, pos))
-    }
-}
-
-impl Hinter for ReplHelper {
-    type Hint = String;
-
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        let (start, candidates) = self.candidates(line, pos);
-        hint_from_candidates(line, start, pos, &candidates)
-    }
-}
-
-impl Highlighter for ReplHelper {
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        dim_hint(hint)
-    }
-}
 
 /// Interactive approver: prompts the user (stderr) before each side-effecting
 /// tool call and reads a y/N answer from stdin. Default (empty / non-y / EOF) is
@@ -440,22 +349,16 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     // the escapes print as literal characters, so rustyline's cursor-column
     // math (0-width) diverges from the terminal's real cursor position —
     // seen as the cursor sitting ~10 columns in in PowerShell before any input.
-    let helper = ReplHelper {
-        models: Rc::new(model_ids),
+    let helper = ModelReplHelper {
+        commands: SLASH_COMMANDS,
+        models: model_ids,
     };
     let history_path = home_dir().join(".monocle").join("agent_history");
 
     run_repl(helper, history_path, "» ", |msg| {
         // `/model` switches the model for subsequent turns (handled before
         // the general dispatch since it carries an argument).
-        if let Some(model_cmd) = parse_model_command(msg) {
-            match model_cmd {
-                Some(id) => {
-                    eprintln!("{}", c::dim(&format!("model → {id}")));
-                    repl.model = id;
-                }
-                None => eprintln!("{}", c::dim(&format!("model: {}", repl.model))),
-            }
+        if handle_model_command(msg, &mut repl.model) {
             return Ok(LoopControl::Continue);
         }
         // Slash commands are handled locally (never sent to the agent/LLM),
@@ -537,7 +440,6 @@ fn one_line(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustyline::history::DefaultHistory;
 
     #[test]
     fn dispatch_recognizes_management_commands() {
@@ -586,90 +488,8 @@ mod tests {
         assert!(!use_prompt_approver(true, false));
     }
 
-    // `parse_model_command`/`fuzzy_model_candidates` themselves are now
-    // covered by `commands::model_list`'s own tests (they moved there so
-    // `chat.rs` can share them) — this module keeps only the `ReplHelper`-
-    // specific completion-offset tests below.
-
-    fn model_ids(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// The completion `start` offset is what rustyline uses to splice the
-    /// chosen candidate back into the line — get it wrong and accepting a
-    /// completion corrupts the line. For `/model <partial>` it must point
-    /// just past `"/model "`, not column 0 (unlike the command-name path),
-    /// so accepting a candidate replaces only the partial id.
-    #[test]
-    fn complete_model_argument_uses_offset_after_prefix() {
-        let helper = ReplHelper {
-            models: Rc::new(model_ids(&["claude-sonnet-4-6", "gpt-4o"])),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/model cla";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, "/model ".len());
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["claude-sonnet-4-6".to_string()]
-        );
-
-        // Bare "/model " (empty partial) offers the full dropdown, still
-        // anchored right after the prefix.
-        let line = "/model ";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, "/model ".len());
-        assert_eq!(candidates.len(), 2);
-    }
-
-    /// Command-name completion (`/mo<TAB>` → `/model`) must be unaffected by
-    /// the new `/model` argument branch.
-    #[test]
-    fn complete_command_name_unaffected_by_model_argument_branch() {
-        let helper = ReplHelper {
-            models: Rc::new(model_ids(&["claude-sonnet-4-6"])),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/mo";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["/model".to_string()]
-        );
-    }
-
-    /// FIX #2: a double space after `/model` must not leave a leading space
-    /// in the extracted query — that would break the fuzzy match even
-    /// though `parse_model_command` (the real dispatcher) already tolerates
-    /// it via its own final `.trim()`.
-    #[test]
-    fn complete_model_argument_tolerates_double_space() {
-        let helper = ReplHelper {
-            models: Rc::new(model_ids(&["claude-sonnet-4-6", "gpt-4o"])),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/model  cla";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, line.len() - "cla".len());
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["claude-sonnet-4-6".to_string()]
-        );
-    }
+    // `parse_model_command`/`fuzzy_model_candidates` themselves are covered
+    // by `commands::model_list`'s own tests; the shared `ModelReplHelper`
+    // (Completer/Hinter) is now covered by `commands::repl`'s tests, since
+    // that's where it lives.
 }
