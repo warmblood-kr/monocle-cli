@@ -1,6 +1,6 @@
 [package]
 name = "monocle-cli"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 description = "Control and use Monocle AI from your terminal: log in, chat with models, run the agent, or integrate Claude Code."
 license = "MIT"
