@@ -28,6 +28,15 @@ pub enum LoopControl {
 /// untyped remainder of the best (first-ranked) candidate — or `None` if the
 /// cursor isn't at the end of the line (mid-line edits shouldn't grow a hint
 /// past the cursor) or there's nothing left to complete.
+///
+/// The comparison is case-insensitive (matching `fuzzy_model_candidates`'
+/// `ignore_case` matcher), but the hint text itself is always the
+/// candidate's own casing — so typing `/model CLA` against a cached
+/// `claude-...` id still ghosts `ude-...`, not a re-cased echo of what was
+/// typed. When the top candidate isn't a prefix of what's typed at all (a
+/// genuine subsequence match, e.g. `/model sonnet` matching
+/// `claude-sonnet-4-6`), there's no sensible ghost suffix and this returns
+/// `None`.
 pub fn hint_from_candidates(
     line: &str,
     start: usize,
@@ -39,7 +48,12 @@ pub fn hint_from_candidates(
     }
     let typed = &line[start..pos];
     let best = candidates.first()?;
-    best.replacement.strip_prefix(typed).map(str::to_string)
+    let candidate_head = best.replacement.get(..typed.len())?;
+    if candidate_head.eq_ignore_ascii_case(typed) {
+        Some(best.replacement[typed.len()..].to_string())
+    } else {
+        None
+    }
 }
 
 /// Dim an inline hint with ANSI, so both REPL helpers' `Highlighter::
@@ -114,4 +128,45 @@ pub fn run_repl<H: Helper>(
 
     let _ = rl.save_history(&history_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(id: &str) -> Pair {
+        Pair {
+            display: id.to_string(),
+            replacement: id.to_string(),
+        }
+    }
+
+    /// FIX #1: `fuzzy_model_candidates` matches case-insensitively, so the
+    /// top candidate for an all-caps query can differ in case from what was
+    /// typed — the hint must still appear, using the candidate's own
+    /// casing for the ghost suffix (not a case-sensitive `strip_prefix`,
+    /// which would silently return `None` here).
+    #[test]
+    fn hint_shows_case_insensitive_prefix_match_with_candidate_casing() {
+        let candidates = vec![pair("claude-sonnet-4-6")];
+        let line = "/model CLA";
+        let start = line.len() - "CLA".len();
+        assert_eq!(
+            hint_from_candidates(line, start, line.len(), &candidates),
+            Some("ude-sonnet-4-6".to_string())
+        );
+    }
+
+    /// A genuine subsequence (non-prefix) fuzzy match has no sensible ghost
+    /// suffix — `None` is correct, not a stripped/garbled remainder.
+    #[test]
+    fn hint_is_none_for_non_prefix_subsequence_match() {
+        let candidates = vec![pair("claude-sonnet-4-6")];
+        let line = "/model sonnet";
+        let start = line.len() - "sonnet".len();
+        assert_eq!(
+            hint_from_candidates(line, start, line.len(), &candidates),
+            None
+        );
+    }
 }

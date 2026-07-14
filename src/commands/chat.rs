@@ -179,10 +179,21 @@ impl ChatReplHelper {
         }
         // `/model <partial>` — fuzzy-match the argument against the cached
         // model ids, anchored just after "/model " (not column 0) so accepting
-        // a candidate replaces only the partial id.
-        if let Some(query) = head.strip_prefix("/model ") {
-            let start = head.len() - query.len();
-            return (start, fuzzy_model_candidates(&self.models, query));
+        // a candidate replaces only the partial id. Guarded (not a bare
+        // `head.strip_prefix("/model ")`) so a double space (`/model  cla`)
+        // still trims down to the right query instead of leaving a leading
+        // space that breaks the fuzzy match — `parse_model_command` (the real
+        // dispatcher) already tolerates this via its own final `.trim()`, so
+        // completion must too. `/models` (no separating space) still falls
+        // through to plain command-name completion below rather than being
+        // misread as `/model` with argument `s` — the same boundary
+        // `parse_model_command` draws.
+        if let Some(rest) = head.strip_prefix("/model") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let query = rest.trim_start();
+                let start = head.len() - query.len();
+                return (start, fuzzy_model_candidates(&self.models, query));
+            }
         }
         let candidates = CHAT_SLASH_COMMANDS
             .iter()
@@ -624,6 +635,30 @@ mod tests {
         let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
         assert_eq!(start, 0);
         assert!(candidates.is_empty());
+    }
+
+    /// FIX #2: a double space after `/model` must not leave a leading space
+    /// in the extracted query — that would break the fuzzy match even
+    /// though `parse_model_command` (the real dispatcher) already tolerates
+    /// it via its own final `.trim()`.
+    #[test]
+    fn complete_model_argument_tolerates_double_space() {
+        let helper = ChatReplHelper {
+            models: Rc::new(vec!["claude-sonnet-4-6".to_string(), "gpt-4o".to_string()]),
+        };
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+
+        let line = "/model  cla";
+        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
+        assert_eq!(start, line.len() - "cla".len());
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|p| p.replacement)
+                .collect::<Vec<_>>(),
+            vec!["claude-sonnet-4-6".to_string()]
+        );
     }
 
     #[test]
