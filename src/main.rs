@@ -9,7 +9,7 @@ use monocle_cli::commands::audio_transcribe::{audio_transcribe_command, AudioTra
 use monocle_cli::commands::audio_transcribe_azure::{
     audio_transcribe_azure_command, AudioTranscribeAzureOptions,
 };
-use monocle_cli::commands::chat::{chat_command, ChatOptions};
+use monocle_cli::commands::chat::{chat_command, chat_list_command, ChatOptions};
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
@@ -107,7 +107,12 @@ enum Commands {
     /// List available models from the Monocle router
     Models,
     /// Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
-    Chat(ChatArgs),
+    Chat {
+        #[command(subcommand)]
+        command: Option<ChatCommand>,
+        #[command(flatten)]
+        args: ChatArgs,
+    },
     /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
     Agent {
         /// The task/prompt (optional; omit to type it interactively, or pipe via stdin)
@@ -165,6 +170,19 @@ struct ChatArgs {
     /// (piped stdin) only — see also inband `file:<path>` tokens in the text.
     #[arg(long = "file")]
     file: Vec<String>,
+    /// Experimental: talk to jarvice's `/api/responses` instead of the plain
+    /// `/v1/chat/completions` — the server owns the conversation thread, so
+    /// this CLI doesn't accumulate history itself. jarvice-only (not reachable
+    /// through chat-proxy); no custom `--system-prompt` support (see
+    /// `responses_api` module docs).
+    #[arg(long)]
+    responses: bool,
+    /// With `--responses`, continue this existing server-side thread id
+    /// instead of starting a new one. When entering the interactive REPL,
+    /// its prior history is replayed to stderr before the prompt. (See also
+    /// `monocle chat list` to discover thread ids.)
+    #[arg(long)]
+    resume: Option<String>,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -175,8 +193,18 @@ impl From<ChatArgs> for ChatOptions {
             system_prompt_file: a.system_prompt_file,
             max_tokens: a.max_tokens,
             files: a.file,
+            responses: a.responses,
+            resume: a.resume,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum ChatCommand {
+    /// List existing jarvice chat threads (id/title/last-updated) — including
+    /// threads created from jarvice's own web UI, since both share the same
+    /// storage. Always lists jarvice's threads; doesn't take `--responses`.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -303,7 +331,10 @@ fn main() {
         }
         Commands::Acp => monocle_cli::acp::serve(),
         Commands::Models => model_list_command(&client, &creds),
-        Commands::Chat(args) => chat_command(&client, &creds, args.into()),
+        Commands::Chat { command, args } => match command {
+            Some(ChatCommand::List) => chat_list_command(&client, &creds),
+            None => chat_command(&client, &creds, args.into()),
+        },
         Commands::Agent {
             prompt,
             workdir,
@@ -444,8 +475,31 @@ mod tests {
     fn chat_file_flag_repeats_into_vec() {
         let cli = Cli::parse_from(["monocle", "chat", "--file", "a.png", "--file", "b.png"]);
         match cli.command {
-            Commands::Chat(args) => {
+            Commands::Chat { args, .. } => {
                 assert_eq!(args.file, vec!["a.png".to_string(), "b.png".to_string()]);
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_list_parses_as_list_subcommand() {
+        let cli = Cli::parse_from(["monocle", "chat", "list"]);
+        match cli.command {
+            Commands::Chat { command, .. } => {
+                assert!(matches!(command, Some(ChatCommand::List)));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_resume_flag_parses() {
+        let cli = Cli::parse_from(["monocle", "chat", "--responses", "--resume", "abc-123"]);
+        match cli.command {
+            Commands::Chat { command, args } => {
+                assert!(command.is_none());
+                assert_eq!(args.resume.as_deref(), Some("abc-123"));
             }
             _ => panic!("expected Chat command"),
         }

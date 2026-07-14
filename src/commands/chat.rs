@@ -1,22 +1,23 @@
 use std::io::{IsTerminal, Write};
 
-use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
-use rustyline::history::DefaultHistory;
-use rustyline::{Config, Context, Editor, Helper, Highlighter, Hinter, Validator};
 use serde_json::Value;
 
+use chrono::TimeZone;
+
 use crate::agent::providers::{
-    ChatRequest, ImageAttachment, LlmProvider, Message, MonocleProvider,
+    ChatRequest, ChatResponse, ImageAttachment, LlmProvider, Message, MonocleProvider,
 };
 use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
-use crate::auth::get_access_token;
+use crate::auth::{get_access_token, jarvice_url_for, AuthSession};
+use crate::commands::model_list::{fetch_model_ids, handle_model_command};
+use crate::commands::repl::{run_repl, LoopControl, ModelReplHelper};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
 use crate::net::Client;
 use crate::origin::auth_headers;
+use crate::responses_api::ResponsesClient;
 use crate::util::home_dir;
 
 pub struct ChatOptions {
@@ -26,6 +27,11 @@ pub struct ChatOptions {
     pub max_tokens: Option<String>,
     /// `--file <PATH|URL>` values (repeatable), one-shot only.
     pub files: Vec<String>,
+    /// `--responses`: talk to jarvice's `/api/responses` (server-managed
+    /// thread) instead of the plain `/v1/chat/completions` path.
+    pub responses: bool,
+    /// `--resume <ID>`: continue an existing `--responses` thread.
+    pub resume: Option<String>,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -40,21 +46,17 @@ fn resolve_max_tokens(flag: Option<&str>) -> Option<i64> {
 }
 
 /// One streaming chat turn via the shared provider (chat-proxy routing): assistant
-/// text deltas are written to stdout (and flushed) as they arrive.
+/// text deltas are written to stdout (and flushed) as they arrive. `messages` is
+/// the full request the caller has already assembled (system prompt + any prior
+/// turns + this turn) — this fn only executes the network call and returns the
+/// assembled response so the caller can append it to its own running history.
 fn call_chat(
     provider: &MonocleProvider,
     model: &str,
-    system_prompt: Option<&str>,
-    user_message: &str,
+    messages: Vec<Message>,
     max_tokens: Option<i64>,
     images: &[ImageAttachment],
-) -> Result<()> {
-    let mut messages = Vec::new();
-    if let Some(sp) = system_prompt {
-        messages.push(Message::system(sp));
-    }
-    messages.push(Message::user(user_message));
-
+) -> Result<ChatResponse> {
     let req = ChatRequest {
         model: model.to_string(),
         messages,
@@ -75,7 +77,48 @@ fn call_chat(
     if resp.truncated {
         eprintln!("\n⚠ the response was cut short (partial output shown).");
     }
-    Ok(())
+    Ok(resp)
+}
+
+/// Read piped stdin (if not a TTY) and resolve `--file` + inband `file:<path>`
+/// tokens into one one-shot turn — shared by both the plain-completions and
+/// `--responses` paths. Returns `None` on an interactive TTY (nothing piped).
+/// Exits the process on a bad attachment ref or empty input, matching this
+/// command's existing fail-fast one-shot behavior.
+fn read_one_shot_input(
+    stdin_is_tty: bool,
+    files: &[String],
+) -> Result<Option<(String, Vec<ImageAttachment>)>> {
+    if stdin_is_tty {
+        return Ok(None);
+    }
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let (cleaned_text, inband_refs) = attachment::extract_inband_refs(input.trim());
+
+    let mut refs: Vec<String> = files.to_vec();
+    refs.extend(inband_refs);
+
+    let mut images: Vec<ImageAttachment> = Vec::new();
+    for r in &refs {
+        match attachment::resolve(r) {
+            Ok(img) => images.push(img),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let cleaned_text = cleaned_text.trim().to_string();
+    // Image-only messages are valid — only bail when BOTH the text and the
+    // attachments are empty.
+    if cleaned_text.is_empty() && images.is_empty() {
+        eprintln!("No input provided via stdin.");
+        std::process::exit(1);
+    }
+
+    Ok(Some((cleaned_text, images)))
 }
 
 /// Resolve inband `file:<path>` refs in a REPL line into images, mirroring the
@@ -99,47 +142,24 @@ fn resolve_repl_attachments(
     Ok((cleaned_text.trim().to_string(), images))
 }
 
-/// The slash commands the REPL understands — just quitting, for now (chat has
-/// no `/help`/`/model`/`/config`/`/status`, unlike `monocle agent`'s REPL).
-const CHAT_SLASH_COMMANDS: &[&str] = &["/exit", "/quit"];
+/// The slash commands the REPL understands. `/model` mirrors `monocle
+/// agent`'s REPL (switches the model for subsequent turns); chat still has no
+/// `/help`/`/config`/`/status`.
+const CHAT_SLASH_COMMANDS: &[&str] = &["/model", "/exit", "/quit"];
 
-/// rustyline line helper for `monocle chat`'s REPL: Tab-completes the two
-/// slash commands. Hinting/highlighting/validation are the derived no-op
-/// defaults — multi-line handling comes from `bracketed_paste`, not a custom
-/// `Validator`. Deliberately simpler than `agent.rs`'s `ReplHelper` (no
-/// `/model`-argument fuzzy completion, no model-id list to carry).
-#[derive(Helper, Hinter, Highlighter, Validator)]
-struct ChatReplHelper;
-
-impl Completer for ChatReplHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        // Only offer completion for a slash-command being typed at line start.
-        let head = &line[..pos];
-        if !head.starts_with('/') {
-            return Ok((0, Vec::new()));
-        }
-        let candidates = CHAT_SLASH_COMMANDS
-            .iter()
-            .filter(|cmd| cmd.starts_with(head))
-            .map(|cmd| Pair {
-                display: cmd.to_string(),
-                replacement: cmd.to_string(),
-            })
-            .collect();
-        // Replace from column 0 (the whole slash token starts there).
-        Ok((0, candidates))
+pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    if options.responses {
+        run_responses_chat(client, creds, options)
+    } else {
+        run_completions_chat(client, creds, options)
     }
 }
 
-pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
-    let model = options
+/// The default path: a stateless `/v1/chat/completions` call per turn, with
+/// this REPL accumulating the growing conversation itself (see `convo` below)
+/// and resending it in full each turn.
+fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    let mut model = options
         .model
         .as_deref()
         .unwrap_or(DEFAULT_MODEL)
@@ -178,37 +198,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     // Read stdin + resolve any attachments — cheap, local-only work that
     // should fail fast (bad path, unsupported MIME) before the second network
     // call (model-ID validation) below, but after the auth check above.
-    let one_shot_input: Option<(String, Vec<ImageAttachment>)> = if !stdin_is_tty {
-        let mut input = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-        let (cleaned_text, inband_refs) = attachment::extract_inband_refs(input.trim());
-
-        let mut refs: Vec<String> = options.files.clone();
-        refs.extend(inband_refs);
-
-        let mut images: Vec<ImageAttachment> = Vec::new();
-        for r in &refs {
-            match attachment::resolve(r) {
-                Ok(img) => images.push(img),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-
-        let cleaned_text = cleaned_text.trim().to_string();
-        // Image-only messages are valid — only bail when BOTH the text and the
-        // attachments are empty.
-        if cleaned_text.is_empty() && images.is_empty() {
-            eprintln!("No input provided via stdin.");
-            std::process::exit(1);
-        }
-
-        Some((cleaned_text, images))
-    } else {
-        None
-    };
+    let one_shot_input = read_one_shot_input(stdin_is_tty, &options.files)?;
 
     // Resolve system prompt.
     let system_prompt: Option<String> = if let Some(path) = &options.system_prompt_file {
@@ -221,7 +211,12 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         options.system_prompt.clone()
     };
 
-    // Validate the model ID against the available models (non-fatal on failure).
+    // Validate the model ID against the available models (non-fatal on
+    // failure), and keep the full id list around — reused below as the
+    // interactive REPL's `/model` completion candidates instead of a second
+    // fetch (`agent.rs`'s REPL fetches separately since it has no equivalent
+    // startup validation call to piggyback on).
+    let mut model_ids: Vec<String> = Vec::new();
     if let Ok(resp) = client.get(
         &format!("{router_url}{}", endpoints::MODELS),
         &auth_headers(&bearer),
@@ -245,6 +240,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
                     }
                     std::process::exit(1);
                 }
+                model_ids = ids;
             }
         }
     }
@@ -255,14 +251,12 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     if let Some((text, images)) = one_shot_input {
         eprintln!("Using model: {model}");
         eprintln!("Router: {router_url}");
-        call_chat(
-            &provider,
-            &model,
-            system_prompt.as_deref(),
-            &text,
-            max_tokens,
-            &images,
-        )?;
+        let mut messages = Vec::new();
+        if let Some(sp) = &system_prompt {
+            messages.push(Message::system(sp));
+        }
+        messages.push(Message::user(&text));
+        call_chat(&provider, &model, messages, max_tokens, &images)?;
         let mut out = std::io::stdout();
         out.write_all(b"\n")?;
         out.flush()?;
@@ -276,160 +270,318 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
         eprintln!("System prompt loaded ({} chars)", sp.chars().count());
     }
     eprintln!("Type your message. Press Ctrl+D to exit.");
-    eprintln!("↑/↓ history, Tab completes /quit, /exit — a multi-line paste is one input.");
+    eprintln!("↑/↓ history, Tab completes /model, /quit, /exit — a multi-line paste is one input.");
     eprintln!("---");
 
-    // rustyline gives the input line proper editing (←/→, ↑/↓ history, Emacs
-    // Ctrl-A/E/K/Y) with its default Emacs keymap + file history, mirroring
-    // `monocle agent`'s REPL (`src/commands/agent.rs`). `bracketed_paste(true)`
-    // makes a multi-line paste arrive as a single input buffer (submitted only
-    // on Enter) instead of each embedded newline being read as a separate
-    // accept-line → separate turn.
-    let config = Config::builder().bracketed_paste(true).build();
-    let mut rl: Editor<ChatReplHelper, DefaultHistory> =
-        Editor::with_config(config).map_err(|e| crate::error::AppError::new(e.to_string()))?;
-    rl.set_helper(Some(ChatReplHelper));
     // Separate history file from `monocle agent`'s — the two REPLs' histories
-    // stay independent.
+    // stay independent. The Editor build, bracketed-paste config, history
+    // load/save, and the Ctrl-C/Ctrl-D/error loop itself are shared with
+    // `monocle agent`'s REPL via `commands::repl::run_repl`.
     let history_path = home_dir().join(".monocle").join("chat_history");
-    if let Some(parent) = history_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let helper = ModelReplHelper {
+        commands: CHAT_SLASH_COMMANDS,
+        models: model_ids,
+    };
+
+    // Conversation memory: mirrors `monocle agent`'s `Repl.convo` — grows for
+    // the life of the process instead of `call_chat` rebuilding a one-message
+    // request every turn (the REPL used to have no memory of earlier turns at
+    // all). Seeded once with the system prompt, if any.
+    let mut convo: Vec<Message> = Vec::new();
+    if let Some(sp) = &system_prompt {
+        convo.push(Message::system(sp));
     }
-    // Best-effort history persistence: a missing/unreadable file just means an
-    // empty history this session.
-    let _ = rl.load_history(&history_path);
 
-    let prompt = "> ";
-    loop {
-        match rl.readline(prompt) {
-            Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // History gets the raw typed line (before `file:` tokens are
-                // stripped) — recalling it via ↑ should show what was actually
-                // typed, matching the non-attachment behavior this REPL already
-                // had.
-                let _ = rl.add_history_entry(line.as_str());
-                if trimmed == "/quit" || trimmed == "/exit" {
-                    eprintln!("Bye.");
-                    break;
-                }
+    run_repl(helper, history_path, "> ", |trimmed| {
+        if trimmed == "/quit" || trimmed == "/exit" {
+            eprintln!("Bye.");
+            return Ok(LoopControl::Quit);
+        }
+        // `/model` switches the model for subsequent turns — handled before
+        // the general dispatch since it carries an argument, same as
+        // `monocle agent`'s REPL.
+        if handle_model_command(trimmed, &mut model) {
+            return Ok(LoopControl::Continue);
+        }
 
-                let (text, images) = match resolve_repl_attachments(trimmed) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // Same per-turn recovery as a `call_chat` error below:
-                        // print and go back to the prompt, no `call_chat` call
-                        // for this turn.
-                        eprintln!("Error: {e}");
-                        eprintln!();
-                        continue;
-                    }
-                };
-
+        let (text, images) = match resolve_repl_attachments(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                // Same per-turn recovery as a `call_chat` error below: print
+                // and go back to the prompt, no `call_chat` call this turn.
+                eprintln!("Error: {e}");
                 eprintln!();
-                // Reset before this turn's work runs, so the hint below reflects
-                // only whether *this* turn logged a network error — not a stale
-                // flag left over from an earlier one (this REPL loops for the
-                // life of the process, same as `monocle agent`'s).
-                crate::diag::reset();
-                match call_chat(
-                    &provider,
-                    &model,
-                    system_prompt.as_deref(),
-                    &text,
-                    max_tokens,
-                    &images,
-                ) {
-                    Ok(()) => {
-                        let mut out = std::io::stdout();
-                        out.write_all(b"\n\n")?;
-                        out.flush()?;
-                    }
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        if crate::diag::was_logged() {
-                            eprintln!("  (details logged to {})", crate::diag::display_path());
-                        }
-                        eprintln!();
-                    }
-                }
+                return Ok(LoopControl::Continue);
             }
-            // Ctrl-C: don't quit — just start a fresh prompt (matches `monocle
-            // agent`'s idle-prompt behavior).
-            Err(ReadlineError::Interrupted) => continue,
-            // Ctrl-D (EOF): quit, matching the previous read_line behavior.
-            Err(ReadlineError::Eof) => {
-                eprintln!("Bye.");
-                break;
+        };
+
+        eprintln!();
+        // Reset before this turn's work runs, so the hint below reflects only
+        // whether *this* turn logged a network error — not a stale flag left
+        // over from an earlier one (this REPL loops for the life of the
+        // process, same as `monocle agent`'s).
+        crate::diag::reset();
+        // Roll back this turn's user message on failure (mirrors `monocle
+        // agent`'s `Repl::run_turn` mark/truncate) so a failed turn doesn't
+        // leave a dangling, reply-less user message in the history sent next time.
+        let mark = convo.len();
+        convo.push(Message::user(text));
+        match call_chat(&provider, &model, convo.clone(), max_tokens, &images) {
+            Ok(resp) => {
+                convo.push(Message::assistant(resp.content));
+                let mut out = std::io::stdout();
+                out.write_all(b"\n\n")?;
+                out.flush()?;
             }
             Err(e) => {
+                convo.truncate(mark);
                 eprintln!("Error: {e}");
-                break;
+                if crate::diag::was_logged() {
+                    eprintln!("  (details logged to {})", crate::diag::display_path());
+                }
+                eprintln!();
+            }
+        }
+        Ok(LoopControl::Continue)
+    })
+}
+
+/// Resolve a validated session + jarvice's own base URL + a ready-to-use
+/// `Authorization` header value — shared by `run_responses_chat` and
+/// `chat_list_command`, since both need the same auth + jarvice-host
+/// resolution. Deliberately `jarvice_url_for`, NOT `session.router_url`
+/// (chat-proxy) — see `responses_api` module docs for why.
+fn resolve_jarvice(client: &Client, creds: &Credentials) -> Result<(AuthSession, String, String)> {
+    let session = get_access_token(client, creds);
+    let stored = creds.read().ok_or_else(|| {
+        crate::error::AppError::new("Not logged in. Run `monocle login --tenant <domain>` first.")
+    })?;
+    let jarvice_url = jarvice_url_for(&stored);
+    let bearer = format!("Bearer {}", session.token);
+    Ok((session, jarvice_url, bearer))
+}
+
+/// `monocle chat list` — list the current user's existing jarvice threads
+/// (id/title/last-updated) and exit. Always jarvice's thread storage — there
+/// is nothing else to list in the plain completions mode, so this never takes
+/// a `--responses` flag.
+pub fn chat_list_command(client: &Client, creds: &Credentials) -> Result<()> {
+    let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
+    let threads = crate::jarvice_chats::list_threads(client, &jarvice_url, &bearer)?;
+    print_threads_table(&threads);
+    Ok(())
+}
+
+/// `--responses`: jarvice's `/api/responses` (see `responses_api` module
+/// docs). The server owns the conversation thread — this REPL only tracks
+/// the `thread_id` to pass on the next turn, never a local message history.
+///
+/// jarvice-only (not reachable through chat-proxy's `router_url`); no custom
+/// `--system-prompt`/`--max-tokens` support (the endpoint has no such
+/// fields) — both are warned-and-ignored rather than silently dropped.
+fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    let mut model = options
+        .model
+        .as_deref()
+        .unwrap_or(DEFAULT_MODEL)
+        .to_string();
+
+    if options.max_tokens.is_some() {
+        eprintln!("⚠ --max-tokens is ignored with --responses (jarvice's Responses API has no such field)");
+    }
+    if options.system_prompt.is_some() || options.system_prompt_file.is_some() {
+        eprintln!("⚠ --system-prompt/--system-prompt-file is ignored with --responses (the endpoint has no generic system-prompt field, only a voice-mode speech_system_context)");
+    }
+
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    if !options.files.is_empty() && stdin_is_tty {
+        eprintln!(
+            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle chat --responses --file photo.png"
+        );
+        std::process::exit(1);
+    }
+
+    // Auth FIRST, same rationale as the completions path — an expired/missing
+    // login must surface before any local-input error masks it.
+    let (session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
+
+    let one_shot_input = read_one_shot_input(stdin_is_tty, &options.files)?;
+
+    let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
+
+    if let Some((text, images)) = one_shot_input {
+        eprintln!("Using model: {model}");
+        eprintln!("jarvice: {jarvice_url}");
+        let reply = rc.respond(&model, &text, &images, options.resume.as_deref())?;
+        println!("{}", reply.content);
+        if let Some(id) = reply.thread_id {
+            eprintln!("Thread: {id}");
+        }
+        return Ok(());
+    }
+
+    // Interactive REPL.
+    eprintln!("Monocle Chat — Responses API (model: {model})");
+    eprintln!("jarvice: {jarvice_url}");
+    eprintln!("Type your message. Press Ctrl+D to exit.");
+    eprintln!("↑/↓ history, Tab completes /model, /quit, /exit — a multi-line paste is one input.");
+    eprintln!("The server owns this conversation's thread — no local history is resent.");
+    eprintln!("---");
+
+    let history_path = home_dir().join(".monocle").join("chat_history");
+    // Not a `Vec<Message>` like `run_completions_chat`'s `convo` — the server
+    // persists the conversation; this is just the id to hand back next turn.
+    let mut thread_id: Option<String> = options.resume.clone();
+    // Best-effort, same defensive posture as `agent.rs`'s REPL: this path has
+    // no startup model-list fetch to piggyback on (unlike the completions
+    // path's validation call), so fetch once here for `/model` completion.
+    let model_ids = fetch_model_ids(client, creds).unwrap_or_default();
+    let helper = ModelReplHelper {
+        commands: CHAT_SLASH_COMMANDS,
+        models: model_ids,
+    };
+
+    // Replay prior history for an existing thread, REPL-only (never in the
+    // one-shot path above, never on stdout — this repo treats stdout as
+    // strictly the answer/data channel). A fetch failure must not block
+    // continuing the thread, so it's a warning, not a propagated error.
+    if let Some(id) = &thread_id {
+        match crate::jarvice_chats::get_thread(client, &jarvice_url, &bearer, id) {
+            Ok(detail) => {
+                let turns = detail
+                    .current_id
+                    .as_deref()
+                    .map(|cur| crate::jarvice_chats::linearize(&detail.messages, cur))
+                    .unwrap_or_default();
+                if !turns.is_empty() {
+                    eprintln!("--- prior history ---");
+                    for node in turns {
+                        match node.role.as_str() {
+                            "user" => eprintln!("> {}", node.content),
+                            "assistant" => eprintln!("{}", node.content),
+                            _ => {}
+                        }
+                    }
+                    eprintln!("--- end history ---");
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: could not load thread history: {e}");
             }
         }
     }
 
-    let _ = rl.save_history(&history_path);
-    Ok(())
+    run_repl(helper, history_path, "> ", |trimmed| {
+        if trimmed == "/quit" || trimmed == "/exit" {
+            eprintln!("Bye.");
+            return Ok(LoopControl::Quit);
+        }
+        // `/model` switches the model for subsequent turns — handled before
+        // the general dispatch since it carries an argument, same as
+        // `monocle agent`'s REPL.
+        if handle_model_command(trimmed, &mut model) {
+            return Ok(LoopControl::Continue);
+        }
+
+        let (text, images) = match resolve_repl_attachments(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                eprintln!();
+                return Ok(LoopControl::Continue);
+            }
+        };
+
+        eprintln!();
+        crate::diag::reset();
+        match rc.respond(&model, &text, &images, thread_id.as_deref()) {
+            Ok(reply) => {
+                println!("{}", reply.content);
+                // Announce the thread id only when it's newly learned (the
+                // first turn) or changed — not on every turn, since it's
+                // normally stable for the rest of the session.
+                if reply.thread_id.is_some() && thread_id != reply.thread_id {
+                    thread_id = reply.thread_id;
+                    if let Some(id) = &thread_id {
+                        eprintln!("Thread: {id}");
+                    }
+                }
+                println!();
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                if crate::diag::was_logged() {
+                    eprintln!("  (details logged to {})", crate::diag::display_path());
+                }
+                eprintln!();
+            }
+        }
+        Ok(LoopControl::Continue)
+    })
+}
+
+/// Render `monocle chat list`'s table to stdout — this is a terminal
+/// print-and-exit command (like `monocle models`), so stdout is the correct
+/// channel here, unlike the history-replay path below.
+fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
+    use crate::commands::model_list::pad;
+
+    if threads.is_empty() {
+        eprintln!("No threads found.");
+        return;
+    }
+
+    let id_width = threads
+        .iter()
+        .map(|t| t.id.chars().count())
+        .chain([9])
+        .max()
+        .unwrap();
+    let title_width = threads
+        .iter()
+        .map(|t| t.title.chars().count())
+        .chain([5])
+        .max()
+        .unwrap();
+
+    let mut out = std::io::stdout();
+    let _ = writeln!(
+        out,
+        "{}  {}  UPDATED",
+        pad("THREAD ID", id_width),
+        pad("TITLE", title_width)
+    );
+    let _ = writeln!(
+        out,
+        "{}  {}  {}",
+        "─".repeat(id_width),
+        "─".repeat(title_width),
+        "─".repeat(16)
+    );
+    for t in threads {
+        let updated = chrono::Utc
+            .timestamp_opt(t.updated_at, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            out,
+            "{}  {}  {}",
+            pad(&t.id, id_width),
+            pad(&t.title, title_width),
+            updated
+        );
+    }
+    eprintln!("\n{} thread(s).", threads.len());
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_max_tokens, resolve_repl_attachments, ChatReplHelper};
-    use rustyline::completion::Completer;
-    use rustyline::history::DefaultHistory;
-    use rustyline::Context;
+    use super::{resolve_max_tokens, resolve_repl_attachments};
 
-    #[test]
-    fn complete_slash_command_narrows_to_matching_prefix() {
-        let helper = ChatReplHelper;
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/qu";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["/quit".to_string()]
-        );
-    }
-
-    #[test]
-    fn complete_bare_slash_offers_both_commands() {
-        let helper = ChatReplHelper;
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["/exit".to_string(), "/quit".to_string()]
-        );
-    }
-
-    #[test]
-    fn complete_non_slash_text_offers_nothing() {
-        let helper = ChatReplHelper;
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "hello";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert!(candidates.is_empty());
-    }
+    // The shared `ModelReplHelper` (Completer/Hinter, slash-command +
+    // `/model` fuzzy completion) now lives in `commands::repl` and is
+    // covered there, since that's where its Completer/Hinter impls live.
 
     #[test]
     fn absent_flag_omits() {

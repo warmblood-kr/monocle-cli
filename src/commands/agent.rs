@@ -6,14 +6,7 @@
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::rc::Rc;
 
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
-use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
-use rustyline::history::DefaultHistory;
-use rustyline::{Config, Context, Editor, Helper, Highlighter, Hinter, Validator};
 use serde_json::Value;
 
 use crate::agent::commands::{config_text, help_text, login_view, status_text};
@@ -24,7 +17,8 @@ use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::agent::SYSTEM_PROMPT;
 use crate::auth::get_access_token;
 use crate::colors as c;
-use crate::commands::model_list::fetch_model_ids;
+use crate::commands::model_list::{fetch_model_ids, handle_model_command};
+use crate::commands::repl::{run_repl, LoopControl, ModelReplHelper};
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
@@ -75,83 +69,6 @@ impl Observer for CliObserver {
 /// by `/help`. Kept here (next to the dispatcher) so completion never drifts from
 /// what `dispatch_command` / `parse_model_command` actually handle.
 const SLASH_COMMANDS: &[&str] = &["/help", "/config", "/status", "/model", "/exit", "/quit"];
-
-/// rustyline line helper: Tab-completes slash commands, and (for `/model`)
-/// fuzzy-completes the argument against a model id list fetched once at REPL
-/// startup. Hinting/highlighting/validation are the derived no-op defaults —
-/// we only customize completion.
-#[derive(Helper, Hinter, Highlighter, Validator)]
-struct ReplHelper {
-    /// Model ids fetched once before the loop starts (see `agent_command`).
-    /// Empty when not logged in / the fetch failed — `/model` completion then
-    /// just offers no candidates, same defensive posture as the rest of the
-    /// interactive path. `Rc` because `Editor::set_helper` takes ownership and
-    /// the list is read-only for the session's lifetime (no need for a `Vec`
-    /// clone per keystroke).
-    models: Rc<Vec<String>>,
-}
-
-impl Completer for ReplHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        // Only offer completion for a slash-command being typed at the line start.
-        let head = &line[..pos];
-        if !head.starts_with('/') {
-            return Ok((0, Vec::new()));
-        }
-        // `/model <partial>` — fuzzy-match the argument against the cached model
-        // ids instead of the flat command-name list, so `/model cla<TAB>` narrows
-        // to matching ids and a bare `/model <TAB>` shows the full dropdown.
-        // Replace only from just after "/model " (not column 0, unlike the
-        // command-name path below) — we're completing the argument, not the
-        // command word.
-        if let Some(query) = head.strip_prefix("/model ") {
-            let start = head.len() - query.len();
-            return Ok((start, fuzzy_model_candidates(&self.models, query)));
-        }
-        let candidates = SLASH_COMMANDS
-            .iter()
-            .filter(|cmd| cmd.starts_with(head))
-            .map(|cmd| Pair {
-                display: cmd.to_string(),
-                replacement: cmd.to_string(),
-            })
-            .collect();
-        // Replace from column 0 (the whole slash token starts there).
-        Ok((0, candidates))
-    }
-}
-
-/// Fuzzy-match `query` against cached model ids for `/model` tab-completion.
-/// An empty query returns the full list unranked (the "show me what's
-/// available" dropdown); otherwise ids are scored with `fuzzy-matcher`'s skim
-/// algorithm (subsequence match, case-smart), kept only if they match at all,
-/// and sorted best match first.
-fn fuzzy_model_candidates(models: &[String], query: &str) -> Vec<Pair> {
-    let to_pair = |id: &String| Pair {
-        display: id.clone(),
-        replacement: id.clone(),
-    };
-    if query.is_empty() {
-        return models.iter().map(to_pair).collect();
-    }
-    // `ignore_case` (not the default smart-case) so typing in any case still
-    // narrows the (lowercase-by-convention) model ids — smart-case would make
-    // an all-caps query like "CLAUDE" match nothing.
-    let matcher = SkimMatcherV2::default().ignore_case();
-    let mut scored: Vec<(i64, &String)> = models
-        .iter()
-        .filter_map(|id| matcher.fuzzy_match(id, query).map(|score| (score, id)))
-        .collect();
-    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-    scored.into_iter().map(|(_, id)| to_pair(id)).collect()
-}
 
 /// Interactive approver: prompts the user (stderr) before each side-effecting
 /// tool call and reads a y/N answer from stdin. Default (empty / non-y / EOF) is
@@ -305,23 +222,6 @@ fn dispatch_command(input: &str) -> Command {
     }
 }
 
-/// Pure parser for the `/model` command. Returns:
-/// - `None` — not a `/model` invocation (let normal dispatch handle it);
-/// - `Some(None)` — bare `/model` (show the current model);
-/// - `Some(Some(id))` — `/model <id>` (switch to `id`).
-fn parse_model_command(input: &str) -> Option<Option<String>> {
-    let trimmed = input.trim();
-    if trimmed == "/model" {
-        return Some(None);
-    }
-    let rest = trimmed.strip_prefix("/model ")?.trim();
-    if rest.is_empty() {
-        Some(None)
-    } else {
-        Some(Some(rest.to_string()))
-    }
-}
-
 pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -> Result<()> {
     let workdir = opts
         .workdir
@@ -429,35 +329,18 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     // ONLY here, on the interactive TTY path — the headless / piped / ACP paths
     // above never touch it, keeping the engine UI-free (CLAUDE.md 설계 원칙:
     // rich UI is the host's job via `monocle acp`). This is input-line editing
-    // only; it does not take over scrollback/paging.
+    // only; it does not take over scrollback/paging. The Editor build,
+    // bracketed-paste config, history load/save, and the Ctrl-C/Ctrl-D/error
+    // loop itself are shared with `monocle chat`'s REPL via
+    // `commands::repl::run_repl`; only the helper (Tab-completion) and the
+    // per-line dispatch below are specific to this REPL.
     //
-    // `bracketed_paste(true)` makes a multi-line paste arrive as a SINGLE input
-    // buffer (submitted only on Enter) instead of each embedded newline being read
-    // as a separate accept-line → separate turn. This is already rustyline 14's
-    // default (`Config::default().enable_bracketed_paste == true`), so on a
-    // terminal that supports bracketed paste it worked before too; we set it
-    // explicitly (via `Editor::with_config`, replacing `DefaultEditor`) to make
-    // the guarantee visible and stop line-splitting regressing if the default
-    // changes. The `ReplHelper` adds Tab-completion of slash commands.
-    let config = Config::builder().bracketed_paste(true).build();
-    let mut rl: Editor<ReplHelper, DefaultHistory> =
-        Editor::with_config(config).map_err(|e| crate::error::AppError::new(e.to_string()))?;
-    rl.set_helper(Some(ReplHelper {
-        models: Rc::new(model_ids),
-    }));
-    let history_path = home_dir().join(".monocle").join("agent_history");
-    if let Some(parent) = history_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Best-effort history persistence: a missing/unreadable file just means an
-    // empty history this session.
-    let _ = rl.load_history(&history_path);
-
     // rustyline reads the prompt in raw mode, where Ctrl-C surfaces as
     // `Interrupted` WITHOUT raising SIGINT — so the `ctrlc` turn-cancel handler
     // is not triggered at the idle prompt (we just start a fresh line). During a
     // turn the terminal is back in cooked mode, so Ctrl-C raises SIGINT and that
     // handler cancels the running turn, exactly as before.
+    //
     // Plain, uncolored — a prompt string handed to `rl.readline()` must not
     // carry raw ANSI escapes. rustyline computes the prompt's on-screen width
     // by skipping recognized escape sequences (0-width), but on Windows the
@@ -466,97 +349,81 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     // the escapes print as literal characters, so rustyline's cursor-column
     // math (0-width) diverges from the terminal's real cursor position —
     // seen as the cursor sitting ~10 columns in in PowerShell before any input.
-    let prompt = "» ".to_string();
-    loop {
-        match rl.readline(&prompt) {
-            Ok(line) => {
-                let msg = line.trim();
-                if msg.is_empty() {
-                    continue;
-                }
-                let _ = rl.add_history_entry(line.as_str());
-                // `/model` switches the model for subsequent turns (handled before
-                // the general dispatch since it carries an argument).
-                if let Some(model_cmd) = parse_model_command(msg) {
-                    match model_cmd {
-                        Some(id) => {
-                            eprintln!("{}", c::dim(&format!("model → {id}")));
-                            repl.model = id;
-                        }
-                        None => eprintln!("{}", c::dim(&format!("model: {}", repl.model))),
-                    }
-                    continue;
-                }
-                // Slash commands are handled locally (never sent to the agent/LLM),
-                // and printed to stderr so stdout stays the clean answer channel.
-                match dispatch_command(msg) {
-                    Command::Quit => {
-                        eprintln!("Bye.");
-                        break;
-                    }
-                    Command::Help => eprintln!("{}", help_text()),
-                    Command::Config => eprintln!(
-                        "{}",
-                        config_text(
-                            &repl.model,
-                            repl.max_steps,
-                            &repl.workdir,
-                            repl.session_name()
-                        )
-                    ),
-                    Command::Status => {
-                        let login = login_view(repl.creds);
+    let helper = ModelReplHelper {
+        commands: SLASH_COMMANDS,
+        models: model_ids,
+    };
+    let history_path = home_dir().join(".monocle").join("agent_history");
+
+    run_repl(helper, history_path, "» ", |msg| {
+        // `/model` switches the model for subsequent turns (handled before
+        // the general dispatch since it carries an argument).
+        if handle_model_command(msg, &mut repl.model) {
+            return Ok(LoopControl::Continue);
+        }
+        // Slash commands are handled locally (never sent to the agent/LLM),
+        // and printed to stderr so stdout stays the clean answer channel.
+        match dispatch_command(msg) {
+            Command::Quit => {
+                eprintln!("Bye.");
+                Ok(LoopControl::Quit)
+            }
+            Command::Help => {
+                eprintln!("{}", help_text());
+                Ok(LoopControl::Continue)
+            }
+            Command::Config => {
+                eprintln!(
+                    "{}",
+                    config_text(
+                        &repl.model,
+                        repl.max_steps,
+                        &repl.workdir,
+                        repl.session_name()
+                    )
+                );
+                Ok(LoopControl::Continue)
+            }
+            Command::Status => {
+                let login = login_view(repl.creds);
+                eprintln!(
+                    "{}",
+                    status_text(
+                        login.as_ref(),
+                        &repl.model,
+                        repl.max_steps,
+                        &repl.workdir,
+                        repl.session_name(),
+                    )
+                );
+                Ok(LoopControl::Continue)
+            }
+            Command::Unknown(cmd) => {
+                eprintln!("unknown command: {cmd} (try /help)");
+                Ok(LoopControl::Continue)
+            }
+            Command::Turn => {
+                // Reset before this turn's work runs, so the hint below
+                // reflects only whether *this* turn logged a network error —
+                // not a stale flag left over from an earlier one.
+                crate::diag::reset();
+                // A transient per-turn error must not tear down the session.
+                if let Err(e) = repl.run_turn(msg.to_string()) {
+                    eprintln!("{} {e}", c::red("Error:"));
+                    if crate::diag::was_logged() {
                         eprintln!(
-                            "{}",
-                            status_text(
-                                login.as_ref(),
-                                &repl.model,
-                                repl.max_steps,
-                                &repl.workdir,
-                                repl.session_name(),
-                            )
+                            "  {}",
+                            c::dim(&format!(
+                                "(details logged to {})",
+                                crate::diag::display_path()
+                            ))
                         );
                     }
-                    Command::Unknown(cmd) => {
-                        eprintln!("unknown command: {cmd} (try /help)");
-                    }
-                    Command::Turn => {
-                        // Reset before this turn's work runs, so the hint below
-                        // reflects only whether *this* turn logged a network
-                        // error — not a stale flag left over from an earlier one.
-                        crate::diag::reset();
-                        // A transient per-turn error must not tear down the session.
-                        if let Err(e) = repl.run_turn(msg.to_string()) {
-                            eprintln!("{} {e}", c::red("Error:"));
-                            if crate::diag::was_logged() {
-                                eprintln!(
-                                    "  {}",
-                                    c::dim(&format!(
-                                        "(details logged to {})",
-                                        crate::diag::display_path()
-                                    ))
-                                );
-                            }
-                        }
-                    }
                 }
-            }
-            // Ctrl-C at the idle prompt: don't quit — just start a fresh prompt.
-            Err(ReadlineError::Interrupted) => continue,
-            // Ctrl-D (EOF): quit, matching the previous read_line behavior.
-            Err(ReadlineError::Eof) => {
-                eprintln!("Bye.");
-                break;
-            }
-            Err(e) => {
-                eprintln!("{} {e}", c::red("Error:"));
-                break;
+                Ok(LoopControl::Continue)
             }
         }
-    }
-
-    let _ = rl.save_history(&history_path);
-    Ok(())
+    })
 }
 
 /// Collapse whitespace and truncate, for compact one-line progress output.
@@ -621,128 +488,8 @@ mod tests {
         assert!(!use_prompt_approver(true, false));
     }
 
-    #[test]
-    fn parse_model_command_variants() {
-        // Not a /model command.
-        assert_eq!(parse_model_command("hello"), None);
-        assert_eq!(parse_model_command("/models"), None);
-        assert_eq!(parse_model_command("/help"), None);
-        // Bare /model (with or without surrounding / trailing space) shows current.
-        assert_eq!(parse_model_command("/model"), Some(None));
-        assert_eq!(parse_model_command("  /model  "), Some(None));
-        assert_eq!(parse_model_command("/model   "), Some(None));
-        // /model <id> switches.
-        assert_eq!(
-            parse_model_command("/model gpt-4o"),
-            Some(Some("gpt-4o".to_string()))
-        );
-        assert_eq!(
-            parse_model_command("/model  claude-x  "),
-            Some(Some("claude-x".to_string()))
-        );
-    }
-
-    fn model_ids(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn fuzzy_model_candidates_empty_query_returns_full_list_unranked() {
-        let models = model_ids(&["claude-sonnet-4-6", "gpt-4o", "claude-opus-4"]);
-        let got: Vec<String> = fuzzy_model_candidates(&models, "")
-            .into_iter()
-            .map(|p| p.replacement)
-            .collect();
-        assert_eq!(got, models);
-    }
-
-    #[test]
-    fn fuzzy_model_candidates_narrows_by_subsequence() {
-        let models = model_ids(&["claude-sonnet-4-6", "gpt-4o", "claude-opus-4"]);
-        let got: Vec<String> = fuzzy_model_candidates(&models, "cla")
-            .into_iter()
-            .map(|p| p.replacement)
-            .collect();
-        assert_eq!(got, vec!["claude-sonnet-4-6", "claude-opus-4"]);
-    }
-
-    #[test]
-    fn fuzzy_model_candidates_ranks_tighter_match_first() {
-        // "gpt4o" as a subsequence appears in both, but a contiguous match in
-        // "gpt-4o" should outrank the more scattered match in "gpt-4-omni".
-        let models = model_ids(&["gpt-4-omni", "gpt-4o"]);
-        let got: Vec<String> = fuzzy_model_candidates(&models, "gpt4o")
-            .into_iter()
-            .map(|p| p.replacement)
-            .collect();
-        assert_eq!(got.first().map(String::as_str), Some("gpt-4o"));
-    }
-
-    #[test]
-    fn fuzzy_model_candidates_excludes_non_matches() {
-        let models = model_ids(&["claude-sonnet-4-6", "gpt-4o"]);
-        let got = fuzzy_model_candidates(&models, "zzz");
-        assert!(got.is_empty());
-    }
-
-    #[test]
-    fn fuzzy_model_candidates_case_insensitive() {
-        let models = model_ids(&["claude-sonnet-4-6"]);
-        let got = fuzzy_model_candidates(&models, "CLAUDE");
-        assert_eq!(got.len(), 1);
-    }
-
-    /// The completion `start` offset is what rustyline uses to splice the
-    /// chosen candidate back into the line — get it wrong and accepting a
-    /// completion corrupts the line. For `/model <partial>` it must point
-    /// just past `"/model "`, not column 0 (unlike the command-name path),
-    /// so accepting a candidate replaces only the partial id.
-    #[test]
-    fn complete_model_argument_uses_offset_after_prefix() {
-        let helper = ReplHelper {
-            models: Rc::new(model_ids(&["claude-sonnet-4-6", "gpt-4o"])),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/model cla";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, "/model ".len());
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["claude-sonnet-4-6".to_string()]
-        );
-
-        // Bare "/model " (empty partial) offers the full dropdown, still
-        // anchored right after the prefix.
-        let line = "/model ";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, "/model ".len());
-        assert_eq!(candidates.len(), 2);
-    }
-
-    /// Command-name completion (`/mo<TAB>` → `/model`) must be unaffected by
-    /// the new `/model` argument branch.
-    #[test]
-    fn complete_command_name_unaffected_by_model_argument_branch() {
-        let helper = ReplHelper {
-            models: Rc::new(model_ids(&["claude-sonnet-4-6"])),
-        };
-        let history = DefaultHistory::new();
-        let ctx = Context::new(&history);
-
-        let line = "/mo";
-        let (start, candidates) = helper.complete(line, line.len(), &ctx).unwrap();
-        assert_eq!(start, 0);
-        assert_eq!(
-            candidates
-                .into_iter()
-                .map(|p| p.replacement)
-                .collect::<Vec<_>>(),
-            vec!["/model".to_string()]
-        );
-    }
+    // `parse_model_command`/`fuzzy_model_candidates` themselves are covered
+    // by `commands::model_list`'s own tests; the shared `ModelReplHelper`
+    // (Completer/Hinter) is now covered by `commands::repl`'s tests, since
+    // that's where it lives.
 }

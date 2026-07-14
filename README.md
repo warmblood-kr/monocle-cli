@@ -53,7 +53,8 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only) |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead |
+| `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
@@ -99,9 +100,19 @@ Bye.
 
 The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
 and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
-Tab completes `/quit`/`/exit`, and a multi-line paste is inserted as a single input
-(submitted only on Enter, not one turn per line). Command history persists across
-sessions in `~/.monocle/chat_history` (kept separate from `monocle agent`'s history).
+Tab completes `/model`/`/quit`/`/exit` as a dropdown listing every match (not cycling
+one at a time), with the best match also shown as a dim inline hint as you type; a
+multi-line paste is inserted as a single input (submitted only on Enter, not one turn
+per line). Command history persists across sessions in `~/.monocle/chat_history` (kept
+separate from `monocle agent`'s history). The REPL remembers the conversation — each
+turn resends the full exchange so far, the same way `monocle agent` does — so
+follow-up questions ("what about in Python?") work without repeating context.
+
+Same as `monocle agent`'s REPL, `/model` shows the current model (or `/model <id>`
+switches it for later turns), and `/model <TAB>` fuzzy-completes against the model ids
+available to your account (fetched once at startup) — e.g. `/model cla<TAB>` narrows to
+matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in or the
+list can't be fetched, completion just offers nothing (typing a full id still works).
 
 One-shot via stdin:
 
@@ -174,6 +185,64 @@ for m in gpt-4o claude-sonnet-4-6 gemini-2-flash; do
   echo "count the people in this image" | monocle chat --file crowd.jpg --model "$m"
 done
 ```
+
+### 🧵 `--responses`: server-managed threads (experimental)
+
+`monocle chat --responses` talks to jarvice's custom **Responses API**
+(`/api/responses`) instead of the plain `/v1/chat/completions` path. It's not
+OpenAI's Responses API — it's monocle's own endpoint, named for the similar
+idea: the **server** persists the conversation thread, so the CLI sends only
+the new turn instead of resending the whole exchange.
+
+```bash
+monocle chat --responses --model claude-sonnet-4-6
+```
+
+```console
+Monocle Chat — Responses API (model: claude-sonnet-4-6)
+jarvice: https://acme.monocle-ai.com
+Type your message. Press Ctrl+D to exit.
+---
+> Hello
+Hello! How can I help you today?
+Thread: 3fa3b2c1-...
+
+> /quit
+Bye.
+```
+
+Continue a specific thread later (one-shot or REPL) with `--resume <id>`
+(the id a previous run printed to stderr as `Thread: ...`):
+
+```bash
+echo "and in Python?" | monocle chat --responses --resume 3fa3b2c1-...
+```
+
+List your existing threads (including ones started in jarvice's own web UI —
+both share the same storage) with the `list` subcommand:
+
+```bash
+monocle chat list
+```
+
+Continuing into the interactive REPL with `--resume <id>` (not one-shot)
+replays that thread's prior history to stderr before the prompt, so you can
+pick up a conversation started elsewhere.
+
+Notes:
+
+- **jarvice-only** — this does not go through chat-proxy's router, so it
+  needs jarvice's own tenant URL (derived the same way as the rest of this
+  CLI, from your logged-in tenant domain). It's unrelated to `--model`
+  routing and can't be redirected.
+- **No streaming yet** — the reply is fetched non-streaming and printed once
+  it's fully generated, unlike the plain chat path's live token stream.
+- **`--system-prompt`/`--system-prompt-file`/`--max-tokens` are ignored** — the
+  endpoint has no equivalent fields (a warning is printed if you pass them).
+- **Known auth gap**: this endpoint currently rejects the CLI's access token
+  with a 401 (`JWT missing required claim: email`) against real staging/prod
+  tenants — the same open issue that blocks `monocle mcp` today. It's fine to
+  use against a local/mock dev stack in the meantime.
 
 ## 🔊 Audio (STT / TTS)
 
@@ -280,9 +349,10 @@ it for an interactive REPL. Progress goes to stderr, the answer to stdout; `--se
 
 The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
 and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
-Tab completes slash commands, and a multi-line paste is inserted as a single input
-(submitted only on Enter). Command history persists across sessions in
-`~/.monocle/agent_history`.
+Tab completes slash commands as a dropdown listing every match (not cycling one at a
+time), with the best match also shown as a dim inline hint as you type; a multi-line
+paste is inserted as a single input (submitted only on Enter). Command history
+persists across sessions in `~/.monocle/agent_history`.
 
 In the interactive REPL, lines starting with `/` are local management commands (handled
 without calling the model, printed to stderr): `/help` lists them, `/config` shows the
