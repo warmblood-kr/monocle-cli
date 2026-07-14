@@ -29,7 +29,7 @@ use crate::error::{AppError, Result};
 use crate::net::Client;
 use crate::origin::auth_headers;
 
-/// One turn's reply, plus the thread id to pass as `--thread`/the next turn's
+/// One turn's reply, plus the thread id to pass as `--resume`/the next turn's
 /// `thread_id` to keep the conversation going. jarvice always resolves (and
 /// returns) a thread id — creating one on the first turn of a session, or
 /// confirming the one passed in — so this is `Option` only defensively, in

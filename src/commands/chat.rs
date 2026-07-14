@@ -2,12 +2,14 @@ use std::io::{IsTerminal, Write};
 
 use serde_json::Value;
 
+use chrono::TimeZone;
+
 use crate::agent::providers::{
     ChatRequest, ChatResponse, ImageAttachment, LlmProvider, Message, MonocleProvider,
 };
 use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
-use crate::auth::{get_access_token, jarvice_url_for};
+use crate::auth::{get_access_token, jarvice_url_for, AuthSession};
 use crate::commands::model_list::{fetch_model_ids, handle_model_command};
 use crate::commands::repl::{run_repl, LoopControl, ModelReplHelper};
 use crate::credentials::Credentials;
@@ -28,8 +30,8 @@ pub struct ChatOptions {
     /// `--responses`: talk to jarvice's `/api/responses` (server-managed
     /// thread) instead of the plain `/v1/chat/completions` path.
     pub responses: bool,
-    /// `--thread <ID>`: continue an existing `--responses` thread.
-    pub thread: Option<String>,
+    /// `--resume <ID>`: continue an existing `--responses` thread.
+    pub resume: Option<String>,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -344,6 +346,32 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     })
 }
 
+/// Resolve a validated session + jarvice's own base URL + a ready-to-use
+/// `Authorization` header value — shared by `run_responses_chat` and
+/// `chat_list_command`, since both need the same auth + jarvice-host
+/// resolution. Deliberately `jarvice_url_for`, NOT `session.router_url`
+/// (chat-proxy) — see `responses_api` module docs for why.
+fn resolve_jarvice(client: &Client, creds: &Credentials) -> Result<(AuthSession, String, String)> {
+    let session = get_access_token(client, creds);
+    let stored = creds.read().ok_or_else(|| {
+        crate::error::AppError::new("Not logged in. Run `monocle login --tenant <domain>` first.")
+    })?;
+    let jarvice_url = jarvice_url_for(&stored);
+    let bearer = format!("Bearer {}", session.token);
+    Ok((session, jarvice_url, bearer))
+}
+
+/// `monocle chat list` — list the current user's existing jarvice threads
+/// (id/title/last-updated) and exit. Always jarvice's thread storage — there
+/// is nothing else to list in the plain completions mode, so this never takes
+/// a `--responses` flag.
+pub fn chat_list_command(client: &Client, creds: &Credentials) -> Result<()> {
+    let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
+    let threads = crate::jarvice_chats::list_threads(client, &jarvice_url, &bearer)?;
+    print_threads_table(&threads);
+    Ok(())
+}
+
 /// `--responses`: jarvice's `/api/responses` (see `responses_api` module
 /// docs). The server owns the conversation thread — this REPL only tracks
 /// the `thread_id` to pass on the next turn, never a local message history.
@@ -375,13 +403,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
 
     // Auth FIRST, same rationale as the completions path — an expired/missing
     // login must surface before any local-input error masks it.
-    let session = get_access_token(client, creds);
-    let stored = creds.read().ok_or_else(|| {
-        crate::error::AppError::new("Not logged in. Run `monocle login --tenant <domain>` first.")
-    })?;
-    // Deliberately `jarvice_url_for`, NOT `session.router_url` — `/api/responses`
-    // is jarvice-only, unreachable through chat-proxy (see `responses_api` docs).
-    let jarvice_url = jarvice_url_for(&stored);
+    let (session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
 
     let one_shot_input = read_one_shot_input(stdin_is_tty, &options.files)?;
 
@@ -390,7 +412,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     if let Some((text, images)) = one_shot_input {
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
-        let reply = rc.respond(&model, &text, &images, options.thread.as_deref())?;
+        let reply = rc.respond(&model, &text, &images, options.resume.as_deref())?;
         println!("{}", reply.content);
         if let Some(id) = reply.thread_id {
             eprintln!("Thread: {id}");
@@ -409,7 +431,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     let history_path = home_dir().join(".monocle").join("chat_history");
     // Not a `Vec<Message>` like `run_completions_chat`'s `convo` — the server
     // persists the conversation; this is just the id to hand back next turn.
-    let mut thread_id: Option<String> = options.thread.clone();
+    let mut thread_id: Option<String> = options.resume.clone();
     // Best-effort, same defensive posture as `agent.rs`'s REPL: this path has
     // no startup model-list fetch to piggyback on (unlike the completions
     // path's validation call), so fetch once here for `/model` completion.
@@ -418,6 +440,36 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         commands: CHAT_SLASH_COMMANDS,
         models: model_ids,
     };
+
+    // Replay prior history for an existing thread, REPL-only (never in the
+    // one-shot path above, never on stdout — this repo treats stdout as
+    // strictly the answer/data channel). A fetch failure must not block
+    // continuing the thread, so it's a warning, not a propagated error.
+    if let Some(id) = &thread_id {
+        match crate::jarvice_chats::get_thread(client, &jarvice_url, &bearer, id) {
+            Ok(detail) => {
+                let turns = detail
+                    .current_id
+                    .as_deref()
+                    .map(|cur| crate::jarvice_chats::linearize(&detail.messages, cur))
+                    .unwrap_or_default();
+                if !turns.is_empty() {
+                    eprintln!("--- prior history ---");
+                    for node in turns {
+                        match node.role.as_str() {
+                            "user" => eprintln!("> {}", node.content),
+                            "assistant" => eprintln!("{}", node.content),
+                            _ => {}
+                        }
+                    }
+                    eprintln!("--- end history ---");
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: could not load thread history: {e}");
+            }
+        }
+    }
 
     run_repl(helper, history_path, "> ", |trimmed| {
         if trimmed == "/quit" || trimmed == "/exit" {
@@ -466,6 +518,61 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         }
         Ok(LoopControl::Continue)
     })
+}
+
+/// Render `monocle chat list`'s table to stdout — this is a terminal
+/// print-and-exit command (like `monocle models`), so stdout is the correct
+/// channel here, unlike the history-replay path below.
+fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
+    use crate::commands::model_list::pad;
+
+    if threads.is_empty() {
+        eprintln!("No threads found.");
+        return;
+    }
+
+    let id_width = threads
+        .iter()
+        .map(|t| t.id.chars().count())
+        .chain([9])
+        .max()
+        .unwrap();
+    let title_width = threads
+        .iter()
+        .map(|t| t.title.chars().count())
+        .chain([5])
+        .max()
+        .unwrap();
+
+    let mut out = std::io::stdout();
+    let _ = writeln!(
+        out,
+        "{}  {}  UPDATED",
+        pad("THREAD ID", id_width),
+        pad("TITLE", title_width)
+    );
+    let _ = writeln!(
+        out,
+        "{}  {}  {}",
+        "─".repeat(id_width),
+        "─".repeat(title_width),
+        "─".repeat(16)
+    );
+    for t in threads {
+        let updated = chrono::Utc
+            .timestamp_opt(t.updated_at, 0)
+            .single()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            out,
+            "{}  {}  {}",
+            pad(&t.id, id_width),
+            pad(&t.title, title_width),
+            updated
+        );
+    }
+    eprintln!("\n{} thread(s).", threads.len());
 }
 
 #[cfg(test)]

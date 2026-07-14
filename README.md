@@ -53,7 +53,8 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--thread <id>]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead |
+| `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
@@ -210,12 +211,23 @@ Thread: 3fa3b2c1-...
 Bye.
 ```
 
-Continue a specific thread later (one-shot or REPL) with `--thread <id>`
+Continue a specific thread later (one-shot or REPL) with `--resume <id>`
 (the id a previous run printed to stderr as `Thread: ...`):
 
 ```bash
-echo "and in Python?" | monocle chat --responses --thread 3fa3b2c1-...
+echo "and in Python?" | monocle chat --responses --resume 3fa3b2c1-...
 ```
+
+List your existing threads (including ones started in jarvice's own web UI —
+both share the same storage) with the `list` subcommand:
+
+```bash
+monocle chat list
+```
+
+Continuing into the interactive REPL with `--resume <id>` (not one-shot)
+replays that thread's prior history to stderr before the prompt, so you can
+pick up a conversation started elsewhere.
 
 Notes:
 
