@@ -217,6 +217,31 @@ fn handle_diag_command(trimmed: &str, diagnostics: &Option<TurnDiagnostics>) -> 
     true
 }
 
+/// Dispatch a slash-command line to whichever handler recognizes it (shared
+/// by both REPL loops, so the two don't drift out of sync). Returns
+/// `Some(control)` when `trimmed` was consumed as a recognized command — the
+/// caller should return it immediately. `None` means it wasn't a recognized
+/// command and should be treated as ordinary chat input.
+fn dispatch_chat_command(
+    trimmed: &str,
+    model: &mut String,
+    diagnostics: &Option<TurnDiagnostics>,
+) -> Option<LoopControl> {
+    if trimmed == "/quit" || trimmed == "/exit" {
+        eprintln!("Bye.");
+        return Some(LoopControl::Quit);
+    }
+    // `/model` switches the model for subsequent turns — handled before
+    // `/diag` since it carries an argument, same as `monocle agent`'s REPL.
+    if handle_model_command(trimmed, model) {
+        return Some(LoopControl::Continue);
+    }
+    if handle_diag_command(trimmed, diagnostics) {
+        return Some(LoopControl::Continue);
+    }
+    None
+}
+
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
     if options.responses {
         run_responses_chat(client, creds, options)
@@ -375,18 +400,8 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     let mut diagnostics: Option<TurnDiagnostics> = None;
 
     run_repl(helper, history_path, "> ", |trimmed| {
-        if trimmed == "/quit" || trimmed == "/exit" {
-            eprintln!("Bye.");
-            return Ok(LoopControl::Quit);
-        }
-        // `/model` switches the model for subsequent turns — handled before
-        // the general dispatch since it carries an argument, same as
-        // `monocle agent`'s REPL.
-        if handle_model_command(trimmed, &mut model) {
-            return Ok(LoopControl::Continue);
-        }
-        if handle_diag_command(trimmed, &diagnostics) {
-            return Ok(LoopControl::Continue);
+        if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
+            return Ok(control);
         }
 
         let (text, images) = match resolve_repl_attachments(trimmed) {
@@ -416,6 +431,12 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             Some(s) => s,
             None => return Ok(LoopControl::Continue),
         };
+        // Captured before `provider.refresh` consumes `session` — the actual
+        // per-turn request goes to whatever router URL THIS session carries,
+        // which can differ from the outer `router_url` after a mid-session
+        // refresh re-discovers a different router. `/diag`'s endpoint must
+        // reflect the request that was actually sent, not the startup value.
+        let turn_router_url = session.router_url.clone();
         provider.refresh(session);
 
         eprintln!();
@@ -438,7 +459,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
                 diagnostics = Some(TurnDiagnostics {
                     requested_model: model.clone(),
                     served_model: resp.model.clone(),
-                    endpoint: format!("{router_url}{}", endpoints::CHAT_COMPLETIONS),
+                    endpoint: format!("{turn_router_url}{}", endpoints::CHAT_COMPLETIONS),
                     latency_ms: started.elapsed().as_millis(),
                     usage: resp.usage.clone(),
                 });
@@ -449,6 +470,9 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             }
             Err(e) => {
                 convo.truncate(mark);
+                // A failed turn must not leave stale diagnostics from an
+                // earlier successful turn silently displayable via `/diag`.
+                diagnostics = None;
                 eprintln!("Error: {e}");
                 if crate::diag::was_logged() {
                     eprintln!("  (details logged to {})", crate::diag::display_path());
@@ -590,18 +614,8 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     }
 
     run_repl(helper, history_path, "> ", |trimmed| {
-        if trimmed == "/quit" || trimmed == "/exit" {
-            eprintln!("Bye.");
-            return Ok(LoopControl::Quit);
-        }
-        // `/model` switches the model for subsequent turns — handled before
-        // the general dispatch since it carries an argument, same as
-        // `monocle agent`'s REPL.
-        if handle_model_command(trimmed, &mut model) {
-            return Ok(LoopControl::Continue);
-        }
-        if handle_diag_command(trimmed, &diagnostics) {
-            return Ok(LoopControl::Continue);
+        if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
+            return Ok(control);
         }
 
         let (text, images) = match resolve_repl_attachments(trimmed) {
@@ -655,6 +669,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                 println!();
             }
             Err(e) => {
+                // A failed turn must not leave stale diagnostics from an
+                // earlier successful turn silently displayable via `/diag`.
+                diagnostics = None;
                 eprintln!("Error: {e}");
                 if crate::diag::was_logged() {
                     eprintln!("  (details logged to {})", crate::diag::display_path());
@@ -723,12 +740,42 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_diag, resolve_max_tokens, resolve_repl_attachments, TurnDiagnostics};
+    use super::{
+        dispatch_chat_command, format_diag, resolve_max_tokens, resolve_repl_attachments,
+        TurnDiagnostics,
+    };
     use crate::agent::providers::TokenUsage;
+    use crate::commands::repl::LoopControl;
 
     // The shared `ModelReplHelper` (Completer/Hinter, slash-command +
     // `/model` fuzzy completion) now lives in `commands::repl` and is
     // covered there, since that's where its Completer/Hinter impls live.
+
+    // `/model`/`/diag` dispatch through `dispatch_chat_command` isn't
+    // re-tested in detail here — `handle_model_command` and
+    // `handle_diag_command` already have their own coverage; this just
+    // confirms the shared entry point recognizes `/quit`/`/exit` and passes
+    // through anything else as ordinary chat input.
+    #[test]
+    fn dispatch_chat_command_quit_and_exit_stop_the_repl() {
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        assert!(matches!(
+            dispatch_chat_command("/quit", &mut model, &diagnostics),
+            Some(LoopControl::Quit)
+        ));
+        assert!(matches!(
+            dispatch_chat_command("/exit", &mut model, &diagnostics),
+            Some(LoopControl::Quit)
+        ));
+    }
+
+    #[test]
+    fn dispatch_chat_command_unrecognized_line_is_chat_input() {
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        assert!(dispatch_chat_command("hello there", &mut model, &diagnostics).is_none());
+    }
 
     #[test]
     fn absent_flag_omits() {

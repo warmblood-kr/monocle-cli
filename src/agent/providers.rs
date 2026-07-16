@@ -181,11 +181,18 @@ pub struct TokenUsage {
 /// present. Shared by the non-streaming parser and the streaming assembler's
 /// final-chunk handling.
 fn parse_usage(data: &Value) -> Option<TokenUsage> {
+    // `.unwrap_or(0)` handles a missing/non-numeric field; the `u32::try_from`
+    // below handles a present-but-oversized one (e.g. a malformed upstream
+    // payload) by saturating to `u32::MAX` instead of silently wrapping to a
+    // small, wrong number via an `as u32` truncation.
     let usage = data.get("usage")?;
+    let field = |name: &str| -> u32 {
+        u32::try_from(usage[name].as_u64().unwrap_or(0)).unwrap_or(u32::MAX)
+    };
     Some(TokenUsage {
-        prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-        completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
-        total_tokens: usage["total_tokens"].as_u64().unwrap_or(0) as u32,
+        prompt_tokens: field("prompt_tokens"),
+        completion_tokens: field("completion_tokens"),
+        total_tokens: field("total_tokens"),
     })
 }
 
@@ -676,6 +683,30 @@ mod tests {
         });
         let resp = parse_response_value(&data).unwrap();
         assert_eq!(resp.usage, None);
+    }
+
+    #[test]
+    fn oversized_usage_field_saturates_instead_of_wrapping() {
+        // A malformed/oversized upstream value must saturate to `u32::MAX`,
+        // not silently wrap to a small (wrong-looking) number via `as u32`.
+        let data = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": u64::MAX,
+                "completion_tokens": (u32::MAX as u64) + 1,
+                "total_tokens": 15,
+            },
+        });
+        let resp = parse_response_value(&data).unwrap();
+        assert_eq!(
+            resp.usage,
+            Some(TokenUsage {
+                prompt_tokens: u32::MAX,
+                completion_tokens: u32::MAX,
+                total_tokens: 15,
+            })
+        );
     }
 
     #[test]
