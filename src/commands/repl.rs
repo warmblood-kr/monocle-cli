@@ -19,6 +19,16 @@ use crate::colors as c;
 use crate::commands::model_list::fuzzy_model_candidates;
 use crate::error::Result;
 
+/// Shared REPL prompt for both `monocle chat` and `monocle agent` — unifies
+/// what were previously two different carets ("> " and "» "). Plain ASCII-
+/// safe text only: rustyline computes prompt width by skipping recognized
+/// ANSI escapes, but on Windows consoles without VT processing enabled those
+/// escapes print as literal bytes instead, desyncing the cursor column from
+/// what rustyline thinks it is. Mode identity is signaled by a colored line
+/// printed BEFORE the REPL starts (see chat.rs/agent.rs), not by coloring
+/// this prompt.
+pub const PROMPT: &str = "\u{276F} "; // ❯ — the modern CLI prompt glyph (Starship/Spaceship convention), replacing the old "$"/">" default.
+
 /// What the per-line callback wants the loop to do next.
 pub enum LoopControl {
     Continue,

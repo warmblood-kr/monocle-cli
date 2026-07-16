@@ -91,10 +91,11 @@ Monocle Chat (model: claude-sonnet-4-6)
 Router: https://api.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
 ---
-> Hello
+▸ chat
+❯ Hello
 Hello! How can I help you today?
 
-> /quit
+❯ /quit
 Bye.
 ```
 
@@ -119,7 +120,7 @@ after a reply, it's opt-in on demand. Handy with a router alias (e.g. `monocle-a
 see which concrete model actually served the response:
 
 ```console
-> /diag
+❯ /diag
 --- diag ---
 Endpoint: https://api.monocle-ai.com/v1/chat/completions
 Requested model: monocle-auto
@@ -223,11 +224,12 @@ Monocle Chat — Responses API (model: claude-sonnet-4-6)
 jarvice: https://acme.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
 ---
-> Hello
+▸ chat
+❯ Hello
 Hello! How can I help you today?
 Thread: 3fa3b2c1-...
 
-> /quit
+❯ /quit
 Bye.
 ```
 

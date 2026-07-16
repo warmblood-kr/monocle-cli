@@ -43,3 +43,26 @@ pub fn cyan(s: &str) -> String {
 pub fn red(s: &str) -> String {
     wrap("31", "39", s)
 }
+
+/// Monocle brand orange (#f97316, DESIGN.md §2 Primary/Orange/500) via
+/// truecolor ANSI. Reserved for the handful of deliberate brand touchpoints
+/// (see agent.rs/chat.rs mode banners) — NOT a general-purpose accent color;
+/// the rest of this CLI intentionally stays muted/cyan (gh/brew convention)
+/// so it never fights the user's terminal theme.
+pub fn orange(s: &str) -> String {
+    wrap("38;2;249;115;22", "39", s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::orange;
+    use std::env;
+
+    #[test]
+    fn orange_wraps_with_truecolor_sgr_when_forced() {
+        env::set_var("FORCE_COLOR", "1");
+        let out = orange("agent");
+        env::remove_var("FORCE_COLOR");
+        assert!(out.contains("38;2;249;115;22"));
+    }
+}
