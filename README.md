@@ -114,6 +114,26 @@ available to your account (fetched once at startup) — e.g. `/model cla<TAB>` n
 matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in or the
 list can't be fetched, completion just offers nothing (typing a full id still works).
 
+`/diag` shows diagnostics for the **last** turn only — nothing is printed automatically
+after a reply, it's opt-in on demand. Handy with a router alias (e.g. `monocle-auto`) to
+see which concrete model actually served the response:
+
+```console
+> /diag
+--- diag ---
+Endpoint: https://api.monocle-ai.com/v1/chat/completions
+Requested model: monocle-auto
+Served model: claude-sonnet-4-6
+Latency: 842ms
+Tokens: 120 prompt + 45 completion = 165 total
+--- end diag ---
+```
+
+`Served model` and `Tokens` are only shown when the backend reports them (always true for
+`monocle chat`'s default path; `--responses`, below, reports neither today, so those lines
+are simply omitted rather than printed as empty). Before the first turn, `/diag` just
+prints a hint to send a message first.
+
 One-shot via stdin:
 
 ```console
@@ -217,6 +237,10 @@ Continue a specific thread later (one-shot or REPL) with `--resume <id>`
 ```bash
 echo "and in Python?" | monocle chat --responses --resume 3fa3b2c1-...
 ```
+
+`/diag` also works in this REPL, but the Responses API doesn't echo back a served
+model or token usage, so those lines are omitted — only `Endpoint`/`Requested
+model`/`Latency` are shown.
 
 List your existing threads (including ones started in jarvice's own web UI —
 both share the same storage) with the `list` subcommand:

@@ -54,6 +54,7 @@ pub fn text_response(content: &str) -> ChatResponse {
         model: None,
         finish_reason: Some("stop".to_string()),
         truncated: false,
+        usage: None,
     }
 }
 
@@ -78,6 +79,7 @@ pub fn tool_call_response_raw(id: &str, name: &str, arguments: &str) -> ChatResp
         model: None,
         finish_reason: Some("tool_calls".to_string()),
         truncated: false,
+        usage: None,
     }
 }
 
