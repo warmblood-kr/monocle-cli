@@ -160,6 +160,40 @@ pub struct ChatResponse {
     /// magic `finish_reason` string. A complete-but-then-dropped stream (the
     /// model already sent `finish_reason`) is NOT truncated.
     pub truncated: bool,
+    /// Token counts, when the backend reports them. Always present on a
+    /// non-streaming reply (the OpenAI-compatible `usage` object is part of
+    /// the standard, non-opt-in response shape); for streaming, only present
+    /// because `MonocleProvider::build_body` opts in via
+    /// `stream_options.include_usage` — see that fn's doc comment.
+    pub usage: Option<TokenUsage>,
+}
+
+/// Token counts for one turn (OpenAI-compatible `usage` object:
+/// `prompt_tokens` + `completion_tokens` = `total_tokens`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+/// Parse an OpenAI-compatible `usage` object off a response/chunk body, if
+/// present. Shared by the non-streaming parser and the streaming assembler's
+/// final-chunk handling.
+fn parse_usage(data: &Value) -> Option<TokenUsage> {
+    // `.unwrap_or(0)` handles a missing/non-numeric field; the `u32::try_from`
+    // below handles a present-but-oversized one (e.g. a malformed upstream
+    // payload) by saturating to `u32::MAX` instead of silently wrapping to a
+    // small, wrong number via an `as u32` truncation.
+    let usage = data.get("usage")?;
+    let field = |name: &str| -> u32 {
+        u32::try_from(usage[name].as_u64().unwrap_or(0)).unwrap_or(u32::MAX)
+    };
+    Some(TokenUsage {
+        prompt_tokens: field("prompt_tokens"),
+        completion_tokens: field("completion_tokens"),
+        total_tokens: field("total_tokens"),
+    })
 }
 
 /// Ensure every assembled tool call has a non-empty `id`, synthesizing a stable
@@ -192,12 +226,14 @@ fn parse_response_value(data: &Value) -> Result<ChatResponse> {
     let finish_reason = data["choices"][0]["finish_reason"]
         .as_str()
         .map(String::from);
+    let usage = parse_usage(data);
     Ok(ChatResponse {
         content,
         tool_calls,
         model,
         finish_reason,
         truncated: false,
+        usage,
     })
 }
 
@@ -243,6 +279,10 @@ fn assemble_sse_stream(
     let mut model: Option<String> = None;
     let mut tool_acc: Vec<ToolCallAcc> = Vec::new();
     let mut truncated = false;
+    // Only present when the request opted in via `stream_options.include_usage`
+    // (see `MonocleProvider::build_body`) — OpenAI-compatible servers then send
+    // one extra terminal chunk carrying `usage` alongside an empty `choices`.
+    let mut usage: Option<TokenUsage> = None;
 
     loop {
         let raw = match next_line() {
@@ -277,6 +317,9 @@ fn assemble_sse_stream(
         };
         if model.is_none() {
             model = v["model"].as_str().map(String::from);
+        }
+        if usage.is_none() {
+            usage = parse_usage(&v);
         }
         let choice = &v["choices"][0];
         if let Some(fr) = choice["finish_reason"].as_str() {
@@ -344,6 +387,7 @@ fn assemble_sse_stream(
         model,
         finish_reason,
         truncated,
+        usage,
     })
 }
 
@@ -425,6 +469,12 @@ impl MonocleProvider {
             "messages": messages,
             "stream": stream,
         });
+        if stream {
+            // OpenAI-compatible streaming omits `usage` unless the request
+            // opts in — without this, a streamed turn's `/diag` would never
+            // have token counts (only the non-streaming path would).
+            body["stream_options"] = json!({"include_usage": true});
+        }
         if let Some(max_tokens) = req.max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
@@ -607,6 +657,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_streaming_response_with_usage_is_parsed() {
+        let data = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+        });
+        let resp = parse_response_value(&data).unwrap();
+        assert_eq!(
+            resp.usage,
+            Some(TokenUsage {
+                prompt_tokens: 12,
+                completion_tokens: 3,
+                total_tokens: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn non_streaming_response_without_usage_is_none() {
+        let data = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+        });
+        let resp = parse_response_value(&data).unwrap();
+        assert_eq!(resp.usage, None);
+    }
+
+    #[test]
+    fn oversized_usage_field_saturates_instead_of_wrapping() {
+        // A malformed/oversized upstream value must saturate to `u32::MAX`,
+        // not silently wrap to a small (wrong-looking) number via `as u32`.
+        let data = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": u64::MAX,
+                "completion_tokens": (u32::MAX as u64) + 1,
+                "total_tokens": 15,
+            },
+        });
+        let resp = parse_response_value(&data).unwrap();
+        assert_eq!(
+            resp.usage,
+            Some(TokenUsage {
+                prompt_tokens: u32::MAX,
+                completion_tokens: u32::MAX,
+                total_tokens: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn streaming_final_usage_chunk_is_captured() {
+        // Mirrors the terminal chunk an OpenAI-compatible server sends when the
+        // request opts in via `stream_options.include_usage`: empty `choices`
+        // alongside a `usage` object, after the content-bearing deltas.
+        let usage_chunk =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}";
+        let (resp, deltas) = run_stream(vec![
+            content_line("Hi"),
+            Ok(Some(usage_chunk.to_string())),
+            Ok(Some("data: [DONE]".to_string())),
+            Ok(None),
+        ]);
+        let resp = resp.expect("normal completion with a trailing usage chunk should succeed");
+        assert_eq!(resp.content, "Hi");
+        assert_eq!(
+            resp.usage,
+            Some(TokenUsage {
+                prompt_tokens: 5,
+                completion_tokens: 2,
+                total_tokens: 7,
+            })
+        );
+        assert_eq!(deltas, vec!["Hi".to_string()]);
+    }
+
     fn dummy_provider() -> MonocleProvider {
         MonocleProvider::new("token", "https://router.example")
     }
@@ -628,6 +756,27 @@ mod tests {
         assert_eq!(body["messages"][1]["content"], json!("hello"));
         assert!(body["messages"][1]["content"].is_string());
         assert_eq!(body["max_tokens"], json!(100));
+    }
+
+    #[test]
+    fn build_body_streaming_opts_into_usage() {
+        // Streaming requests must ask for the terminal `usage` chunk (OpenAI-
+        // compatible servers omit it otherwise) so `/diag` can show token
+        // counts on a streamed turn, same as a non-streaming one.
+        let provider = dummy_provider();
+        let req = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message::user("hello")],
+            ..Default::default()
+        };
+        let streaming_body = provider.build_body(&req, true);
+        assert_eq!(
+            streaming_body["stream_options"],
+            json!({"include_usage": true})
+        );
+
+        let non_streaming_body = provider.build_body(&req, false);
+        assert!(non_streaming_body.get("stream_options").is_none());
     }
 
     #[test]

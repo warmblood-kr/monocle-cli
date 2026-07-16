@@ -5,7 +5,7 @@ use serde_json::Value;
 use chrono::TimeZone;
 
 use crate::agent::providers::{
-    ChatRequest, ChatResponse, ImageAttachment, LlmProvider, Message, MonocleProvider,
+    ChatRequest, ChatResponse, ImageAttachment, LlmProvider, Message, MonocleProvider, TokenUsage,
 };
 use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
@@ -158,9 +158,89 @@ fn resolve_repl_attachments(
 }
 
 /// The slash commands the REPL understands. `/model` mirrors `monocle
-/// agent`'s REPL (switches the model for subsequent turns); chat still has no
-/// `/help`/`/config`/`/status`.
-const CHAT_SLASH_COMMANDS: &[&str] = &["/model", "/exit", "/quit"];
+/// agent`'s REPL (switches the model for subsequent turns); `/diag` shows
+/// diagnostics for the last turn; chat still has no `/help`/`/config`/`/status`.
+const CHAT_SLASH_COMMANDS: &[&str] = &["/model", "/diag", "/exit", "/quit"];
+
+/// Diagnostics for the most recently completed turn, shown on demand by
+/// `/diag` — REPL-only, overwritten each turn (no history is kept). Built
+/// fresh after every successful turn in both `run_completions_chat` and
+/// `run_responses_chat`; `served_model`/`usage` stay `None` wherever the
+/// backend doesn't report them (the `--responses` path reports neither today
+/// — see module docs on `responses_api::ResponsesReply`).
+struct TurnDiagnostics {
+    requested_model: String,
+    served_model: Option<String>,
+    endpoint: String,
+    latency_ms: u128,
+    usage: Option<TokenUsage>,
+}
+
+/// Render `/diag`'s bordered block (same `--- ... ---` framing as the
+/// `--responses` REPL's prior-history replay). Lines for data the backend
+/// didn't report are omitted entirely — never printed as `None`/`null`.
+fn format_diag(d: &TurnDiagnostics) -> String {
+    let mut lines = vec![
+        "--- diag ---".to_string(),
+        format!("Endpoint: {}", d.endpoint),
+        format!("Requested model: {}", d.requested_model),
+    ];
+    if let Some(served) = &d.served_model {
+        lines.push(format!("Served model: {served}"));
+    }
+    lines.push(format!("Latency: {}ms", d.latency_ms));
+    if let Some(u) = &d.usage {
+        lines.push(format!(
+            "Tokens: {} prompt + {} completion = {} total",
+            u.prompt_tokens, u.completion_tokens, u.total_tokens
+        ));
+    }
+    lines.push("--- end diag ---".to_string());
+    lines.join("\n")
+}
+
+/// Handle a `/diag` line if `trimmed` is one: prints the last turn's
+/// diagnostics (or a "nothing yet" hint before the first turn). Returns
+/// `true` if this input was consumed as `/diag`, mirroring
+/// `model_list::handle_model_command`'s contract.
+fn handle_diag_command(trimmed: &str, diagnostics: &Option<TurnDiagnostics>) -> bool {
+    if trimmed != "/diag" {
+        return false;
+    }
+    match diagnostics {
+        None => eprintln!(
+            "{}",
+            crate::colors::dim("No response yet — send a message first.")
+        ),
+        Some(d) => eprintln!("{}", format_diag(d)),
+    }
+    true
+}
+
+/// Dispatch a slash-command line to whichever handler recognizes it (shared
+/// by both REPL loops, so the two don't drift out of sync). Returns
+/// `Some(control)` when `trimmed` was consumed as a recognized command — the
+/// caller should return it immediately. `None` means it wasn't a recognized
+/// command and should be treated as ordinary chat input.
+fn dispatch_chat_command(
+    trimmed: &str,
+    model: &mut String,
+    diagnostics: &Option<TurnDiagnostics>,
+) -> Option<LoopControl> {
+    if trimmed == "/quit" || trimmed == "/exit" {
+        eprintln!("Bye.");
+        return Some(LoopControl::Quit);
+    }
+    // `/model` switches the model for subsequent turns — handled before
+    // `/diag` since it carries an argument, same as `monocle agent`'s REPL.
+    if handle_model_command(trimmed, model) {
+        return Some(LoopControl::Continue);
+    }
+    if handle_diag_command(trimmed, diagnostics) {
+        return Some(LoopControl::Continue);
+    }
+    None
+}
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
     if options.responses {
@@ -292,6 +372,9 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     }
     eprintln!("Type your message. Press Ctrl+D to exit.");
     eprintln!("↑/↓ history, Tab completes /model, /quit, /exit — a multi-line paste is one input.");
+    eprintln!(
+        "/diag shows diagnostics (served model, endpoint, latency, tokens) for the last turn."
+    );
     eprintln!("---");
 
     // Separate history file from `monocle agent`'s — the two REPLs' histories
@@ -312,17 +395,13 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     if let Some(sp) = &system_prompt {
         convo.push(Message::system(sp));
     }
+    // Last turn's diagnostics, shown on demand by `/diag` — `None` until the
+    // first successful turn.
+    let mut diagnostics: Option<TurnDiagnostics> = None;
 
     run_repl(helper, history_path, "> ", |trimmed| {
-        if trimmed == "/quit" || trimmed == "/exit" {
-            eprintln!("Bye.");
-            return Ok(LoopControl::Quit);
-        }
-        // `/model` switches the model for subsequent turns — handled before
-        // the general dispatch since it carries an argument, same as
-        // `monocle agent`'s REPL.
-        if handle_model_command(trimmed, &mut model) {
-            return Ok(LoopControl::Continue);
+        if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
+            return Ok(control);
         }
 
         let (text, images) = match resolve_repl_attachments(trimmed) {
@@ -352,6 +431,12 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             Some(s) => s,
             None => return Ok(LoopControl::Continue),
         };
+        // Captured before `provider.refresh` consumes `session` — the actual
+        // per-turn request goes to whatever router URL THIS session carries,
+        // which can differ from the outer `router_url` after a mid-session
+        // refresh re-discovers a different router. `/diag`'s endpoint must
+        // reflect the request that was actually sent, not the startup value.
+        let turn_router_url = session.router_url.clone();
         provider.refresh(session);
 
         eprintln!();
@@ -366,8 +451,18 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         // leave a dangling, reply-less user message in the history sent next time.
         let mark = convo.len();
         convo.push(Message::user(text));
+        // Wrapped tightly around the network call itself (not REPL input-wait
+        // time) — this is what `/diag`'s `Latency:` line reports.
+        let started = std::time::Instant::now();
         match call_chat(&provider, &model, convo.clone(), max_tokens, &images) {
             Ok(resp) => {
+                diagnostics = Some(TurnDiagnostics {
+                    requested_model: model.clone(),
+                    served_model: resp.model.clone(),
+                    endpoint: format!("{turn_router_url}{}", endpoints::CHAT_COMPLETIONS),
+                    latency_ms: started.elapsed().as_millis(),
+                    usage: resp.usage.clone(),
+                });
                 convo.push(Message::assistant(resp.content));
                 let mut out = std::io::stdout();
                 out.write_all(b"\n\n")?;
@@ -375,6 +470,9 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             }
             Err(e) => {
                 convo.truncate(mark);
+                // A failed turn must not leave stale diagnostics from an
+                // earlier successful turn silently displayable via `/diag`.
+                diagnostics = None;
                 eprintln!("Error: {e}");
                 if crate::diag::was_logged() {
                     eprintln!("  (details logged to {})", crate::diag::display_path());
@@ -464,6 +562,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     eprintln!("jarvice: {jarvice_url}");
     eprintln!("Type your message. Press Ctrl+D to exit.");
     eprintln!("↑/↓ history, Tab completes /model, /quit, /exit — a multi-line paste is one input.");
+    eprintln!("/diag shows diagnostics (endpoint, latency) for the last turn.");
     eprintln!("The server owns this conversation's thread — no local history is resent.");
     eprintln!("---");
 
@@ -479,6 +578,10 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         commands: CHAT_SLASH_COMMANDS,
         models: model_ids,
     };
+    // Last turn's diagnostics, shown on demand by `/diag`. This path never
+    // learns a served model or token usage (see `TurnDiagnostics` docs), so
+    // those fields stay `None` for the life of the session.
+    let mut diagnostics: Option<TurnDiagnostics> = None;
 
     // Replay prior history for an existing thread, REPL-only (never in the
     // one-shot path above, never on stdout — this repo treats stdout as
@@ -511,15 +614,8 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     }
 
     run_repl(helper, history_path, "> ", |trimmed| {
-        if trimmed == "/quit" || trimmed == "/exit" {
-            eprintln!("Bye.");
-            return Ok(LoopControl::Quit);
-        }
-        // `/model` switches the model for subsequent turns — handled before
-        // the general dispatch since it carries an argument, same as
-        // `monocle agent`'s REPL.
-        if handle_model_command(trimmed, &mut model) {
-            return Ok(LoopControl::Continue);
+        if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
+            return Ok(control);
         }
 
         let (text, images) = match resolve_repl_attachments(trimmed) {
@@ -548,8 +644,18 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!();
         crate::diag::reset();
 
+        // Wrapped tightly around the network call itself, same as the
+        // completions path — this is what `/diag`'s `Latency:` line reports.
+        let started = std::time::Instant::now();
         match rc.respond(&model, &text, &images, thread_id.as_deref()) {
             Ok(reply) => {
+                diagnostics = Some(TurnDiagnostics {
+                    requested_model: model.clone(),
+                    served_model: None,
+                    endpoint: format!("{jarvice_url}/api/responses"),
+                    latency_ms: started.elapsed().as_millis(),
+                    usage: None,
+                });
                 println!("{}", reply.content);
                 // Announce the thread id only when it's newly learned (the
                 // first turn) or changed — not on every turn, since it's
@@ -563,6 +669,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                 println!();
             }
             Err(e) => {
+                // A failed turn must not leave stale diagnostics from an
+                // earlier successful turn silently displayable via `/diag`.
+                diagnostics = None;
                 eprintln!("Error: {e}");
                 if crate::diag::was_logged() {
                     eprintln!("  (details logged to {})", crate::diag::display_path());
@@ -631,11 +740,42 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_max_tokens, resolve_repl_attachments};
+    use super::{
+        dispatch_chat_command, format_diag, resolve_max_tokens, resolve_repl_attachments,
+        TurnDiagnostics,
+    };
+    use crate::agent::providers::TokenUsage;
+    use crate::commands::repl::LoopControl;
 
     // The shared `ModelReplHelper` (Completer/Hinter, slash-command +
     // `/model` fuzzy completion) now lives in `commands::repl` and is
     // covered there, since that's where its Completer/Hinter impls live.
+
+    // `/model`/`/diag` dispatch through `dispatch_chat_command` isn't
+    // re-tested in detail here — `handle_model_command` and
+    // `handle_diag_command` already have their own coverage; this just
+    // confirms the shared entry point recognizes `/quit`/`/exit` and passes
+    // through anything else as ordinary chat input.
+    #[test]
+    fn dispatch_chat_command_quit_and_exit_stop_the_repl() {
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        assert!(matches!(
+            dispatch_chat_command("/quit", &mut model, &diagnostics),
+            Some(LoopControl::Quit)
+        ));
+        assert!(matches!(
+            dispatch_chat_command("/exit", &mut model, &diagnostics),
+            Some(LoopControl::Quit)
+        ));
+    }
+
+    #[test]
+    fn dispatch_chat_command_unrecognized_line_is_chat_input() {
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        assert!(dispatch_chat_command("hello there", &mut model, &diagnostics).is_none());
+    }
 
     #[test]
     fn absent_flag_omits() {
@@ -699,6 +839,57 @@ mod tests {
     fn repl_line_with_nonexistent_file_ref_errors_without_panicking() {
         let err = resolve_repl_attachments("file:/no/such/path.png").unwrap_err();
         assert!(err.contains("not found"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn format_diag_omits_served_model_and_usage_when_unavailable() {
+        // The `--responses` path: only endpoint/requested-model/latency are
+        // ever known — served model and usage must never render as a literal
+        // "None"/"null", they're just absent lines.
+        let d = TurnDiagnostics {
+            requested_model: "monocle-auto".to_string(),
+            served_model: None,
+            endpoint: "https://acme.monocle-ai.com/api/responses".to_string(),
+            latency_ms: 842,
+            usage: None,
+        };
+        let block = format_diag(&d);
+        assert_eq!(
+            block,
+            "--- diag ---\n\
+             Endpoint: https://acme.monocle-ai.com/api/responses\n\
+             Requested model: monocle-auto\n\
+             Latency: 842ms\n\
+             --- end diag ---"
+        );
+        assert!(!block.contains("None"));
+        assert!(!block.contains("null"));
+    }
+
+    #[test]
+    fn format_diag_shows_served_model_and_usage_when_present() {
+        let d = TurnDiagnostics {
+            requested_model: "monocle-auto".to_string(),
+            served_model: Some("claude-sonnet-4-6".to_string()),
+            endpoint: "https://api.monocle-ai.com/v1/chat/completions".to_string(),
+            latency_ms: 1234,
+            usage: Some(TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                total_tokens: 165,
+            }),
+        };
+        let block = format_diag(&d);
+        assert_eq!(
+            block,
+            "--- diag ---\n\
+             Endpoint: https://api.monocle-ai.com/v1/chat/completions\n\
+             Requested model: monocle-auto\n\
+             Served model: claude-sonnet-4-6\n\
+             Latency: 1234ms\n\
+             Tokens: 120 prompt + 45 completion = 165 total\n\
+             --- end diag ---"
+        );
     }
 
     #[test]
