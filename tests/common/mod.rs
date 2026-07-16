@@ -289,7 +289,8 @@ impl FsBackend for InMemoryFs {
 /// can assert exactly which tool calls the agent made and in what order:
 /// - `call:<name>:<args-compact-json>`
 /// - `result:<name>:<is_error>`
-/// - `text:<delta>` · `notice:<msg>`
+/// - `text:<delta>` · `notice:<msg>` · `step` (one per `on_turn_step` call — once
+///   per LLM call the turn makes)
 #[derive(Default)]
 pub struct RecordingObserver {
     events: Vec<String>,
@@ -319,5 +320,8 @@ impl Observer for RecordingObserver {
     }
     fn on_notice(&mut self, msg: &str) {
         self.events.push(format!("notice:{msg}"));
+    }
+    fn on_turn_step(&mut self, _resp: &ChatResponse) {
+        self.events.push("step".to_string());
     }
 }

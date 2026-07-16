@@ -69,6 +69,7 @@ pub(crate) fn help_text() -> String {
         "  /help    show this help",
         "  /config  show session config (model, max-steps, workdir, session)",
         "  /status  show login status and session config",
+        "  /diag    show diagnostics for the last turn (served model, endpoint, latency, tokens)",
         "  /model   show the current model, or `/model <id>` to switch it",
         "  /exit    quit the REPL (also /quit, Ctrl-D)",
     ]
@@ -146,7 +147,7 @@ mod tests {
     #[test]
     fn help_text_lists_each_command() {
         let h = help_text();
-        for cmd in ["/help", "/config", "/status", "/model", "/exit"] {
+        for cmd in ["/help", "/config", "/status", "/diag", "/model", "/exit"] {
             assert!(h.contains(cmd), "help missing {cmd}: {h}");
         }
     }

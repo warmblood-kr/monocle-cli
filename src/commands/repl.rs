@@ -15,6 +15,7 @@ use rustyline::{CompletionType, Config, Context, Editor, Helper, Validator};
 use std::borrow::Cow;
 use std::path::PathBuf;
 
+use crate::agent::providers::TokenUsage;
 use crate::colors as c;
 use crate::commands::model_list::fuzzy_model_candidates;
 use crate::error::Result;
@@ -44,6 +45,76 @@ pub fn mode_banner(label: &str, colorize: impl Fn(&str) -> String) -> String {
 pub enum LoopControl {
     Continue,
     Quit,
+}
+
+/// Diagnostics for the most recently completed turn, shown on demand by
+/// `/diag` — REPL-only, overwritten each turn (no history is kept). Shared by
+/// `monocle chat` (built fresh after every successful turn in both
+/// `run_completions_chat` and `run_responses_chat`, `steps` always `None`
+/// since a chat turn is exactly one LLM call) and `monocle agent` (`steps`
+/// accumulated across the agent-core loop's tool-use steps, since one turn
+/// can make several LLM calls). `served_model`/`usage` stay `None` wherever
+/// the backend doesn't report them (the `--responses` path reports neither
+/// today — see module docs on `responses_api::ResponsesReply`).
+pub struct TurnDiagnostics {
+    pub requested_model: String,
+    pub served_model: Option<String>,
+    pub endpoint: String,
+    pub latency_ms: u128,
+    pub usage: Option<TokenUsage>,
+    /// How many LLM calls this turn made. `None` for chat (always exactly
+    /// one); `Some(n)` for agent, whose tool-use loop can call the LLM
+    /// multiple times per turn.
+    pub steps: Option<u32>,
+}
+
+/// Render `/diag`'s bordered block (same `--- ... ---` framing as the
+/// `--responses` REPL's prior-history replay). Lines for data the backend
+/// didn't report are omitted entirely — never printed as `None`/`null`.
+pub fn format_diag(d: &TurnDiagnostics) -> String {
+    let mut lines = vec![
+        "--- diag ---".to_string(),
+        format!("Endpoint: {}", d.endpoint),
+        format!("Requested model: {}", d.requested_model),
+    ];
+    if let Some(served) = &d.served_model {
+        lines.push(format!("Served model: {served}"));
+    }
+    lines.push(format!("Latency: {}ms", d.latency_ms));
+    if let Some(steps) = d.steps {
+        lines.push(format!("Steps: {steps}"));
+    }
+    if let Some(u) = &d.usage {
+        lines.push(format!(
+            "Tokens: {} prompt + {} completion = {} total",
+            u.prompt_tokens, u.completion_tokens, u.total_tokens
+        ));
+    }
+    lines.push("--- end diag ---".to_string());
+    lines.join("\n")
+}
+
+/// Renders `/diag` output for either REPL: the last turn's diagnostics, or
+/// a dim "nothing yet" hint before the first turn.
+pub fn diag_output(diagnostics: &Option<TurnDiagnostics>) -> String {
+    match diagnostics {
+        None => crate::colors::dim("No response yet — send a message first."),
+        Some(d) => format_diag(d),
+    }
+}
+
+/// Handle a `/diag` line if `trimmed` is one: prints the last turn's
+/// diagnostics (or a "nothing yet" hint before the first turn). Returns
+/// `true` if this input was consumed as `/diag`, mirroring
+/// `model_list::handle_model_command`'s contract. `monocle chat`'s dispatch
+/// is a plain boolean chain, so this keeps that contract; `monocle agent`'s
+/// `Command`-enum dispatch calls `diag_output` directly instead.
+pub fn handle_diag_command(trimmed: &str, diagnostics: &Option<TurnDiagnostics>) -> bool {
+    if trimmed != "/diag" {
+        return false;
+    }
+    eprintln!("{}", diag_output(diagnostics));
+    true
 }
 
 /// Ghost-text hint shared by both REPL helpers' `Hinter` impls: given the
@@ -432,5 +503,115 @@ mod tests {
 
         let line = "/model sonnet";
         assert_eq!(h.hint(line, line.len(), &ctx), None);
+    }
+
+    #[test]
+    fn format_diag_omits_served_model_and_usage_when_unavailable() {
+        // The `--responses` path: only endpoint/requested-model/latency are
+        // ever known — served model and usage must never render as a literal
+        // "None"/"null", they're just absent lines.
+        let d = TurnDiagnostics {
+            requested_model: "monocle-auto".to_string(),
+            served_model: None,
+            endpoint: "https://acme.monocle-ai.com/api/responses".to_string(),
+            latency_ms: 842,
+            usage: None,
+            steps: None,
+        };
+        let block = format_diag(&d);
+        assert_eq!(
+            block,
+            "--- diag ---\n\
+             Endpoint: https://acme.monocle-ai.com/api/responses\n\
+             Requested model: monocle-auto\n\
+             Latency: 842ms\n\
+             --- end diag ---"
+        );
+        assert!(!block.contains("None"));
+        assert!(!block.contains("null"));
+    }
+
+    #[test]
+    fn format_diag_shows_served_model_and_usage_when_present() {
+        let d = TurnDiagnostics {
+            requested_model: "monocle-auto".to_string(),
+            served_model: Some("claude-sonnet-4-6".to_string()),
+            endpoint: "https://api.monocle-ai.com/v1/chat/completions".to_string(),
+            latency_ms: 1234,
+            usage: Some(TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                total_tokens: 165,
+            }),
+            steps: None,
+        };
+        let block = format_diag(&d);
+        assert_eq!(
+            block,
+            "--- diag ---\n\
+             Endpoint: https://api.monocle-ai.com/v1/chat/completions\n\
+             Requested model: monocle-auto\n\
+             Served model: claude-sonnet-4-6\n\
+             Latency: 1234ms\n\
+             Tokens: 120 prompt + 45 completion = 165 total\n\
+             --- end diag ---"
+        );
+    }
+
+    /// `steps` is agent-only — when present it renders between "Latency" and
+    /// "Tokens", since an agent turn's step count is a fact about the turn as
+    /// a whole (like latency), not part of the token accounting.
+    #[test]
+    fn format_diag_shows_steps_when_present() {
+        let d = TurnDiagnostics {
+            requested_model: "monocle-auto".to_string(),
+            served_model: Some("claude-sonnet-4-6".to_string()),
+            endpoint: "https://api.monocle-ai.com/agent".to_string(),
+            latency_ms: 2500,
+            usage: Some(TokenUsage {
+                prompt_tokens: 300,
+                completion_tokens: 80,
+                total_tokens: 380,
+            }),
+            steps: Some(3),
+        };
+        let block = format_diag(&d);
+        assert_eq!(
+            block,
+            "--- diag ---\n\
+             Endpoint: https://api.monocle-ai.com/agent\n\
+             Requested model: monocle-auto\n\
+             Served model: claude-sonnet-4-6\n\
+             Latency: 2500ms\n\
+             Steps: 3\n\
+             Tokens: 300 prompt + 80 completion = 380 total\n\
+             --- end diag ---"
+        );
+    }
+
+    #[test]
+    fn diag_output_shows_nothing_yet_hint_before_first_turn() {
+        let out = diag_output(&None);
+        assert!(out.contains("No response yet"));
+    }
+
+    #[test]
+    fn diag_output_renders_format_diag_when_present() {
+        let d = TurnDiagnostics {
+            requested_model: "monocle-auto".to_string(),
+            served_model: None,
+            endpoint: "https://api.monocle-ai.com/agent".to_string(),
+            latency_ms: 10,
+            usage: None,
+            steps: Some(1),
+        };
+        assert!(diag_output(&Some(d)).contains("Steps: 1"));
+    }
+
+    #[test]
+    fn handle_diag_command_only_consumes_exact_slash_diag() {
+        let diagnostics: Option<TurnDiagnostics> = None;
+        assert!(!handle_diag_command("not diag", &diagnostics));
+        assert!(handle_diag_command("/diag", &diagnostics));
     }
 }

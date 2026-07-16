@@ -77,6 +77,42 @@ fn loop_executes_tool_then_returns_final_answer() {
 }
 
 #[test]
+fn on_turn_step_fires_once_per_llm_call_in_a_multi_step_turn() {
+    // Same tool-call-then-final-answer script as
+    // `loop_executes_tool_then_returns_final_answer`: the fake provider is
+    // called twice (once for the tool-call step, once for the final-answer
+    // step) — `on_turn_step` must fire exactly once per LLM call, i.e. twice.
+    let provider = FakeProvider::new(|req| {
+        if has_tool_result(req) {
+            text_response("done")
+        } else {
+            tool_call_response(
+                "call_1",
+                "write_file",
+                json!({"path":"out.txt","content":"hi"}),
+            )
+        }
+    });
+    let tools = ToolRegistry::with_defaults();
+    let dir = tempfile::tempdir().unwrap();
+    let agent = agent(&provider, &tools, dir.path(), 20);
+
+    let mut rec = RecordingObserver::new();
+    let stop = agent
+        .run(
+            &mut vec![Message::user("write out.txt")],
+            &mut AllowAll,
+            &mut rec,
+            &Cancel::new(),
+        )
+        .unwrap();
+
+    assert!(matches!(stop, RunStop::EndTurn));
+    let steps: Vec<String> = rec.events().into_iter().filter(|e| e == "step").collect();
+    assert_eq!(steps.len(), 2, "expected one on_turn_step per LLM call");
+}
+
+#[test]
 fn denied_side_effecting_tool_is_not_executed() {
     let provider = FakeProvider::new(|req| {
         if has_tool_result(req) {
