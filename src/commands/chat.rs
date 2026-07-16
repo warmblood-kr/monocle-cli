@@ -121,6 +121,21 @@ fn read_one_shot_input(
     Ok(Some((cleaned_text, images)))
 }
 
+/// Resolve a fresh (auto-refreshing) session for this turn, or print the
+/// error and return `None` so the caller can bail out of the turn with
+/// `LoopControl::Continue` — a dead refresh token is a per-turn error here,
+/// never fatal to the whole REPL session.
+fn resolve_turn_session(client: &Client, creds: &Credentials) -> Option<AuthSession> {
+    match try_access_token(client, creds) {
+        Ok(session) => Some(session),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            eprintln!();
+            None
+        }
+    }
+}
+
 /// Resolve inband `file:<path>` refs in a REPL line into images, mirroring the
 /// one-shot path's resolution (`attachment::extract_inband_refs` +
 /// `attachment::resolve`) but returning a failure as `Err(String)` instead of
@@ -262,6 +277,13 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         return Ok(());
     }
 
+    // Built once for the REPL's lifetime (mutable) and refreshed in place
+    // each turn via `MonocleProvider::refresh` — reuses the underlying HTTP
+    // client/connection pool instead of rebuilding one every turn, unlike a
+    // fresh `MonocleProvider::from_session` call which pays `Client::new()`'s
+    // real setup cost each time.
+    let mut provider = MonocleProvider::new(token, router_url.clone());
+
     // Interactive REPL.
     eprintln!("Monocle Chat (model: {model})");
     eprintln!("Router: {router_url}");
@@ -314,28 +336,30 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             }
         };
 
+        // Fresh token each turn (`try_access_token` refreshes if near expiry),
+        // refreshed in place on the shared `provider` (see
+        // `MonocleProvider::refresh`) rather than rebuilding it — mirrors
+        // `monocle agent`'s `Repl::run_turn` so a long-lived interactive
+        // session never sends a stale bearer. Resolved before touching
+        // `convo` (same order as `agent.rs`), so a refresh failure (e.g. a
+        // dead refresh token) never leaves a dangling user message — it's a
+        // per-turn error, not fatal, same recovery shape as a failed
+        // `call_chat` below. Placed here (before `eprintln!();
+        // crate::diag::reset();` below, not after) so this insertion point
+        // doesn't land on the same anchor as the sibling `/diag` PR's
+        // `Instant::now()` insertion right after `crate::diag::reset()`.
+        let session = match resolve_turn_session(client, creds) {
+            Some(s) => s,
+            None => return Ok(LoopControl::Continue),
+        };
+        provider.refresh(session);
+
         eprintln!();
         // Reset before this turn's work runs, so the hint below reflects only
         // whether *this* turn logged a network error — not a stale flag left
         // over from an earlier one (this REPL loops for the life of the
         // process, same as `monocle agent`'s).
         crate::diag::reset();
-
-        // Fresh token each turn (`try_access_token` refreshes if near expiry)
-        // and a freshly built provider — mirrors `monocle agent`'s
-        // `Repl::run_turn` so a long-lived interactive session never sends a
-        // stale bearer. Resolved before touching `convo` (same order as
-        // `agent.rs`), so a refresh failure (e.g. a dead refresh token) never
-        // leaves a dangling user message — it's a per-turn error, not fatal,
-        // same recovery shape as a failed `call_chat` below.
-        let provider = match try_access_token(client, creds) {
-            Ok(session) => MonocleProvider::from_session(session),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                eprintln!();
-                return Ok(LoopControl::Continue);
-            }
-        };
 
         // Roll back this turn's user message on failure (mirrors `monocle
         // agent`'s `Repl::run_turn` mark/truncate) so a failed turn doesn't
@@ -507,21 +531,22 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
             }
         };
 
-        eprintln!();
-        crate::diag::reset();
-
         // Fresh token each turn, same rationale and ordering as the
         // completions path / `monocle agent`'s `Repl::run_turn` — rebuilds
         // the client so a long-lived REPL never sends a stale bearer. A
-        // refresh failure is a per-turn error, not fatal.
-        let rc = match try_access_token(client, creds) {
-            Ok(session) => ResponsesClient::new(client, session.token, jarvice_url.clone()),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                eprintln!();
-                return Ok(LoopControl::Continue);
-            }
+        // refresh failure is a per-turn error, not fatal. Placed here
+        // (before `eprintln!(); crate::diag::reset();` below, not after) so
+        // this insertion point doesn't land on the same anchor as the
+        // sibling `/diag` PR's `Instant::now()` insertion right after
+        // `crate::diag::reset()`.
+        let session = match resolve_turn_session(client, creds) {
+            Some(s) => s,
+            None => return Ok(LoopControl::Continue),
         };
+        let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
+
+        eprintln!();
+        crate::diag::reset();
 
         match rc.respond(&model, &text, &images, thread_id.as_deref()) {
             Ok(reply) => {

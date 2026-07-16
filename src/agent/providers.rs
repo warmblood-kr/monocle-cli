@@ -389,6 +389,15 @@ impl MonocleProvider {
         Self::new(session.token, session.router_url)
     }
 
+    /// Update this provider's token/router_url from a freshly resolved auth
+    /// session, reusing the existing HTTP client (its connection pool and TLS
+    /// session) rather than rebuilding one — `Client::new()` is real setup cost
+    /// a token refresh doesn't need to pay for every turn.
+    pub fn refresh(&mut self, session: AuthSession) {
+        self.token = session.token;
+        self.router_url = session.router_url;
+    }
+
     fn build_body(&self, req: &ChatRequest, stream: bool) -> Value {
         let mut messages = json!(req.messages);
         // Vision requests (monocle-cli file-attach plan): rewrite the last
