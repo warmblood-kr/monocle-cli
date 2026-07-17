@@ -1,4 +1,5 @@
-//! Shared management commands (`help`/`status`/`config`) for the agent surfaces.
+//! Shared management commands (`help`/`status`/`config`/`diag`) for the agent
+//! surfaces.
 //!
 //! These are handled **locally** — never sent to the agent/LLM — by BOTH the
 //! interactive REPL (`crate::commands::agent`) and the ACP server (`crate::acp`).
@@ -18,6 +19,7 @@ pub(crate) enum Management {
     Help,
     Status,
     Config,
+    Diag,
 }
 
 /// Recognize a management-command invocation. The leading `/` is REQUIRED so a
@@ -31,6 +33,7 @@ pub(crate) fn management_command(input: &str) -> Option<Management> {
         "/help" => Some(Management::Help),
         "/status" => Some(Management::Status),
         "/config" => Some(Management::Config),
+        "/diag" => Some(Management::Diag),
         _ => None,
     }
 }
@@ -69,7 +72,7 @@ pub(crate) fn help_text() -> String {
         "  /help    show this help",
         "  /config  show session config (model, max-steps, workdir, session)",
         "  /status  show login status and session config",
-        "  /diag    show diagnostics for the last turn (served model, endpoint, latency, tokens)",
+        "  /diag    show diagnostics for the last turn (served model, endpoint, latency, tokens, and step count)",
         "  /model   show the current model, or `/model <id>` to switch it",
         "  /exit    quit the REPL (also /quit, Ctrl-D)",
     ]
@@ -124,6 +127,7 @@ mod tests {
         assert_eq!(management_command("/help"), Some(Management::Help));
         assert_eq!(management_command("/status"), Some(Management::Status));
         assert_eq!(management_command("/config"), Some(Management::Config));
+        assert_eq!(management_command("/diag"), Some(Management::Diag));
     }
 
     #[test]
@@ -137,6 +141,7 @@ mod tests {
         assert_eq!(management_command("help"), None);
         assert_eq!(management_command("status"), None);
         assert_eq!(management_command("config"), None);
+        assert_eq!(management_command("diag"), None);
         assert_eq!(management_command("hello"), None);
         assert_eq!(management_command(""), None);
         assert_eq!(management_command("/bogus"), None);

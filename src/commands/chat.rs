@@ -169,13 +169,21 @@ const CHAT_SLASH_COMMANDS: &[&str] = &["/help", "/model", "/diag", "/exit", "/qu
 
 /// The onboarding block printed once at REPL startup (both `run_completions_chat`
 /// and `run_responses_chat`) and re-printed on demand by `/help` — one string,
-/// two call sites, so the two never drift.
+/// two call sites, so the two never drift. The Tab-completion line is built
+/// from `CHAT_SLASH_COMMANDS` itself (not hand-typed) so it can't silently
+/// under-report a command again the way it previously did. The `/diag` line
+/// deliberately doesn't itemize which fields it shows — `run_responses_chat`
+/// never learns a served model or token usage (see `TurnDiagnostics` docs),
+/// so a shared, itemized promise would overclaim for that path; `format_diag`
+/// already self-describes by omitting whatever the backend didn't report.
 fn chat_help_text() -> String {
     [
         "Type your message. Press Ctrl+D to exit.".to_string(),
-        "↑/↓ history, Tab completes /model, /quit, /exit — a multi-line paste is one input."
-            .to_string(),
-        "/diag shows diagnostics (served model, endpoint, latency, tokens) for the last turn."
+        format!(
+            "↑/↓ history, Tab completes {} — a multi-line paste is one input.",
+            CHAT_SLASH_COMMANDS.join(", ")
+        ),
+        "/diag shows diagnostics for the last turn (only what the backend reports is shown)."
             .to_string(),
         "/help shows this message again.".to_string(),
     ]
@@ -432,15 +440,13 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         let started = std::time::Instant::now();
         match call_chat(&provider, &model, convo.clone(), max_tokens, &images) {
             Ok(resp) => {
-                diagnostics = Some(TurnDiagnostics {
-                    requested_model: model.clone(),
-                    served_model: resp.model.clone(),
-                    endpoint: format!("{turn_router_url}{}", endpoints::CHAT_COMPLETIONS),
-                    latency_ms: started.elapsed().as_millis(),
-                    usage: resp.usage.clone(),
-                    // A chat turn is always exactly one LLM call.
-                    steps: None,
-                });
+                diagnostics = Some(TurnDiagnostics::for_chat(
+                    model.clone(),
+                    resp.model.clone(),
+                    format!("{turn_router_url}{}", endpoints::CHAT_COMPLETIONS),
+                    started.elapsed().as_millis(),
+                    resp.usage.clone(),
+                ));
                 convo.push(Message::assistant(resp.content));
                 let mut out = std::io::stdout();
                 out.write_all(b"\n\n")?;
@@ -627,15 +633,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         let started = std::time::Instant::now();
         match rc.respond(&model, &text, &images, thread_id.as_deref()) {
             Ok(reply) => {
-                diagnostics = Some(TurnDiagnostics {
-                    requested_model: model.clone(),
-                    served_model: None,
-                    endpoint: format!("{jarvice_url}/api/responses"),
-                    latency_ms: started.elapsed().as_millis(),
-                    usage: None,
-                    // A chat turn is always exactly one LLM call.
-                    steps: None,
-                });
+                diagnostics = Some(TurnDiagnostics::for_chat(
+                    model.clone(),
+                    None,
+                    format!("{jarvice_url}/api/responses"),
+                    started.elapsed().as_millis(),
+                    None,
+                ));
                 println!("{}", reply.content);
                 // Announce the thread id only when it's newly learned (the
                 // first turn) or changed — not on every turn, since it's

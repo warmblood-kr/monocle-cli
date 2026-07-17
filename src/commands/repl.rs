@@ -68,6 +68,48 @@ pub struct TurnDiagnostics {
     pub steps: Option<u32>,
 }
 
+impl TurnDiagnostics {
+    /// A chat turn is always exactly one LLM call — `steps` is never
+    /// meaningful here, so callers don't set it themselves (and can't get it
+    /// wrong the way a bare struct literal would let them).
+    pub fn for_chat(
+        requested_model: String,
+        served_model: Option<String>,
+        endpoint: String,
+        latency_ms: u128,
+        usage: Option<TokenUsage>,
+    ) -> Self {
+        Self {
+            requested_model,
+            served_model,
+            endpoint,
+            latency_ms,
+            usage,
+            steps: None,
+        }
+    }
+
+    /// An agent turn's tool-use loop can call the LLM several times —
+    /// `steps` records how many this turn actually took.
+    pub fn for_agent(
+        requested_model: String,
+        served_model: Option<String>,
+        endpoint: String,
+        latency_ms: u128,
+        usage: Option<TokenUsage>,
+        steps: u32,
+    ) -> Self {
+        Self {
+            requested_model,
+            served_model,
+            endpoint,
+            latency_ms,
+            usage,
+            steps: Some(steps),
+        }
+    }
+}
+
 /// Render `/diag`'s bordered block (same `--- ... ---` framing as the
 /// `--responses` REPL's prior-history replay). Lines for data the backend
 /// didn't report are omitted entirely — never printed as `None`/`null`.

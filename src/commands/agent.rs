@@ -188,8 +188,9 @@ impl Repl<'_> {
         // Fresh token each turn (get_access_token refreshes if near expiry).
         let auth = get_access_token(self.client, self.creds);
         // Captured before `MonocleProvider::from_session` consumes `auth` —
-        // `/diag`'s endpoint must reflect the request this turn actually sent.
-        let turn_endpoint = auth.router_url.clone();
+        // `/diag`'s endpoint must reflect the request this turn actually sent
+        // (the full URL `MonocleProvider` posts to, not just the router base).
+        let turn_endpoint = format!("{}{}", auth.router_url, crate::endpoints::CHAT_COMPLETIONS);
         let provider = MonocleProvider::from_session(auth);
         let agent = Agent::with_max_steps(
             &provider,
@@ -231,14 +232,14 @@ impl Repl<'_> {
         out.write_all(b"\n")?;
         out.flush()?;
 
-        self.diagnostics = Some(TurnDiagnostics {
-            requested_model: self.model.clone(),
-            served_model: observer.served_model.clone(),
-            endpoint: turn_endpoint,
-            latency_ms: started.elapsed().as_millis(),
-            usage: observer.usage.clone(),
-            steps: Some(observer.steps),
-        });
+        self.diagnostics = Some(TurnDiagnostics::for_agent(
+            self.model.clone(),
+            observer.served_model.clone(),
+            turn_endpoint,
+            started.elapsed().as_millis(),
+            observer.usage.clone(),
+            observer.steps,
+        ));
 
         // Persist this turn's new messages (append-only).
         if let Some(store) = &self.session {
