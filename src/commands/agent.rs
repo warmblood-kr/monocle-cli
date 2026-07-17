@@ -18,7 +18,7 @@ use crate::agent::SYSTEM_PROMPT;
 use crate::auth::get_access_token;
 use crate::colors as c;
 use crate::commands::model_list::{fetch_model_ids, handle_model_command};
-use crate::commands::repl::{run_repl, LoopControl, ModelReplHelper};
+use crate::commands::repl::{mode_banner, run_repl, LoopControl, ModelReplHelper, PROMPT};
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
@@ -232,7 +232,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
 
     eprintln!(
         "{} {}",
-        c::dim("agent · workdir"),
+        mode_banner("agent", c::orange),
         c::dim(&workdir.display().to_string())
     );
     // Interactive sessions gate side-effecting tools behind a y/N prompt (unless
@@ -355,7 +355,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     };
     let history_path = home_dir().join(".monocle").join("agent_history");
 
-    run_repl(helper, history_path, "» ", |msg| {
+    run_repl(helper, history_path, PROMPT, |msg| {
         // `/model` switches the model for subsequent turns (handled before
         // the general dispatch since it carries an argument).
         if handle_model_command(msg, &mut repl.model) {

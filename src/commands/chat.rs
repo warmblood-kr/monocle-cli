@@ -11,7 +11,7 @@ use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
 use crate::auth::{get_access_token, jarvice_url_for, try_access_token, AuthSession};
 use crate::commands::model_list::{fetch_model_ids, handle_model_command};
-use crate::commands::repl::{run_repl, LoopControl, ModelReplHelper};
+use crate::commands::repl::{mode_banner, run_repl, LoopControl, ModelReplHelper, PROMPT};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
@@ -376,6 +376,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         "/diag shows diagnostics (served model, endpoint, latency, tokens) for the last turn."
     );
     eprintln!("---");
+    eprintln!("{}", mode_banner("chat", crate::colors::cyan));
 
     // Separate history file from `monocle agent`'s — the two REPLs' histories
     // stay independent. The Editor build, bracketed-paste config, history
@@ -399,7 +400,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     // first successful turn.
     let mut diagnostics: Option<TurnDiagnostics> = None;
 
-    run_repl(helper, history_path, "> ", |trimmed| {
+    run_repl(helper, history_path, PROMPT, |trimmed| {
         if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
             return Ok(control);
         }
@@ -613,7 +614,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         }
     }
 
-    run_repl(helper, history_path, "> ", |trimmed| {
+    eprintln!("{}", mode_banner("chat", crate::colors::cyan));
+
+    run_repl(helper, history_path, PROMPT, |trimmed| {
         if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
             return Ok(control);
         }

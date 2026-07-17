@@ -43,3 +43,36 @@ pub fn cyan(s: &str) -> String {
 pub fn red(s: &str) -> String {
     wrap("31", "39", s)
 }
+
+/// Monocle brand orange (#f97316, DESIGN.md §2 Primary/Orange/500) via
+/// truecolor ANSI. Reserved for the handful of deliberate brand touchpoints —
+/// today, just `monocle agent`'s "▸ agent" mode banner (`monocle chat`'s "▸
+/// chat" banner deliberately stays cyan, see `commands::repl::mode_banner`) —
+/// NOT a general-purpose accent color; the rest of this CLI intentionally
+/// stays muted/cyan (gh/brew convention) so it never fights the user's
+/// terminal theme.
+pub fn orange(s: &str) -> String {
+    wrap("38;2;249;115;22", "39", s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::orange;
+    use std::env;
+    use std::sync::Mutex;
+
+    // `FORCE_COLOR` is process-wide state and `cargo test` runs unit tests on
+    // parallel threads within one process — guard the mutation so a future
+    // test that reads/sets NO_COLOR/FORCE_COLOR (or asserts exact-equality on
+    // colored output) can't race with this one.
+    static COLOR_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn orange_wraps_with_truecolor_sgr_when_forced() {
+        let _guard = COLOR_ENV_LOCK.lock().unwrap();
+        env::set_var("FORCE_COLOR", "1");
+        let out = orange("agent");
+        env::remove_var("FORCE_COLOR");
+        assert!(out.contains("38;2;249;115;22"));
+    }
+}
