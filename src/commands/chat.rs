@@ -5,7 +5,7 @@ use serde_json::Value;
 use chrono::TimeZone;
 
 use crate::agent::providers::{
-    ChatRequest, ChatResponse, ImageAttachment, LlmProvider, Message, MonocleProvider,
+    ChatRequest, ChatResponse, ImageAttachment, LlmProvider, Message, MonocleProvider, ToolCall,
 };
 use crate::agent::DEFAULT_MODEL;
 use crate::attachment;
@@ -337,7 +337,10 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             messages.push(Message::system(sp));
         }
         messages.push(Message::user(&text));
-        call_chat(&provider, &model, messages, max_tokens, &images)?;
+        let resp = call_chat(&provider, &model, messages, max_tokens, &images)?;
+        if let Some(msg) = dropped_tool_calls_message(&resp.tool_calls, 0, "monocle chat") {
+            eprintln!("{msg}");
+        }
         let mut out = std::io::stdout();
         out.write_all(b"\n")?;
         out.flush()?;
@@ -447,6 +450,9 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
                     started.elapsed().as_millis(),
                     resp.usage.clone(),
                 ));
+                if let Some(msg) = dropped_tool_calls_message(&resp.tool_calls, 0, "monocle chat") {
+                    eprintln!("{msg}");
+                }
                 convo.push(Message::assistant(resp.content));
                 let mut out = std::io::stdout();
                 out.write_all(b"\n\n")?;
@@ -494,6 +500,44 @@ pub fn chat_list_command(client: &Client, creds: &Credentials) -> Result<()> {
     Ok(())
 }
 
+/// Build a warning about tool call(s) a turn couldn't act on, or `None` if
+/// there's nothing to report (monocle-cli#101 / monocle#275 — see
+/// `responses_api::ResponsesReply::tool_calls` for the canonical explanation
+/// of why `--responses` mode can't execute them). Pure — no I/O — so it's
+/// directly unit-testable; the call site does the actual `eprintln!`, same as
+/// this path's other warnings degrading gracefully rather than erroring the
+/// turn. `unparsed` additionally reports tool_calls whose shape didn't even
+/// deserialize (see `responses_api::parse_tool_calls`) — those must be
+/// mentioned too, or a shape mismatch is just as silent as never reading the
+/// field at all. Shared by both `run_responses_chat` and `run_completions_chat`
+/// so plain `monocle chat` gets the same non-silent behavior, not just
+/// `--responses` mode (monocle-cli#101 code review).
+fn dropped_tool_calls_message(
+    tool_calls: &[ToolCall],
+    unparsed: usize,
+    mode: &str,
+) -> Option<String> {
+    if tool_calls.is_empty() && unparsed == 0 {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if !tool_calls.is_empty() {
+        let names = tool_calls
+            .iter()
+            .map(|tc| tc.function.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        reasons.push(format!("tool call(s) ({names})"));
+    }
+    if unparsed > 0 {
+        reasons.push(format!("{unparsed} tool call(s) in an unrecognized shape"));
+    }
+    Some(format!(
+        "⚠ model requested {} but {mode} does not execute tools yet — see https://github.com/warmblood-kr/monocle-cli/issues/101 (try `monocle agent` for local tool execution today)",
+        reasons.join(" and ")
+    ))
+}
+
 /// `--responses`: jarvice's `/api/responses` (see `responses_api` module
 /// docs). The server owns the conversation thread — this REPL only tracks
 /// the `thread_id` to pass on the next turn, never a local message history.
@@ -534,6 +578,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
         let reply = rc.respond(&model, &text, &images, options.resume.as_deref())?;
+        if let Some(msg) = dropped_tool_calls_message(
+            &reply.tool_calls,
+            reply.unparsed_tool_calls,
+            "--responses mode",
+        ) {
+            eprintln!("{msg}");
+        }
         println!("{}", reply.content);
         if let Some(id) = reply.thread_id {
             eprintln!("Thread: {id}");
@@ -640,6 +691,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                     started.elapsed().as_millis(),
                     None,
                 ));
+                if let Some(msg) = dropped_tool_calls_message(
+                    &reply.tool_calls,
+                    reply.unparsed_tool_calls,
+                    "--responses mode",
+                ) {
+                    eprintln!("{msg}");
+                }
                 println!("{}", reply.content);
                 // Announce the thread id only when it's newly learned (the
                 // first turn) or changed — not on every turn, since it's
@@ -725,10 +783,56 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_help_text, dispatch_chat_command, handle_help_command, resolve_max_tokens,
-        resolve_repl_attachments, TurnDiagnostics,
+        chat_help_text, dispatch_chat_command, dropped_tool_calls_message, handle_help_command,
+        resolve_max_tokens, resolve_repl_attachments, TurnDiagnostics,
     };
+    use crate::agent::providers::{FunctionCall, ToolCall};
     use crate::commands::repl::LoopControl;
+
+    fn tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn dropped_tool_calls_message_none_when_nothing_to_report() {
+        assert_eq!(dropped_tool_calls_message(&[], 0, "--responses mode"), None);
+    }
+
+    #[test]
+    fn dropped_tool_calls_message_names_the_call_and_the_mode() {
+        // monocle-cli#101 code review: the pairing between obtaining a reply
+        // and warning about it was previously enforced by convention only,
+        // with no test ever exercising the warning text itself. This locks
+        // it down directly, against the pure (non-eprintln!) builder.
+        let msg = dropped_tool_calls_message(&[tool_call("generate_image")], 0, "--responses mode")
+            .expect("should produce a message");
+        assert!(msg.contains("generate_image"), "{msg}");
+        assert!(msg.contains("--responses mode"), "{msg}");
+        assert!(msg.contains("monocle agent"), "{msg}");
+    }
+
+    #[test]
+    fn dropped_tool_calls_message_reports_unparsed_count_even_with_no_named_calls() {
+        let msg = dropped_tool_calls_message(&[], 3, "--responses mode").expect("should report");
+        assert!(msg.contains('3'), "{msg}");
+        assert!(msg.contains("unrecognized shape"), "{msg}");
+    }
+
+    #[test]
+    fn dropped_tool_calls_message_reports_both_named_and_unparsed() {
+        let msg = dropped_tool_calls_message(&[tool_call("read_file")], 1, "monocle chat")
+            .expect("should report");
+        assert!(msg.contains("read_file"), "{msg}");
+        assert!(msg.contains('1'), "{msg}");
+        assert!(msg.contains("monocle chat"), "{msg}");
+    }
 
     // The shared `ModelReplHelper` (Completer/Hinter, slash-command +
     // `/model` fuzzy completion) now lives in `commands::repl` and is

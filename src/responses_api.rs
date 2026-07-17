@@ -24,7 +24,7 @@
 
 use serde_json::{json, Value};
 
-use crate::agent::providers::ImageAttachment;
+use crate::agent::providers::{ensure_tool_call_ids, ImageAttachment, ToolCall};
 use crate::error::{AppError, Result};
 use crate::net::Client;
 use crate::origin::auth_headers;
@@ -37,6 +37,24 @@ use crate::origin::auth_headers;
 pub struct ResponsesReply {
     pub content: String,
     pub thread_id: Option<String>,
+    /// Tool calls the model requested, surfaced but NOT executed
+    /// (monocle-cli#101 / monocle#275) — **this is the canonical explanation,
+    /// referenced rather than repeated elsewhere**: jarvice's `/api/responses`
+    /// only runs its MCP tool-execution loop on the streaming branch, and this
+    /// client always sends `"stream": false` (see the module docs), so a
+    /// non-empty `tool_calls` here means the model's request went unexecuted.
+    /// Callers must warn rather than silently drop it — actually executing
+    /// tools in this mode is out of scope (tracked separately, monocle#274).
+    pub tool_calls: Vec<ToolCall>,
+    /// Count of `tool_calls` entries jarvice sent whose JSON shape didn't
+    /// deserialize into `ToolCall` (e.g. a missing `id`, or `function.arguments`
+    /// sent as a parsed object rather than a JSON-encoded string). Parsed
+    /// per-entry (see `parse_tool_calls`) specifically so ONE malformed entry
+    /// can't silently discard every OTHER, well-formed entry alongside it —
+    /// the all-or-nothing failure mode a single `Vec<ToolCall>` deserialize
+    /// would have. Callers should mention this count too, not just `tool_calls`,
+    /// so a shape mismatch is never silent either (monocle-cli#101).
+    pub unparsed_tool_calls: usize,
 }
 
 /// Build the `input` field: a plain string when there's no attachment (the
@@ -118,18 +136,54 @@ impl<'a> ResponsesClient<'a> {
             )));
         }
         let data: Value = resp.json()?;
-        if data.get("choices").and_then(|c| c.get(0)).is_none() {
-            return Err(AppError::new(format!(
-                "unexpected /api/responses reply (no choices): {data}"
-            )));
-        }
-        let content = data["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
         let thread_id = resp.header("x-thread-id").map(str::to_string);
-        Ok(ResponsesReply { content, thread_id })
+        parse_reply(&data, thread_id)
     }
+}
+
+/// Parse a `/api/responses` JSON body into a `ResponsesReply`. Split out from
+/// `respond` so the parsing — including the `tool_calls` extraction
+/// (monocle-cli#101) — can be exercised directly against fixture JSON in
+/// tests, without an HTTP round-trip.
+fn parse_reply(data: &Value, thread_id: Option<String>) -> Result<ResponsesReply> {
+    if data.get("choices").and_then(|c| c.get(0)).is_none() {
+        return Err(AppError::new(format!(
+            "unexpected /api/responses reply (no choices): {data}"
+        )));
+    }
+    let message = &data["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or_default().to_string();
+    let (tool_calls, unparsed_tool_calls) = parse_tool_calls(&message["tool_calls"]);
+    Ok(ResponsesReply {
+        content,
+        thread_id,
+        tool_calls,
+        unparsed_tool_calls,
+    })
+}
+
+/// Deserialize a `message.tool_calls` JSON value entry-by-entry rather than as
+/// one `Vec<ToolCall>` (monocle-cli#101): `serde`'s derived `Vec<T>` decode
+/// fails the WHOLE sequence if a single element doesn't match `ToolCall`'s
+/// shape, which would silently discard every other, well-formed tool call
+/// alongside it — reproducing the exact silent-drop bug this fix exists for,
+/// just one layer deeper. Returns the entries that parsed (ids normalized via
+/// `ensure_tool_call_ids`, same as the chat-proxy path) plus a count of the
+/// ones that didn't, so a caller can report both instead of neither.
+fn parse_tool_calls(value: &Value) -> (Vec<ToolCall>, usize) {
+    let Some(entries) = value.as_array() else {
+        return (Vec::new(), 0);
+    };
+    let mut tool_calls = Vec::new();
+    let mut unparsed = 0usize;
+    for entry in entries {
+        match serde_json::from_value::<ToolCall>(entry.clone()) {
+            Ok(tc) => tool_calls.push(tc),
+            Err(_) => unparsed += 1,
+        }
+    }
+    ensure_tool_call_ids(&mut tool_calls);
+    (tool_calls, unparsed)
 }
 
 #[cfg(test)]
@@ -166,6 +220,101 @@ mod tests {
             build_input("", &images),
             json!([{"type": "input_image", "image_url": "https://example.com/a.png"}])
         );
+    }
+
+    /// Build a minimal `/api/responses`-shaped body, optionally with a
+    /// `tool_calls` array on `choices[0].message`.
+    fn responses_body(content: &str, tool_calls: Option<Value>) -> Value {
+        let mut message = json!({"content": content});
+        if let Some(tc) = tool_calls {
+            message["tool_calls"] = tc;
+        }
+        json!({"choices": [{"message": message}]})
+    }
+
+    #[test]
+    fn tool_calls_empty_when_absent() {
+        // The common, no-tool-calls case: `tool_calls` must come back empty,
+        // not error, when the field is simply missing from the message.
+        let data = responses_body("hello", None);
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.content, "hello");
+        assert!(reply.tool_calls.is_empty());
+        assert_eq!(reply.unparsed_tool_calls, 0);
+    }
+
+    #[test]
+    fn tool_calls_populated_when_present() {
+        // monocle-cli#101: a non-streaming /api/responses reply can legitimately
+        // carry an unexecuted tool_calls array — it must round-trip intact into
+        // `ResponsesReply.tool_calls` so the caller can warn instead of
+        // silently dropping it.
+        let data = responses_body(
+            "",
+            Some(json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+            }])),
+        );
+        let reply = parse_reply(&data, Some("thread_1".to_string())).unwrap();
+        assert_eq!(reply.thread_id.as_deref(), Some("thread_1"));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "call_1");
+        assert_eq!(reply.tool_calls[0].function.name, "read_file");
+        assert_eq!(
+            reply.tool_calls[0].function.arguments,
+            "{\"path\":\"a.txt\"}"
+        );
+        assert_eq!(reply.unparsed_tool_calls, 0);
+    }
+
+    #[test]
+    fn one_malformed_tool_call_no_longer_discards_its_well_formed_sibling() {
+        // The regression this fix closes (monocle-cli#101 code review): a
+        // naive `Vec<ToolCall>` deserialize fails the WHOLE array on one bad
+        // element. `parse_tool_calls` must parse per-entry instead, so the
+        // well-formed `read_file` call survives even though the second entry
+        // is missing `function` entirely.
+        let data = responses_body(
+            "",
+            Some(json!([
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "call_2", "type": "function"},
+            ])),
+        );
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].function.name, "read_file");
+        // The malformed entry is counted, not silently dropped with zero trace.
+        assert_eq!(reply.unparsed_tool_calls, 1);
+    }
+
+    #[test]
+    fn all_malformed_tool_calls_are_counted_not_silently_dropped() {
+        let data = responses_body("", Some(json!([{"id": "call_1"}, {"id": "call_2"}])));
+        let reply = parse_reply(&data, None).unwrap();
+        assert!(reply.tool_calls.is_empty());
+        assert_eq!(reply.unparsed_tool_calls, 2);
+    }
+
+    #[test]
+    fn tool_call_missing_id_gets_normalized_like_the_chat_proxy_path() {
+        // monocle-cli#101 code review: `parse_reply` must normalize an
+        // empty/missing `id` the same way `agent::providers::parse_response_value`
+        // already does for the chat-proxy path (`ensure_tool_call_ids`), so the
+        // two `ToolCall`-producing parsers don't quietly diverge on the same type.
+        let data = responses_body(
+            "",
+            Some(json!([{
+                "id": "",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }])),
+        );
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "call_0");
     }
 
     #[test]
