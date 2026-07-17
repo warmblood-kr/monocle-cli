@@ -24,7 +24,7 @@
 
 use serde_json::{json, Value};
 
-use crate::agent::providers::ImageAttachment;
+use crate::agent::providers::{ImageAttachment, ToolCall};
 use crate::error::{AppError, Result};
 use crate::net::Client;
 use crate::origin::auth_headers;
@@ -37,6 +37,14 @@ use crate::origin::auth_headers;
 pub struct ResponsesReply {
     pub content: String,
     pub thread_id: Option<String>,
+    /// Tool calls the model requested, surfaced but NOT executed
+    /// (monocle-cli#101 / monocle#275): jarvice's `/api/responses` only runs
+    /// its MCP tool-execution loop on the streaming branch, and this client
+    /// always sends `"stream": false` (see the module docs), so a non-empty
+    /// `tool_calls` here means the model's request went unexecuted. Callers
+    /// must warn rather than silently drop it — actually executing tools in
+    /// this mode is out of scope (tracked separately, monocle#274).
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// Build the `input` field: a plain string when there's no attachment (the
@@ -118,18 +126,30 @@ impl<'a> ResponsesClient<'a> {
             )));
         }
         let data: Value = resp.json()?;
-        if data.get("choices").and_then(|c| c.get(0)).is_none() {
-            return Err(AppError::new(format!(
-                "unexpected /api/responses reply (no choices): {data}"
-            )));
-        }
-        let content = data["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
         let thread_id = resp.header("x-thread-id").map(str::to_string);
-        Ok(ResponsesReply { content, thread_id })
+        parse_reply(&data, thread_id)
     }
+}
+
+/// Parse a `/api/responses` JSON body into a `ResponsesReply`. Split out from
+/// `respond` so the parsing — including the `tool_calls` extraction
+/// (monocle-cli#101) — can be exercised directly against fixture JSON in
+/// tests, without an HTTP round-trip.
+fn parse_reply(data: &Value, thread_id: Option<String>) -> Result<ResponsesReply> {
+    if data.get("choices").and_then(|c| c.get(0)).is_none() {
+        return Err(AppError::new(format!(
+            "unexpected /api/responses reply (no choices): {data}"
+        )));
+    }
+    let message = &data["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or_default().to_string();
+    let tool_calls: Vec<ToolCall> =
+        serde_json::from_value(message["tool_calls"].clone()).unwrap_or_default();
+    Ok(ResponsesReply {
+        content,
+        thread_id,
+        tool_calls,
+    })
 }
 
 #[cfg(test)]
@@ -165,6 +185,51 @@ mod tests {
         assert_eq!(
             build_input("", &images),
             json!([{"type": "input_image", "image_url": "https://example.com/a.png"}])
+        );
+    }
+
+    /// Build a minimal `/api/responses`-shaped body, optionally with a
+    /// `tool_calls` array on `choices[0].message`.
+    fn responses_body(content: &str, tool_calls: Option<Value>) -> Value {
+        let mut message = json!({"content": content});
+        if let Some(tc) = tool_calls {
+            message["tool_calls"] = tc;
+        }
+        json!({"choices": [{"message": message}]})
+    }
+
+    #[test]
+    fn tool_calls_empty_when_absent() {
+        // The common, no-tool-calls case: `tool_calls` must come back empty,
+        // not error, when the field is simply missing from the message.
+        let data = responses_body("hello", None);
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.content, "hello");
+        assert!(reply.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn tool_calls_populated_when_present() {
+        // monocle-cli#101: a non-streaming /api/responses reply can legitimately
+        // carry an unexecuted tool_calls array — it must round-trip intact into
+        // `ResponsesReply.tool_calls` so the caller can warn instead of
+        // silently dropping it.
+        let data = responses_body(
+            "",
+            Some(json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+            }])),
+        );
+        let reply = parse_reply(&data, Some("thread_1".to_string())).unwrap();
+        assert_eq!(reply.thread_id.as_deref(), Some("thread_1"));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "call_1");
+        assert_eq!(reply.tool_calls[0].function.name, "read_file");
+        assert_eq!(
+            reply.tool_calls[0].function.arguments,
+            "{\"path\":\"a.txt\"}"
         );
     }
 

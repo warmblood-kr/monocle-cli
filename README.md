@@ -269,6 +269,10 @@ Notes:
   it's fully generated, unlike the plain chat path's live token stream.
 - **`--system-prompt`/`--system-prompt-file`/`--max-tokens` are ignored** — the
   endpoint has no equivalent fields (a warning is printed if you pass them).
+- **Tool calls aren't executed** — this mode doesn't run a tool loop yet; if a
+  tool-calling model requests one, a warning is printed to stderr naming it
+  instead of silently dropping it (see
+  [monocle-cli#101](https://github.com/warmblood-kr/monocle-cli/issues/101)).
 - **Known auth gap**: this endpoint currently rejects the CLI's access token
   with a 401 (`JWT missing required claim: email`) against real staging/prod
   tenants — the same open issue that blocks `monocle mcp` today. It's fine to

@@ -494,6 +494,29 @@ pub fn chat_list_command(client: &Client, creds: &Credentials) -> Result<()> {
     Ok(())
 }
 
+/// Surface (never silently drop) any `tool_calls` a `--responses` turn came
+/// back with (monocle-cli#101 / monocle#275): jarvice's `/api/responses` only
+/// runs its MCP tool-execution loop on the streaming branch, and this client
+/// always sends `"stream": false`, so a tool-calling model's request goes
+/// unexecuted here. Actually executing tools in this mode is out of scope
+/// (tracked separately, monocle#274) — this just makes the drop visible
+/// instead of silent, on stderr like every other warning in this path, and
+/// degrades gracefully rather than erroring the turn.
+fn warn_dropped_tool_calls(reply: &crate::responses_api::ResponsesReply) {
+    if reply.tool_calls.is_empty() {
+        return;
+    }
+    let names = reply
+        .tool_calls
+        .iter()
+        .map(|tc| tc.function.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "⚠ model requested tool call(s) ({names}) but --responses mode does not execute tools yet — see https://github.com/warmblood-kr/monocle-cli/issues/101"
+    );
+}
+
 /// `--responses`: jarvice's `/api/responses` (see `responses_api` module
 /// docs). The server owns the conversation thread — this REPL only tracks
 /// the `thread_id` to pass on the next turn, never a local message history.
@@ -534,6 +557,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
         let reply = rc.respond(&model, &text, &images, options.resume.as_deref())?;
+        warn_dropped_tool_calls(&reply);
         println!("{}", reply.content);
         if let Some(id) = reply.thread_id {
             eprintln!("Thread: {id}");
@@ -640,6 +664,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                     started.elapsed().as_millis(),
                     None,
                 ));
+                warn_dropped_tool_calls(&reply);
                 println!("{}", reply.content);
                 // Announce the thread id only when it's newly learned (the
                 // first turn) or changed — not on every turn, since it's
