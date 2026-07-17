@@ -18,7 +18,7 @@ use crate::agent::SYSTEM_PROMPT;
 use crate::auth::get_access_token;
 use crate::colors as c;
 use crate::commands::model_list::{fetch_model_ids, handle_model_command};
-use crate::commands::repl::{run_repl, LoopControl, ModelReplHelper, PROMPT};
+use crate::commands::repl::{mode_banner, run_repl, LoopControl, ModelReplHelper, PROMPT};
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
@@ -232,7 +232,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
 
     eprintln!(
         "{} {}",
-        c::orange("\u{25B8} agent"),
+        mode_banner("agent", c::orange),
         c::dim(&workdir.display().to_string())
     );
     // Interactive sessions gate side-effecting tools behind a y/N prompt (unless

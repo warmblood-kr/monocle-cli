@@ -29,6 +29,17 @@ use crate::error::Result;
 /// this prompt.
 pub const PROMPT: &str = "\u{276F} "; // ❯ — the modern CLI prompt glyph (Starship/Spaceship convention), replacing the old "$"/">" default.
 
+/// Renders this REPL's mode-identity marker ("▸ <label>") in the given color
+/// — shared so `monocle chat`'s and `monocle agent`'s banners (and any future
+/// REPL mode's) can't drift on the glyph or format the way the prompt caret
+/// itself briefly did before `PROMPT` was unified. Callers still choose their
+/// own color (agent: orange, "the active/acting mode" per DESIGN.md; chat:
+/// cyan, informational) and print it themselves, since some banners (agent's)
+/// append extra context (the workdir) that isn't part of this shared shape.
+pub fn mode_banner(label: &str, colorize: impl Fn(&str) -> String) -> String {
+    colorize(&format!("\u{25B8} {label}"))
+}
+
 /// What the per-line callback wants the loop to do next.
 pub enum LoopControl {
     Continue,
