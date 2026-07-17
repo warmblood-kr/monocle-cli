@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::commands::{config_text, help_text, login_view, status_text};
-use crate::agent::providers::{Message, MonocleProvider};
+use crate::agent::providers::{ChatResponse, Message, MonocleProvider, TokenUsage};
 use crate::agent::runner::{Agent, AllowAll, Approver, Cancel, Observer};
 use crate::agent::session::{session_path, SessionStore};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
@@ -18,7 +18,9 @@ use crate::agent::SYSTEM_PROMPT;
 use crate::auth::get_access_token;
 use crate::colors as c;
 use crate::commands::model_list::{fetch_model_ids, handle_model_command};
-use crate::commands::repl::{mode_banner, run_repl, LoopControl, ModelReplHelper, PROMPT};
+use crate::commands::repl::{
+    diag_output, mode_banner, run_repl, LoopControl, ModelReplHelper, TurnDiagnostics, PROMPT,
+};
 use crate::credentials::Credentials;
 use crate::error::Result;
 use crate::net::Client;
@@ -35,7 +37,15 @@ pub struct AgentOptions {
     pub auto_approve: bool,
 }
 
-struct CliObserver;
+/// Turn-scoped accumulator for `/diag`: `Agent::run`'s tool-use loop can call
+/// the LLM several times per turn (each a "step"), and this collects the
+/// last-known served model plus a running token total across all of them.
+#[derive(Default)]
+struct CliObserver {
+    served_model: Option<String>,
+    usage: Option<TokenUsage>,
+    steps: u32,
+}
 impl Observer for CliObserver {
     fn on_text_delta(&mut self, delta: &str) {
         // Stream assistant text to stdout as it arrives (tool progress goes to stderr).
@@ -63,12 +73,35 @@ impl Observer for CliObserver {
         // Control notices go to stderr — stdout stays the clean answer channel.
         eprintln!("\n{}", c::dim(msg));
     }
+    fn on_turn_step(&mut self, resp: &ChatResponse) {
+        self.steps += 1;
+        if let Some(model) = &resp.model {
+            self.served_model = Some(model.clone());
+        }
+        if let Some(u) = &resp.usage {
+            // Each step's `usage.prompt_tokens` reflects that step's *entire*
+            // re-sent conversation, so summing across steps overcounts
+            // "distinct prompt content" — but it's still the right number for
+            // "total tokens this turn billed across all its LLM calls", the
+            // practically useful DX/cost question, so it's summed anyway.
+            let acc = self.usage.get_or_insert(TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            });
+            acc.prompt_tokens = acc.prompt_tokens.saturating_add(u.prompt_tokens);
+            acc.completion_tokens = acc.completion_tokens.saturating_add(u.completion_tokens);
+            acc.total_tokens = acc.total_tokens.saturating_add(u.total_tokens);
+        }
+    }
 }
 
 /// The slash commands the REPL understands, offered by the completer and shown
 /// by `/help`. Kept here (next to the dispatcher) so completion never drifts from
 /// what `dispatch_command` / `parse_model_command` actually handle.
-const SLASH_COMMANDS: &[&str] = &["/help", "/config", "/status", "/model", "/exit", "/quit"];
+const SLASH_COMMANDS: &[&str] = &[
+    "/help", "/config", "/status", "/model", "/diag", "/exit", "/quit",
+];
 
 /// Interactive approver: prompts the user (stderr) before each side-effecting
 /// tool call and reads a y/N answer from stdin. Default (empty / non-y / EOF) is
@@ -136,6 +169,9 @@ struct Repl<'a> {
     auto_approve: bool,
     /// Whether this session runs on an interactive TTY (can prompt for approval).
     interactive: bool,
+    /// Last turn's diagnostics, shown on demand by `/diag` — `None` until the
+    /// first successful turn, mirroring `monocle chat`'s REPL.
+    diagnostics: Option<TurnDiagnostics>,
 }
 
 impl Repl<'_> {
@@ -151,6 +187,10 @@ impl Repl<'_> {
     fn run_turn(&mut self, user: String) -> Result<()> {
         // Fresh token each turn (get_access_token refreshes if near expiry).
         let auth = get_access_token(self.client, self.creds);
+        // Captured before `MonocleProvider::from_session` consumes `auth` —
+        // `/diag`'s endpoint must reflect the request this turn actually sent
+        // (the full URL `MonocleProvider` posts to, not just the router base).
+        let turn_endpoint = format!("{}{}", auth.router_url, crate::endpoints::CHAT_COMPLETIONS);
         let provider = MonocleProvider::from_session(auth);
         let agent = Agent::with_max_steps(
             &provider,
@@ -174,9 +214,16 @@ impl Repl<'_> {
             } else {
                 &mut allow
             };
-        if let Err(e) = agent.run(&mut self.convo, approver, &mut CliObserver, &self.cancel) {
+        // Wrapped tightly around the agent-core loop itself — this is what
+        // `/diag`'s `Latency:` line reports.
+        let started = std::time::Instant::now();
+        let mut observer = CliObserver::default();
+        if let Err(e) = agent.run(&mut self.convo, approver, &mut observer, &self.cancel) {
             // Roll back this failed turn's (partial) messages so a retry — and the
-            // persisted session — stay well-formed.
+            // persisted session — stay well-formed. A failed turn must not leave
+            // stale diagnostics from an earlier successful turn silently
+            // displayable via `/diag`, mirroring `monocle chat`'s REPL.
+            self.diagnostics = None;
             self.convo.truncate(mark);
             return Err(e);
         }
@@ -184,6 +231,15 @@ impl Repl<'_> {
         let mut out = std::io::stdout();
         out.write_all(b"\n")?;
         out.flush()?;
+
+        self.diagnostics = Some(TurnDiagnostics::for_agent(
+            self.model.clone(),
+            observer.served_model.clone(),
+            turn_endpoint,
+            started.elapsed().as_millis(),
+            observer.usage.clone(),
+            observer.steps,
+        ));
 
         // Persist this turn's new messages (append-only).
         if let Some(store) = &self.session {
@@ -201,6 +257,7 @@ enum Command {
     Help,
     Config,
     Status,
+    Diag,
     Quit,
     Unknown(String),
     /// Not a slash command — send it to the agent as a normal turn.
@@ -217,6 +274,7 @@ fn dispatch_command(input: &str) -> Command {
         "/help" => Command::Help,
         "/config" => Command::Config,
         "/status" => Command::Status,
+        "/diag" => Command::Diag,
         "/exit" | "/quit" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     }
@@ -287,6 +345,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         persisted,
         auto_approve: opts.auto_approve,
         interactive,
+        diagnostics: None,
     };
 
     // Seed the first turn from the prompt arg, or (non-interactive) piped stdin.
@@ -398,6 +457,10 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
                 );
                 Ok(LoopControl::Continue)
             }
+            Command::Diag => {
+                eprintln!("{}", diag_output(&repl.diagnostics));
+                Ok(LoopControl::Continue)
+            }
             Command::Unknown(cmd) => {
                 eprintln!("unknown command: {cmd} (try /help)");
                 Ok(LoopControl::Continue)
@@ -446,6 +509,7 @@ mod tests {
         assert_eq!(dispatch_command("/help"), Command::Help);
         assert_eq!(dispatch_command("/config"), Command::Config);
         assert_eq!(dispatch_command("/status"), Command::Status);
+        assert_eq!(dispatch_command("/diag"), Command::Diag);
         assert_eq!(dispatch_command("/quit"), Command::Quit);
         assert_eq!(dispatch_command("/exit"), Command::Quit);
     }

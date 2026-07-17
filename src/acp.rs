@@ -31,7 +31,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::agent::commands::{
     config_text, help_text, login_view, management_command, status_text, Management,
 };
-use crate::agent::providers::{Message, MonocleProvider};
+use crate::agent::providers::{ChatResponse, Message, MonocleProvider, TokenUsage};
 use crate::agent::runner::{Agent as CoreAgent, Approver, Cancel, Observer, RunStop};
 use crate::agent::tools::{
     shell_invocation, FsBackend, ShellExec, ShellResult, ToolContext, ToolOutcome, ToolRegistry,
@@ -39,6 +39,7 @@ use crate::agent::tools::{
 };
 use crate::agent::{DEFAULT_MAX_STEPS, DEFAULT_MODEL, SYSTEM_PROMPT};
 use crate::auth::try_access_token;
+use crate::commands::repl::{diag_output, TurnDiagnostics};
 use crate::credentials::Credentials;
 use crate::error::{AppError, Result};
 use crate::net::Client;
@@ -93,6 +94,9 @@ struct SessionState {
     /// True while a `prompt()` turn is executing for this session. Guards against
     /// concurrent prompts corrupting the `mem::take`-n conversation (see Fix #8).
     running: bool,
+    /// Last turn's diagnostics, shown on demand by `/diag` — `None` until the
+    /// first successful turn, mirroring `commands::agent::Repl.diagnostics`.
+    diagnostics: Option<TurnDiagnostics>,
 }
 
 /// The model id for a session: the client's `_meta["monocle.model"]` if present
@@ -154,6 +158,14 @@ impl MonocleAgent {
                 let login = login_view(&Credentials::new());
                 status_text(login.as_ref(), &model, DEFAULT_MAX_STEPS, &cwd, Some(key))
             }
+            Management::Diag => {
+                let sessions = self.sessions.borrow();
+                let diagnostics = sessions.get(key).map(|st| &st.diagnostics);
+                match diagnostics {
+                    Some(d) => diag_output(d),
+                    None => diag_output(&None),
+                }
+            }
         }
     }
 }
@@ -168,6 +180,10 @@ fn advertised_commands() -> Vec<acp::AvailableCommand> {
         acp::AvailableCommand::new(
             "config",
             "Show the session config (model, working directory)",
+        ),
+        acp::AvailableCommand::new(
+            "diag",
+            "Show diagnostics for the last turn (served model, endpoint, latency, tokens, and step count)",
         ),
     ]
 }
@@ -207,6 +223,7 @@ impl Agent for MonocleAgent {
                 cancel: Cancel::new(),
                 model: session_model(&args.meta),
                 running: false,
+                diagnostics: None,
             },
         );
         // Advertise the locally-handled management commands so an ACP client can
@@ -298,6 +315,9 @@ impl Agent for MonocleAgent {
             let mut observer = AcpObserver {
                 updates: updates.clone(),
                 sid: sid.clone(),
+                served_model: None,
+                usage: None,
+                steps: 0,
             };
             let mut approver = AcpApprover {
                 calls: updates,
@@ -306,8 +326,17 @@ impl Agent for MonocleAgent {
             };
             let session = match try_access_token(&Client::new(), &Credentials::new()) {
                 Ok(s) => s,
-                Err(e) => return (convo, Err(e)),
+                Err(e) => return (convo, Err(e), None),
             };
+            // Captured before `MonocleProvider::from_session` consumes `session` —
+            // `/diag`'s endpoint must reflect the request this turn actually sent
+            // (the full URL `MonocleProvider` posts to, not just the router base),
+            // mirroring `commands::agent::Repl::run_turn`.
+            let turn_endpoint = format!(
+                "{}{}",
+                session.router_url,
+                crate::endpoints::CHAT_COMPLETIONS
+            );
             convo.push(Message::user(user));
             let provider = MonocleProvider::from_session(session);
             let tools = ToolRegistry::with_defaults();
@@ -326,9 +355,30 @@ impl Agent for MonocleAgent {
                     cancel: cancel.clone(),
                 }));
             }
+            // Wrapped tightly around the agent-core loop itself — this is what
+            // `/diag`'s `Latency:` line reports.
+            let started = std::time::Instant::now();
+            let requested_model = model.clone();
             let agent = CoreAgent::with_max_steps(&provider, &tools, ctx, model, DEFAULT_MAX_STEPS);
             let result = agent.run(&mut convo, &mut approver, &mut observer, &cancel);
-            (convo, result)
+            // A hard error (e.g. a network failure) must not leave stale
+            // diagnostics from an earlier successful turn silently displayable
+            // via `/diag` — mirroring `commands::agent::Repl::run_turn`. A
+            // cancelled or step-budget-exhausted turn is NOT an error
+            // (`Ok(RunStop::Cancelled | RunStop::MaxSteps)`) and still gets
+            // diagnostics, exactly like the CLI REPL.
+            let diagnostics = match &result {
+                Ok(_) => Some(TurnDiagnostics::for_agent(
+                    requested_model,
+                    observer.served_model.clone(),
+                    turn_endpoint,
+                    started.elapsed().as_millis(),
+                    observer.usage.clone(),
+                    observer.steps,
+                )),
+                Err(_) => None,
+            };
+            (convo, result, diagnostics)
         })
         .await
         .map_err(|_| acp::Error::internal_error())?;
@@ -336,10 +386,13 @@ impl Agent for MonocleAgent {
         // ALWAYS write the (possibly partial) conversation back and release the
         // running guard — for BOTH Ok and Err — so tools already executed this
         // turn are not replayed on the client's retry (Fix #1). Then propagate.
-        let (updated_convo, result) = joined;
+        // `diagnostics` is unconditionally overwritten too (`None` on error), so
+        // a failed turn never leaves stale `/diag` output from an earlier turn.
+        let (updated_convo, result, diagnostics) = joined;
         if let Some(st) = self.sessions.borrow_mut().get_mut(&key) {
             st.convo = updated_convo;
             st.running = false;
+            st.diagnostics = diagnostics;
         }
 
         // The loop reports the real stop reason — a cancel landing on the final
@@ -378,6 +431,13 @@ fn tool_kind(name: &str) -> acp::ToolKind {
 struct AcpObserver {
     updates: mpsc::UnboundedSender<ClientCall>,
     sid: acp::SessionId,
+    /// Turn-scoped accumulator for `/diag`, mirroring
+    /// `commands::agent::CliObserver`: `Agent::run`'s tool-use loop can call
+    /// the LLM several times per turn (each a "step"), and these collect the
+    /// last-known served model plus a running token total across all of them.
+    served_model: Option<String>,
+    usage: Option<TokenUsage>,
+    steps: u32,
 }
 
 impl AcpObserver {
@@ -426,6 +486,27 @@ impl Observer for AcpObserver {
         self.send(acp::SessionUpdate::AgentThoughtChunk(
             acp::ContentChunk::new(acp::ContentBlock::from(msg.to_string())),
         ));
+    }
+    fn on_turn_step(&mut self, resp: &ChatResponse) {
+        self.steps += 1;
+        if let Some(model) = &resp.model {
+            self.served_model = Some(model.clone());
+        }
+        if let Some(u) = &resp.usage {
+            // Each step's `usage.prompt_tokens` reflects that step's *entire*
+            // re-sent conversation, so summing across steps overcounts
+            // "distinct prompt content" — but it's still the right number for
+            // "total tokens this turn billed across all its LLM calls", the
+            // practically useful DX/cost question, so it's summed anyway.
+            let acc = self.usage.get_or_insert(TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            });
+            acc.prompt_tokens = acc.prompt_tokens.saturating_add(u.prompt_tokens);
+            acc.completion_tokens = acc.completion_tokens.saturating_add(u.completion_tokens);
+            acc.total_tokens = acc.total_tokens.saturating_add(u.total_tokens);
+        }
     }
 }
 
@@ -976,6 +1057,9 @@ mod tests {
         let observer = AcpObserver {
             updates: tx,
             sid: acp::SessionId::new("s"),
+            served_model: None,
+            usage: None,
+            steps: 0,
         };
         (observer, rx)
     }
@@ -1226,18 +1310,18 @@ mod tests {
     }
 
     #[test]
-    fn advertised_commands_names_help_status_config() {
+    fn advertised_commands_names_help_status_config_diag() {
         let names: Vec<String> = advertised_commands()
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        assert_eq!(names, vec!["help", "status", "config"]);
+        assert_eq!(names, vec!["help", "status", "config", "diag"]);
     }
 
     #[test]
     fn new_session_advertises_management_commands() {
         // Drive the real `new_session` and drain the updates channel to confirm it
-        // enqueues an AvailableCommandsUpdate naming help/status/config.
+        // enqueues an AvailableCommandsUpdate naming help/status/config/diag.
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
         let agent = MonocleAgent::new(tx);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1260,9 +1344,62 @@ mod tests {
             }
         }
         let names = names.expect("expected an AvailableCommandsUpdate notification");
-        for cmd in ["help", "status", "config"] {
+        for cmd in ["help", "status", "config", "diag"] {
             assert!(names.iter().any(|n| n == cmd), "missing {cmd} in {names:?}");
         }
+    }
+
+    /// Build a real session via `new_session` and return its key, so
+    /// `management_response`/session-state tests exercise the production
+    /// dispatch path instead of hand-rolling a `SessionState`.
+    fn new_session_key(agent: &MonocleAgent) -> String {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let resp = rt
+            .block_on(agent.new_session(acp::NewSessionRequest::new("/work")))
+            .expect("new_session");
+        resp.session_id.0.to_string()
+    }
+
+    #[test]
+    fn management_response_diag_shows_nothing_yet_before_first_turn() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientCall>();
+        let agent = MonocleAgent::new(tx);
+        let key = new_session_key(&agent);
+
+        let out = agent.management_response(&key, Management::Diag);
+        assert!(out.contains("No response yet"), "{out}");
+    }
+
+    /// `/diag` (ACP's `Management::Diag` arm) must render the same
+    /// `TurnDiagnostics` shape the CLI REPL's `/diag` does — this drives
+    /// `management_response` against a session whose `diagnostics` was
+    /// populated (as `prompt()`'s turn-execution path does on a successful
+    /// turn), confirming the wiring reaches `diag_output`/`format_diag`.
+    #[test]
+    fn management_response_diag_shows_stored_diagnostics() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientCall>();
+        let agent = MonocleAgent::new(tx);
+        let key = new_session_key(&agent);
+
+        {
+            let mut sessions = agent.sessions.borrow_mut();
+            let st = sessions.get_mut(&key).expect("session exists");
+            st.diagnostics = Some(TurnDiagnostics::for_agent(
+                DEFAULT_MODEL.to_string(),
+                Some("claude-sonnet-4-6".to_string()),
+                "https://api.example.com/v1/chat/completions".to_string(),
+                42,
+                None,
+                2,
+            ));
+        }
+
+        let out = agent.management_response(&key, Management::Diag);
+        assert!(out.contains("Steps: 2"), "{out}");
+        assert!(out.contains("claude-sonnet-4-6"), "{out}");
+        assert!(out.contains("42ms"), "{out}");
     }
 
     #[test]
