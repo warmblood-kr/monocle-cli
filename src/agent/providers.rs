@@ -200,7 +200,11 @@ fn parse_usage(data: &Value) -> Option<TokenUsage> {
 /// `call_{i}` from position when the wire delivered an empty one. Downstream (ACP)
 /// correlates `ToolCall` / permission / `ToolCallUpdate` by this id, so an empty id
 /// would silently break that correlation. Non-empty ids are left untouched.
-fn ensure_tool_call_ids(tool_calls: &mut [ToolCall]) {
+///
+/// `pub(crate)`: also called by `responses_api::parse_tool_calls` (monocle-cli#101),
+/// which parses `tool_calls` off jarvice's `/api/responses` reply against this same
+/// `ToolCall` type and must not silently diverge on id-normalization from this path.
+pub(crate) fn ensure_tool_call_ids(tool_calls: &mut [ToolCall]) {
     for (i, tc) in tool_calls.iter_mut().enumerate() {
         if tc.id.is_empty() {
             tc.id = format!("call_{i}");
