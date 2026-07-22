@@ -407,10 +407,63 @@ monocle agent "summarize the TODOs in this repo" --workdir .
 ```
 
 > ⚠️ In an interactive session, each side-effecting tool call (write/edit + shell) asks
-> for a `[y/N]` confirmation before it runs; anything but `y` denies it. Pass
-> `--auto-approve` to skip the prompt (dangerous). Non-interactive runs (a prompt
-> argument or piped stdin) have no TTY to prompt on and run tools unattended, so run
-> those only in a directory you trust.
+> for confirmation before it runs, with four choices — **`y`** (allow once),
+> **`s`** (allow for the rest of this session), **`a`** (allow always), or **`N`**
+> (deny, the default; anything unrecognized also denies). Choosing `s` or `a` means
+> that tool won't be asked about again — `s` for the current session only, `a`
+> persisted to `.monocle/settings.json` in the working directory so future sessions
+> skip it too. Granularity is per tool, except the shell, which is remembered per
+> command (allowing `npm test` doesn't green-light every shell command). Pass
+> `--auto-approve` to skip the prompt entirely (dangerous). Non-interactive runs (a
+> prompt argument or piped stdin) have no TTY to prompt on and run tools unattended,
+> so run those only in a directory you trust.
+>
+> `.monocle/settings.json` is a plain JSON file you can hand-edit; `allowedTools`
+> is a list of rules like `"write_file"`, `"edit_file"`, `"bash(npm test)"`, or a
+> `*`-suffixed prefix `"bash(cargo *)"` to allow a whole command family:
+>
+> ```json
+> { "allowedTools": ["edit_file", "bash(cargo *)"] }
+> ```
+
+**Guide files (`AGENTS.md`).** At startup `monocle agent` reads a guide file and
+appends it to the system prompt, so personal- and project-level instructions steer
+the agent. Two locations load in order — your personal `~/.monocle/` (applies
+everywhere), then the working directory (project-specific, loaded last so it wins
+on conflict). Each loaded guide is noted on stderr. This seeds a fresh session; a
+resumed `--session` replays its own saved prompt.
+
+In each location the **first** of these names that exists is used — at most one
+file per directory:
+
+| Priority | File | Why |
+|---|---|---|
+| 1 | `AGENTS.md` | the cross-tool open convention (Codex, Cursor, Amp, Jules, …) |
+| 2 | `AGENT.md` | Amp's fallback spelling |
+| 3 | `CLAUDE.md` | Claude Code |
+| 4 | `GEMINI.md` | Gemini CLI |
+
+So a repo that already has any of these works with no new file. (There is no
+`CODEX.md` — Codex reads `AGENTS.md`.)
+
+**Imports.** `AGENTS.md` itself is plain Markdown with no preprocessing, but
+`@path` imports are a common extension; we follow [Claude Code's
+semantics](https://code.claude.com/docs/en/memory), the most precisely specified:
+
+```markdown
+See @docs/style.md for conventions and @~/.monocle/shared-rules.md for mine.
+```
+
+- `@path/to/file` is expanded anywhere **outside** code spans and fenced blocks
+- relative paths resolve against **the importing file's own directory**; `~/` is
+  home; absolute paths work
+- imported files may import further, up to **4 hops** deep
+- backtick-wrap to escape: `` `@README` `` stays literal
+- a missing import is left in place as written
+
+Guide files support **no command execution** — imports are the only
+preprocessing (same as Claude Code's CLAUDE.md; `!`-style bash execution is a
+slash-command feature, not a memory-file one).
 
 **`monocle acp`** runs Monocle as an **[Agent Client Protocol](https://agentclientprotocol.com)**
 agent over stdio (JSON-RPC) — an editor, the Monocle desktop app, or Craft spawns it and

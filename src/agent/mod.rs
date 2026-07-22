@@ -5,6 +5,8 @@
 //! tools, permission/sandboxing, session, and ACP surface come later.
 
 pub mod commands;
+pub mod guide;
+pub mod permission;
 pub mod providers;
 pub mod runner;
 pub mod session;

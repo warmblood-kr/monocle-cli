@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::commands::{config_text, help_text, login_view, status_text};
+use crate::agent::permission::PermissionStore;
 use crate::agent::providers::{ChatResponse, Message, MonocleProvider, TokenUsage};
 use crate::agent::runner::{Agent, AllowAll, Approver, Cancel, Observer};
 use crate::agent::session::{session_path, SessionStore};
@@ -103,45 +104,83 @@ const SLASH_COMMANDS: &[&str] = &[
     "/help", "/config", "/status", "/model", "/diag", "/exit", "/quit",
 ];
 
-/// Interactive approver: prompts the user (stderr) before each side-effecting
-/// tool call and reads a y/N answer from stdin. Default (empty / non-y / EOF) is
-/// deny — the safe choice. Only ever constructed on an interactive TTY, where the
-/// terminal is in cooked mode during a turn so a plain `read_line` works.
-struct PromptApprover;
-impl Approver for PromptApprover {
+/// Interactive approver with a memory. Before each side-effecting tool call it
+/// consults the session's [`PermissionStore`]; if the call is already authorized
+/// (allowed earlier this session, or persisted in `.monocle/settings.json`) it
+/// runs with no prompt. Otherwise it prompts on stderr with four choices —
+/// **[y]** once, **[s]** this session, **[a]** always (persist), **[N]** deny —
+/// and records `s`/`a` in the store. Default (empty / unknown / EOF) is deny.
+/// Only ever constructed on an interactive TTY, where the terminal is in cooked
+/// mode during a turn so a plain `read_line` works.
+struct PromptApprover<'a> {
+    store: &'a mut PermissionStore,
+}
+impl Approver for PromptApprover<'_> {
     fn approve(&mut self, _id: &str, name: &str, args: &Value) -> bool {
-        // For `shell`, the interesting thing is the command; else show the JSON.
-        let summary = if name == "shell" {
-            args.get("command")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| args.to_string())
-        } else {
-            args.to_string()
-        };
+        // A prior session/persisted decision skips the prompt entirely.
+        if self.store.is_allowed(name, args) {
+            return true;
+        }
+        // For the shell tool the interesting thing is the command; else the JSON.
+        let summary = args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| args.to_string());
         eprint!(
             "{} {} {}: {}  {} ",
             c::yellow("⚠"),
             c::dim("run"),
             c::bold(name),
             c::dim(&one_line(&summary, 120)),
-            c::yellow("[y/N]"),
+            c::yellow("[y]es once / [s]ession / [a]lways / [N]o"),
         );
         let _ = std::io::stderr().flush();
         let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) => false, // EOF → deny
+        let answer = match std::io::stdin().read_line(&mut line) {
+            Ok(0) => ApprovalAnswer::Deny, // EOF → deny
             Ok(_) => approve_answer(&line),
-            Err(_) => false,
+            Err(_) => ApprovalAnswer::Deny,
+        };
+        match answer {
+            ApprovalAnswer::Once => true,
+            ApprovalAnswer::Session => {
+                self.store.allow_session(name, args);
+                true
+            }
+            ApprovalAnswer::Always => {
+                if let Err(e) = self.store.allow_always(name, args) {
+                    eprintln!("{} 권한을 저장하지 못했습니다: {e}", c::yellow("⚠"));
+                }
+                true
+            }
+            ApprovalAnswer::Deny => false,
         }
     }
 }
 
-/// Pure y/N decision for an approval prompt: an answer counts as "yes" only if,
-/// after leading whitespace, it starts with `y`/`Y`. Everything else (empty,
-/// `n`, a stray word) is "no" — the safe default.
-fn approve_answer(input: &str) -> bool {
-    matches!(input.trim_start().chars().next(), Some('y') | Some('Y'))
+/// A four-way approval decision. Anything but a leading `y`/`s`/`a` is `Deny` —
+/// the safe default (empty, `n`, EOF, a stray word).
+#[derive(Debug, PartialEq, Eq)]
+enum ApprovalAnswer {
+    /// `y` — allow this one call only.
+    Once,
+    /// `s` — allow for the rest of this session (in-memory).
+    Session,
+    /// `a` — allow always; persist to `.monocle/settings.json`.
+    Always,
+    /// `n` / empty / unknown / EOF — deny.
+    Deny,
+}
+
+/// Pure decision for an approval prompt, keyed on the first non-space character.
+fn approve_answer(input: &str) -> ApprovalAnswer {
+    match input.trim_start().chars().next() {
+        Some('y') | Some('Y') => ApprovalAnswer::Once,
+        Some('s') | Some('S') => ApprovalAnswer::Session,
+        Some('a') | Some('A') => ApprovalAnswer::Always,
+        _ => ApprovalAnswer::Deny,
+    }
 }
 
 /// Approver-selection policy: use the interactive [`PromptApprover`] only on an
@@ -169,6 +208,9 @@ struct Repl<'a> {
     auto_approve: bool,
     /// Whether this session runs on an interactive TTY (can prompt for approval).
     interactive: bool,
+    /// Remembered tool-permission decisions (session + `.monocle/settings.json`),
+    /// so an allowed tool isn't re-prompted for the life of the session.
+    permissions: PermissionStore,
     /// Last turn's diagnostics, shown on demand by `/diag` — `None` until the
     /// first successful turn, mirroring `monocle chat`'s REPL.
     diagnostics: Option<TurnDiagnostics>,
@@ -207,7 +249,9 @@ impl Repl<'_> {
         // Gate side-effecting tools behind the user in interactive mode; scripts
         // / one-shot / `--auto-approve` keep the unattended `AllowAll` behavior.
         let mut allow = AllowAll;
-        let mut prompt = PromptApprover;
+        let mut prompt = PromptApprover {
+            store: &mut self.permissions,
+        };
         let approver: &mut dyn Approver =
             if use_prompt_approver(self.auto_approve, self.interactive) {
                 &mut prompt
@@ -310,6 +354,15 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         move || c.cancel()
     });
 
+    // Layer any guide files (personal ~/.monocle, then the workdir) onto the
+    // system prompt so user/project instructions steer the agent. Only seeds a
+    // *new* conversation; a resumed session replays its own persisted system turn.
+    let guides = crate::agent::guide::load_guides(&home_dir(), &workdir);
+    for g in &guides {
+        eprintln!("{}", c::dim(&format!("loaded guide — {}", g.label)));
+    }
+    let system_prompt = crate::agent::guide::augment_system_prompt(SYSTEM_PROMPT, &guides);
+
     // Optional named session: resume by replaying the persisted conversation.
     let session: Option<SessionStore> = opts
         .session
@@ -319,7 +372,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         Some(store) => {
             let loaded = store.load()?;
             if loaded.is_empty() {
-                (vec![Message::system(SYSTEM_PROMPT)], 0)
+                (vec![Message::system(system_prompt)], 0)
             } else {
                 eprintln!(
                     "{}",
@@ -329,8 +382,12 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
                 (loaded, n)
             }
         }
-        None => (vec![Message::system(SYSTEM_PROMPT)], 0),
+        None => (vec![Message::system(system_prompt)], 0),
     };
+
+    // Load any previously-persisted tool permissions for this working directory
+    // so allowed tools run without re-prompting.
+    let permissions = PermissionStore::load(&workdir);
 
     let mut repl = Repl {
         client,
@@ -345,6 +402,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         persisted,
         auto_approve: opts.auto_approve,
         interactive,
+        permissions,
         diagnostics: None,
     };
 
@@ -529,16 +587,26 @@ mod tests {
     }
 
     #[test]
-    fn approve_answer_treats_y_prefix_as_yes() {
+    fn approve_answer_treats_y_prefix_as_once() {
         for yes in ["y", "yes", "Y", "YES", "yeah", "  y", "y\n"] {
-            assert!(approve_answer(yes), "expected yes for {yes:?}");
+            assert_eq!(approve_answer(yes), ApprovalAnswer::Once, "for {yes:?}");
         }
     }
 
     #[test]
-    fn approve_answer_defaults_to_no() {
-        for no in ["", "n", "no", "N", "find", "\n", "  ", "1", "sure"] {
-            assert!(!approve_answer(no), "expected no for {no:?}");
+    fn approve_answer_maps_session_and_always() {
+        for s in ["s", "session", "S", "  s"] {
+            assert_eq!(approve_answer(s), ApprovalAnswer::Session, "for {s:?}");
+        }
+        for a in ["a", "always", "A", "a\n"] {
+            assert_eq!(approve_answer(a), ApprovalAnswer::Always, "for {a:?}");
+        }
+    }
+
+    #[test]
+    fn approve_answer_defaults_to_deny() {
+        for no in ["", "n", "no", "N", "find", "\n", "  ", "1"] {
+            assert_eq!(approve_answer(no), ApprovalAnswer::Deny, "for {no:?}");
         }
     }
 
