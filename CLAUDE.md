@@ -33,12 +33,41 @@ cargo fmt               # 포매팅
 > 즉 **프로덕션 세션이 살아있는 상태에서 `monocle login --env stg`를 실행하면 그
 > 세션은 경고 없이 사라진다.** 되돌리려면 재인증해야 한다.
 >
+> **잃는 것이 액세스 토큰만이 아니다.** 프로덕션 리프레시 토큰은 수명이 길어 —
+> 관측 시점 기준 **2026-08-22까지 유효** — 그동안 무인(unattended) 프로덕션
+> 호출을 가능하게 한다. 덮어쓰면 그 능력이 통째로 사라지고, 재인증에는 사람이
+> 붙어야 한다. (날짜는 해당 시점의 실제 세션에서 관측한 값이며 계약이 아니다.)
+>
 > **환경을 바꾸기 전에 백업할 것:**
 > ```bash
 > cp ~/.monocle/credentials.json ~/.monocle/credentials.json.prod   # 전환 전
 > cp ~/.monocle/credentials.json.prod ~/.monocle/credentials.json   # 복구
 > ```
 > (백업본도 토큰이므로 `chmod 600`을 유지하고 레포에 넣지 말 것.)
+>
+> **스테이징은 로그인에 성공해도 동작하지 않을 수 있다.** 스테이징 액세스
+> 토큰에는 `email` 클레임이 없어서(stark#1061) jarvice REST가 401을 낼 수 있다.
+> 즉 "로그인 성공"을 "스테이징이 정상"으로 읽으면 안 된다 — 프로덕션 세션을
+> 날린 대가로 얻은 것이 401뿐일 수 있다.
+
+### 검증 경로 — CLI로 확인한 것은 모바일로 확인한 것이 아니다
+
+`monocle` CLI는 **`X-Session-Id` 헤더를 보내지 않지만 모바일 클라이언트는 보낸다.**
+jarvice는 이 헤더로 처리 분기를 가르므로(jarvice `middleware.py:2440-2451`),
+**CLI에서 통과한 것이 모바일 경로에서도 통과한다는 보장이 없다.** CLI 결과를
+모바일 동작의 근거로 삼는 것은 잘못된 검증이다.
+
+모바일 계열 동작을 검증할 때는 CLI 대신 **헤더 3개를 갖춘 `curl`**을 쓸 것:
+
+```bash
+curl -sS https://stg-agent.monocle-ai.com/<endpoint> \
+  -H 'content-type: application/json' \
+  -H "X-Session-Id: $SESSION_ID" \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+호스트를 헷갈리지 말 것 — 스테이징 **jarvice** 테넌트는 `stg-agent.monocle-ai.com`
+이고, `stg.monocle-ai.com`은 **Stark**(인증 서버)다.
 
 ## 설계 원칙 — 조합성·상호운용성 (유닉스 철학)
 
