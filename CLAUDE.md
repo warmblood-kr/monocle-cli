@@ -21,6 +21,25 @@ cargo fmt               # 포매팅
 - 자격증명 파일(`~/.monocle/credentials.json`)은 drop-in 호환 계약 — JSON 스키마/키
   순서/0600 권한을 바꾸지 말 것 (기존 로그인 사용자가 재인증하지 않도록)
 
+## 인증 · 자격증명
+
+> ⚠️ **자격증명 슬롯은 하나뿐이다 — 환경 전환은 현재 세션을 조용히 파괴한다.**
+>
+> `monocle login`은 `--env <prod|stg|local>`(기본 `prod`)을 받지만, 저장 경로는
+> **환경과 무관하게 `~/.monocle/credentials.json` 하나**다. 환경별 파일이 없다.
+> 로그인은 기존 세션 확인도, 확인 절차도 없이 그대로 덮어쓴다
+> (`src/commands/login.rs`의 `store.write(&creds)`).
+>
+> 즉 **프로덕션 세션이 살아있는 상태에서 `monocle login --env stg`를 실행하면 그
+> 세션은 경고 없이 사라진다.** 되돌리려면 재인증해야 한다.
+>
+> **환경을 바꾸기 전에 백업할 것:**
+> ```bash
+> cp ~/.monocle/credentials.json ~/.monocle/credentials.json.prod   # 전환 전
+> cp ~/.monocle/credentials.json.prod ~/.monocle/credentials.json   # 복구
+> ```
+> (백업본도 토큰이므로 `chmod 600`을 유지하고 레포에 넣지 말 것.)
+
 ## 설계 원칙 — 조합성·상호운용성 (유닉스 철학)
 
 `monocle`은 **"하나를 잘하고 조합 가능한 도구"** 를 지향한다. 최근 코딩 에이전트가
