@@ -86,6 +86,15 @@ impl Client {
             // TCP keepalive lets the OS surface a dead peer on the streaming path
             // (which has no total timeout) without capping a healthy long stream.
             .tcp_keepalive(std::time::Duration::from_secs(60))
+            // Kept below AWS ALB's default 60s idle timeout (our chat-proxy/
+            // jarvice endpoints sit behind one) so THIS client evicts an idle
+            // pooled connection before the peer does. Without this, reqwest's
+            // own default (90s) leaves a ~30s window where we trust a
+            // connection the peer already closed — the next request's send
+            // then fails with a connection reset (surfaced as "error sending
+            // request for url", not a timeout). `send_with_retry` below is
+            // the backstop for whatever this doesn't catch.
+            .pool_idle_timeout(std::time::Duration::from_secs(50))
             .build()
             .expect("failed to build HTTP client");
         Self { inner }
@@ -114,8 +123,9 @@ impl Client {
             req = req.header(*k, *v);
         }
         // Inline send (not the shared `send()`) so the 600s timeout above is the
-        // only cap that applies to the download.
-        let resp = req.send().map_err(|e| AppError(e.to_string()))?;
+        // only cap that applies to the download — but still goes through
+        // `send_with_retry` for the same stale-connection backstop.
+        let resp = send_with_retry("GET", url, req).map_err(|e| AppError(e.to_string()))?;
         let status = resp.status().as_u16();
         let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
         let headers = collect_headers(resp.headers());
@@ -205,7 +215,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let resp = req.send().map_err(|e| AppError(e.to_string()))?;
+        let resp = send_with_retry("POST", url, req).map_err(|e| AppError(e.to_string()))?;
         let status = resp.status().as_u16();
         let content_type = resp
             .headers()
@@ -222,12 +232,56 @@ impl Client {
     }
 }
 
+/// Send a request, retrying exactly once with a fresh connection if the
+/// first attempt fails before we get a response back at all.
+///
+/// No backoff: the overwhelmingly likely cause is a stale pooled connection
+/// (a peer — e.g. an AWS ALB — idle-closed it after we last used it; see
+/// `Client::new`'s `pool_idle_timeout` comment), and a brand-new connection
+/// clears that instantly. Waiting wouldn't help a dead socket, and a genuine
+/// outage fails the retry just as fast as the original attempt — so this is
+/// not the "retry a flaky API with growing backoff" policy (that's a
+/// different problem — real transient 5xx/429 responses from a server that
+/// *did* answer — and would need its own, separately-scoped retry policy).
+///
+/// Safe to retry unconditionally here (not just for idempotent methods):
+/// every call site through this module is an LLM/media API call (chat
+/// completion, token exchange, audio upload/synthesis) where, at worst, a
+/// retry re-dispatches a request the first attempt never got a response for
+/// — wasteful if the server did somehow start work, never corrupting.
+///
+/// `try_clone()` only fails for a non-replayable body (a raw stream); every
+/// body sent through this module (JSON, form, in-memory multipart) is
+/// buffered and clones fine, so this silently skips the retry only in a case
+/// that doesn't occur here.
+fn send_with_retry(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+) -> reqwest::Result<reqwest::blocking::Response> {
+    let retry = req.try_clone();
+    match req.send() {
+        Ok(resp) => Ok(resp),
+        Err(first_err) => {
+            crate::diag::log_network_error(
+                method,
+                url,
+                &format!("retrying once after: {first_err}"),
+            );
+            match retry {
+                Some(retry_req) => retry_req.send(),
+                None => Err(first_err),
+            }
+        }
+    }
+}
+
 fn send(method: &str, url: &str, req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
     // Total request timeout — non-streaming only (see `Client::new`). Streaming
     // (`post_json_stream`) builds and sends its own request without this, so a
     // long generation is never cut short.
     let req = req.timeout(std::time::Duration::from_secs(120));
-    let resp = req.send().map_err(|e| {
+    let resp = send_with_retry(method, url, req).map_err(|e| {
         let msg = e.to_string();
         crate::diag::log_network_error(method, url, &msg);
         AppError(msg)
@@ -304,5 +358,75 @@ impl EventStream {
         let mut s = String::new();
         let _ = self.reader.read_to_string(&mut s);
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::send_with_retry;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Simulates the actual bug: a first attempt that fails, then a
+    /// perfectly normal one. Both connections run a full, ordinary
+    /// accept/read/write/close cycle — the only difference is that the
+    /// first writes content hyper's h1 parser will reject.
+    ///
+    /// (An earlier version of this test instead had the first connection
+    /// die with no response at all, mimicking a stale pooled connection
+    /// exactly — but that made the test itself flaky, independent of
+    /// `send_with_retry`: hyper's client occasionally read the *second*
+    /// connection's perfectly valid response as `UnexpectedMessage` (seen
+    /// even with the first connection's request fully drained before close,
+    /// and even with the retry using a wholly separate `Client`, ruling out
+    /// connection-pool reuse as the cause — some hyper/loopback timing
+    /// artifact specific to two rapid-fire real connections to the same
+    /// address, not a defect in this module. This version sidesteps it
+    /// entirely, at zero cost to what's actually under test: `send_with_retry`
+    /// only cares that the first `send()` returned `Err`, not why.)
+    #[test]
+    fn send_with_retry_recovers_from_a_failed_first_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"not an http response at all\r\n\r\n");
+            }
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                );
+            }
+        });
+
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://{addr}/");
+        let resp = send_with_retry("GET", &url, client.get(&url)).expect("retry should recover");
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// When even the retry fails (the peer never comes back at all), the
+    /// original error surfaces rather than hanging or panicking.
+    #[test]
+    fn send_with_retry_gives_up_after_one_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Drop both the first attempt and the retry.
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://{addr}/");
+        assert!(send_with_retry("GET", &url, client.get(&url)).is_err());
     }
 }
