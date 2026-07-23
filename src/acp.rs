@@ -604,6 +604,51 @@ fn client_round_trip<T>(
     }
 }
 
+/// Wall-clock bound for **teardown** round trips (see
+/// [`client_round_trip_timeout`]). A few seconds is far more than a local editor
+/// needs to ack a `terminal/kill`/`release`, yet still guarantees we can't hang
+/// forever on a silent client.
+const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Sibling of [`client_round_trip`] for **teardown/cleanup** calls that run
+/// *because* the turn was cancelled — `terminal/kill`, `terminal/release`, and
+/// the post-kill `terminal/output` grab.
+///
+/// Those calls must NOT consult `&self.cancel` the way [`client_round_trip`]
+/// does: the cancel flag is, by definition, already set when they run, so the
+/// cancel-aware helper would short-circuit on its anti-hang guard and return
+/// before the ack arrives. The message is still delivered (the `calls.send`
+/// precedes that bail), so today it "works by luck" — but the ack is never
+/// awaited, so a client-side failure is invisible, and a kill issued to service
+/// the cancel could never be confirmed. Instead of the cancel flag, this bounds
+/// the wait with a wall-clock `timeout`: it can't be aborted by the very cancel
+/// it exists to service, yet still can't wedge forever against a silent client.
+/// Timeout (or send/recv failure) collapses to `unavailable`.
+fn client_round_trip_timeout<T>(
+    calls: &mpsc::UnboundedSender<ClientCall>,
+    call: ClientCall,
+    mut rx: oneshot::Receiver<std::result::Result<T, String>>,
+    timeout: std::time::Duration,
+    unavailable: &str,
+) -> std::result::Result<T, String> {
+    if calls.send(call).is_err() {
+        return Err(unavailable.to_string());
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match rx.try_recv() {
+            Ok(res) => return res,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(unavailable.to_string()); // silent client → give up bounded
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(oneshot::error::TryRecvError::Closed) => return Err(unavailable.to_string()),
+        }
+    }
+}
+
 /// Client-mediated [`FsBackend`]: the read/write/edit tools' file I/O is routed
 /// through the ACP client (`fs/read_text_file`, `fs/write_text_file`) instead of
 /// local disk, so the editor can serve unsaved buffers and track changes. Wired
@@ -691,6 +736,24 @@ impl AcpClientShell {
         )
     }
 
+    /// Teardown/cleanup round trip — delegates to [`client_round_trip_timeout`].
+    /// Used only by `kill`/`release`/`output_teardown`, which run *because* of a
+    /// cancel and so must NOT be aborted by `self.cancel` (they'd short-circuit
+    /// before the ack). Bounded by [`TEARDOWN_TIMEOUT`] instead.
+    fn round_trip_timeout<T>(
+        &self,
+        call: ClientCall,
+        rx: oneshot::Receiver<std::result::Result<T, String>>,
+    ) -> std::result::Result<T, String> {
+        client_round_trip_timeout(
+            &self.calls,
+            call,
+            rx,
+            TEARDOWN_TIMEOUT,
+            "acp client terminal unavailable",
+        )
+    }
+
     fn create(
         &self,
         command: &str,
@@ -720,16 +783,32 @@ impl AcpClientShell {
         self.round_trip("terminal output", ClientCall::TerminalOutput(req, tx), rx)
     }
 
+    /// Like [`output`](Self::output), but via the teardown round trip (bounded
+    /// timeout, NOT cancel-aware) — used for the post-kill "grab whatever partial
+    /// output the client has" read, which happens *after* cancel and so must not
+    /// self-abort on the cancel flag.
+    fn output_teardown(
+        &self,
+        terminal_id: &acp::TerminalId,
+    ) -> std::result::Result<acp::TerminalOutputResponse, String> {
+        let req = acp::TerminalOutputRequest::new(self.sid.clone(), terminal_id.clone());
+        let (tx, rx) = oneshot::channel();
+        self.round_trip_timeout(ClientCall::TerminalOutput(req, tx), rx)
+    }
+
+    // Teardown calls use `round_trip_timeout` (not the cancel-aware `round_trip`):
+    // they run *because* the turn was cancelled, so consulting `self.cancel` would
+    // make them short-circuit before the ack (see `client_round_trip_timeout`).
     fn kill(&self, terminal_id: &acp::TerminalId) -> std::result::Result<(), String> {
         let req = acp::KillTerminalCommandRequest::new(self.sid.clone(), terminal_id.clone());
         let (tx, rx) = oneshot::channel();
-        self.round_trip("terminal kill", ClientCall::KillTerminal(req, tx), rx)
+        self.round_trip_timeout(ClientCall::KillTerminal(req, tx), rx)
     }
 
     fn release(&self, terminal_id: &acp::TerminalId) -> std::result::Result<(), String> {
         let req = acp::ReleaseTerminalRequest::new(self.sid.clone(), terminal_id.clone());
         let (tx, rx) = oneshot::channel();
-        self.round_trip("terminal release", ClientCall::ReleaseTerminal(req, tx), rx)
+        self.round_trip_timeout(ClientCall::ReleaseTerminal(req, tx), rx)
     }
 }
 
@@ -772,6 +851,11 @@ impl AcpClientShell {
     /// Poll `terminal/output` until exit / cancel / RPC failure, returning the
     /// accumulated [`ShellResult`] (release is the caller's job).
     fn poll(&self, terminal_id: &acp::TerminalId, cancel: &Cancel) -> ShellResult {
+        // Retain the most recent *successful* output across iterations, so a
+        // cancellation that surfaces via the `Err` arm below (see there) can still
+        // show partial output — the successful `resp` only lives inside the `Ok`
+        // arm otherwise.
+        let mut last_output = String::new();
         loop {
             match self.output(terminal_id) {
                 Ok(resp) => {
@@ -782,31 +866,54 @@ impl AcpClientShell {
                             cancelled: false,
                         };
                     }
+                    last_output = resp.output;
                     if cancel.is_cancelled() {
-                        // Kill, then grab whatever partial output the client has.
-                        let _ = self.kill(terminal_id);
-                        let output = self
-                            .output(terminal_id)
-                            .map(|r| r.output)
-                            .unwrap_or(resp.output);
-                        return ShellResult {
-                            output,
-                            exit_code: None,
-                            cancelled: true,
-                        };
+                        return self.kill_and_collect(terminal_id, last_output);
                     }
                     // Match the local subprocess poll cadence so client-mediated
                     // shell isn't slower to detect exit/cancel (shared const).
                     std::thread::sleep(SHELL_POLL_INTERVAL);
                 }
                 Err(e) => {
+                    // Distinguish a *cancellation* from a genuine RPC failure. The
+                    // cancel-aware `client_round_trip` returns `Err("… cancelled")`
+                    // the moment the cancel flag is set and the ack isn't already
+                    // ready (essentially always: the first `try_recv` after `send`
+                    // is `Empty`). So a cancel landing during the `sleep` above
+                    // makes the very next `output()` return `Err` — that is a
+                    // cancellation, NOT a failed command. Kill and report
+                    // `cancelled: true`, exactly like the `Ok` arm's cancel branch;
+                    // reporting it as a failure (`cancelled: false`) was the bug.
+                    if cancel.is_cancelled() {
+                        return self.kill_and_collect(terminal_id, last_output);
+                    }
+                    // A non-cancel error is a real RPC failure: surface the text.
                     return ShellResult {
                         output: e,
                         exit_code: None,
                         cancelled: false,
-                    }
+                    };
                 }
             }
+        }
+    }
+
+    /// Cancel teardown shared by both `poll` arms: kill the terminal, then grab
+    /// whatever partial output the client still has (falling back to the last
+    /// output we saw). Uses the teardown round trips (`kill`/`output_teardown`,
+    /// bounded-timeout, NOT cancel-aware) so these calls — which run *because* of
+    /// the cancel — aren't themselves aborted by it. Always yields
+    /// `cancelled: true`.
+    fn kill_and_collect(&self, terminal_id: &acp::TerminalId, last_output: String) -> ShellResult {
+        let _ = self.kill(terminal_id);
+        let output = self
+            .output_teardown(terminal_id)
+            .map(|r| r.output)
+            .unwrap_or(last_output);
+        ShellResult {
+            output,
+            exit_code: None,
+            cancelled: true,
         }
     }
 }
@@ -1290,6 +1397,134 @@ mod tests {
             "cancel should be prompt, took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn client_shell_cancel_during_sleep_kills_via_err_arm() {
+        // Bug (a) regression — DETERMINISTIC (no timing races). Reproduces the
+        // production trigger: a cancel that lands while poll() is sleeping makes
+        // the next `terminal/output` return `Err("… cancelled")` (client_round_trip
+        // short-circuits on the cancel flag with the ack still pending). The OLD
+        // Err arm reported that as a FAILED command (cancelled=false, no kill);
+        // the fix must treat it as a cancellation (kill + cancelled=true).
+        //
+        // How it's made deterministic: the responder, on the FIRST poll output,
+        // flips cancel and then HOLDS the ack (never answers) instead of replying.
+        // Holding the ack keeps the oneshot open, so client_round_trip sees
+        // `Empty` + cancel-set → returns `Err("… cancelled")` — the exact prod
+        // path — regardless of thread scheduling. The post-kill teardown grab
+        // (2nd output, via the bounded-timeout helper) is answered so we can also
+        // assert partial output is surfaced.
+        use std::sync::atomic::AtomicBool;
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
+        let killed = std::sync::Arc::new(AtomicBool::new(false));
+        let killed2 = std::sync::Arc::clone(&killed);
+        let cancel = Cancel::new();
+        let flip = cancel.clone();
+        let responder = std::thread::spawn(move || {
+            let mut output_calls = 0u32;
+            // Keep the first output's ack alive so its channel stays open (Empty,
+            // not Closed) → client_round_trip takes the cancel short-circuit.
+            let mut held = Vec::new();
+            while let Some(call) = rx.blocking_recv() {
+                match call {
+                    ClientCall::CreateTerminal(_req, ack) => {
+                        let _ = ack.send(Ok(acp::TerminalId::new("t1")));
+                    }
+                    ClientCall::TerminalOutput(_req, ack) => {
+                        output_calls += 1;
+                        if output_calls == 1 {
+                            // First poll output: flip cancel, then hold the ack.
+                            flip.cancel();
+                            held.push(ack);
+                        } else {
+                            // Post-kill teardown grab: hand back partial output.
+                            let _ = ack.send(Ok(acp::TerminalOutputResponse::new(
+                                "partial-before",
+                                false,
+                            )));
+                        }
+                    }
+                    ClientCall::KillTerminal(_req, ack) => {
+                        killed2.store(true, Ordering::SeqCst);
+                        let _ = ack.send(Ok(()));
+                    }
+                    ClientCall::ReleaseTerminal(_req, ack) => {
+                        let _ = ack.send(Ok(()));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let shell = AcpClientShell {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+            cancel: cancel.clone(),
+        };
+        let r = shell.exec("sleep 5", std::path::Path::new("/work"), &cancel);
+        responder.join().unwrap();
+        assert!(
+            r.cancelled,
+            "Err-arm-under-cancel must report cancelled=true"
+        );
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "a KillTerminal must have been requested from the Err arm"
+        );
+        assert_eq!(
+            r.output, "partial-before",
+            "partial output should be surfaced via the post-kill teardown grab"
+        );
+    }
+
+    #[test]
+    fn client_shell_teardown_completes_despite_cancel_flag() {
+        // Bug (b) regression: kill/release run *because* of a cancel, so the flag
+        // is already set. With the OLD cancel-aware round trip they short-circuit
+        // ("… cancelled") before awaiting the ack — a client-side failure would be
+        // invisible. The fix routes them through the bounded-timeout helper, so
+        // they await the ack and return Ok. (The message was always delivered, so
+        // the OLD path set `killed` too — only the returned Result distinguishes
+        // "ack awaited" from "short-circuited".)
+        use std::sync::atomic::AtomicBool;
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
+        let killed = std::sync::Arc::new(AtomicBool::new(false));
+        let killed2 = std::sync::Arc::clone(&killed);
+        let responder = std::thread::spawn(move || {
+            while let Some(call) = rx.blocking_recv() {
+                match call {
+                    ClientCall::KillTerminal(_req, ack) => {
+                        killed2.store(true, Ordering::SeqCst);
+                        let _ = ack.send(Ok(()));
+                    }
+                    ClientCall::ReleaseTerminal(_req, ack) => {
+                        let _ = ack.send(Ok(()));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let cancel = Cancel::new();
+        cancel.cancel(); // cancel already set — the teardown-time condition
+        let shell = AcpClientShell {
+            calls: tx,
+            sid: acp::SessionId::new("s"),
+            cancel,
+        };
+        let t = acp::TerminalId::new("t1");
+        // OLD code: both short-circuit → Err. Fix: ack awaited → Ok.
+        assert!(
+            shell.kill(&t).is_ok(),
+            "kill ack must be awaited despite cancel"
+        );
+        assert!(
+            shell.release(&t).is_ok(),
+            "release ack must be awaited despite cancel"
+        );
+        responder.join().unwrap();
+        assert!(killed.load(Ordering::SeqCst));
     }
 
     #[test]
