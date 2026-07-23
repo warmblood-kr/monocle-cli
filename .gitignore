@@ -4,6 +4,10 @@
 # IDE
 .idea/
 
+# Per-workdir tool-permission settings written by `monocle agent`
+# (created when the CLI is run from inside this repo).
+.monocle/
+
 # Audio artifacts from `monocle audio …` experiments
 *.mp3
 *.wav

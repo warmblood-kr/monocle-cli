@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::agent::providers::{ChatRequest, LlmProvider, Message};
+use crate::agent::providers::{ChatRequest, ChatResponse, LlmProvider, Message};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
 use crate::error::Result;
 
@@ -62,6 +62,12 @@ pub trait Observer {
     /// A meta/control notice (stopped, cancelled) — NOT model answer text, so the
     /// CLI keeps it off the stdout answer channel.
     fn on_notice(&mut self, _msg: &str) {}
+    /// Called once per LLM call this turn makes (a turn can be several steps
+    /// when tool calls happen) — carries whatever metadata this step's response
+    /// reported (served model, token usage), so a caller can accumulate turn-level
+    /// diagnostics. Default no-op; `Silent` and any observer that doesn't care
+    /// about diagnostics need no changes.
+    fn on_turn_step(&mut self, _resp: &ChatResponse) {}
 }
 
 pub struct Silent;
@@ -164,6 +170,7 @@ impl<'a, P: LlmProvider> Agent<'a, P> {
             let resp = self
                 .provider
                 .chat_stream(&req, &mut |delta| observer.on_text_delta(delta))?;
+            observer.on_turn_step(&resp);
 
             // A mid-stream drop was salvaged into a truncated response
             // (monocle-cli#59): tool_calls are already dropped, so this falls

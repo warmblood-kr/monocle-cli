@@ -91,17 +91,19 @@ Monocle Chat (model: claude-sonnet-4-6)
 Router: https://api.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
 ---
-> Hello
+▸ chat
+❯ Hello
 Hello! How can I help you today?
 
-> /quit
+❯ /quit
 Bye.
 ```
 
 The interactive REPL has full line editing — arrow keys (←/→ to move, ↑/↓ for history),
 and Emacs bindings (Ctrl-A/E to jump to line start/end, Ctrl-K to kill, Ctrl-Y to yank).
-Tab completes `/model`/`/quit`/`/exit` as a dropdown listing every match (not cycling
-one at a time), with the best match also shown as a dim inline hint as you type; a
+Tab completes `/help`/`/model`/`/diag`/`/quit`/`/exit` as a dropdown listing every
+match (not cycling one at a time), with the best match also shown as a dim inline
+hint as you type; a
 multi-line paste is inserted as a single input (submitted only on Enter, not one turn
 per line). Command history persists across sessions in `~/.monocle/chat_history` (kept
 separate from `monocle agent`'s history). The REPL remembers the conversation — each
@@ -113,6 +115,29 @@ switches it for later turns), and `/model <TAB>` fuzzy-completes against the mod
 available to your account (fetched once at startup) — e.g. `/model cla<TAB>` narrows to
 matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in or the
 list can't be fetched, completion just offers nothing (typing a full id still works).
+
+`/diag` shows diagnostics for the **last** turn only — nothing is printed automatically
+after a reply, it's opt-in on demand. Handy with a router alias (e.g. `monocle-auto`) to
+see which concrete model actually served the response:
+
+```console
+❯ /diag
+--- diag ---
+Endpoint: https://api.monocle-ai.com/v1/chat/completions
+Requested model: monocle-auto
+Served model: claude-sonnet-4-6
+Latency: 842ms
+Tokens: 120 prompt + 45 completion = 165 total
+--- end diag ---
+```
+
+`Served model` and `Tokens` are only shown when the backend reports them (always true for
+`monocle chat`'s default path; `--responses`, below, reports neither today, so those lines
+are simply omitted rather than printed as empty). Before the first turn, `/diag` just
+prints a hint to send a message first.
+
+`/help` re-prints the REPL's onboarding message (the same lines shown when the
+session starts) — handy if you've scrolled past it.
 
 One-shot via stdin:
 
@@ -203,11 +228,12 @@ Monocle Chat — Responses API (model: claude-sonnet-4-6)
 jarvice: https://acme.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
 ---
-> Hello
+▸ chat
+❯ Hello
 Hello! How can I help you today?
 Thread: 3fa3b2c1-...
 
-> /quit
+❯ /quit
 Bye.
 ```
 
@@ -217,6 +243,10 @@ Continue a specific thread later (one-shot or REPL) with `--resume <id>`
 ```bash
 echo "and in Python?" | monocle chat --responses --resume 3fa3b2c1-...
 ```
+
+`/diag` also works in this REPL, but the Responses API doesn't echo back a served
+model or token usage, so those lines are omitted — only `Endpoint`/`Requested
+model`/`Latency` are shown.
 
 List your existing threads (including ones started in jarvice's own web UI —
 both share the same storage) with the `list` subcommand:
@@ -239,6 +269,13 @@ Notes:
   it's fully generated, unlike the plain chat path's live token stream.
 - **`--system-prompt`/`--system-prompt-file`/`--max-tokens` are ignored** — the
   endpoint has no equivalent fields (a warning is printed if you pass them).
+- **Tool calls aren't executed** — this mode doesn't run a tool loop yet; if a
+  tool-calling model requests one, a warning is printed to stderr — naming it
+  when its shape parses, or noting the count when it doesn't — instead of
+  silently dropping it (see
+  [monocle-cli#101](https://github.com/warmblood-kr/monocle-cli/issues/101)).
+  `monocle agent` executes tools client-side today, if that's what you need
+  right now.
 - **Known auth gap**: this endpoint currently rejects the CLI's access token
   with a 401 (`JWT missing required claim: email`) against real staging/prod
   tenants — the same open issue that blocks `monocle mcp` today. It's fine to
@@ -357,21 +394,76 @@ persists across sessions in `~/.monocle/agent_history`.
 In the interactive REPL, lines starting with `/` are local management commands (handled
 without calling the model, printed to stderr): `/help` lists them, `/config` shows the
 session config (model, max-steps, workdir, session), `/status` adds your login status,
-`/model` shows the current model (or `/model <id>` switches it for later turns), and
-`/exit` (or `/quit`, Ctrl-D) quits. `/model <TAB>` fuzzy-completes against the model ids
-available to your account (fetched once at startup) — e.g. `/model cla<TAB>` narrows to
-matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in or the
-list can't be fetched, completion just offers nothing (typing a full id still works).
+`/diag` shows diagnostics (served model, endpoint, latency, tokens, and step count) for
+the last turn, `/model` shows the current model (or `/model <id>` switches it for later
+turns), and `/exit` (or `/quit`, Ctrl-D) quits. `/model <TAB>` fuzzy-completes against the
+model ids available to your account (fetched once at startup) — e.g. `/model cla<TAB>`
+narrows to matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in
+or the list can't be fetched, completion just offers nothing (typing a full id still
+works).
 
 ```bash
 monocle agent "summarize the TODOs in this repo" --workdir .
 ```
 
 > ⚠️ In an interactive session, each side-effecting tool call (write/edit + shell) asks
-> for a `[y/N]` confirmation before it runs; anything but `y` denies it. Pass
-> `--auto-approve` to skip the prompt (dangerous). Non-interactive runs (a prompt
-> argument or piped stdin) have no TTY to prompt on and run tools unattended, so run
-> those only in a directory you trust.
+> for confirmation before it runs, with four choices — **`y`** (allow once),
+> **`s`** (allow for the rest of this session), **`a`** (allow always), or **`N`**
+> (deny, the default; anything unrecognized also denies). Choosing `s` or `a` means
+> that tool won't be asked about again — `s` for the current session only, `a`
+> persisted to `.monocle/settings.json` in the working directory so future sessions
+> skip it too. Granularity is per tool, except the shell, which is remembered per
+> command (allowing `npm test` doesn't green-light every shell command). Pass
+> `--auto-approve` to skip the prompt entirely (dangerous). Non-interactive runs (a
+> prompt argument or piped stdin) have no TTY to prompt on and run tools unattended,
+> so run those only in a directory you trust.
+>
+> `.monocle/settings.json` is a plain JSON file you can hand-edit; `allowedTools`
+> is a list of rules like `"write_file"`, `"edit_file"`, `"bash(npm test)"`, or a
+> `*`-suffixed prefix `"bash(cargo *)"` to allow a whole command family:
+>
+> ```json
+> { "allowedTools": ["edit_file", "bash(cargo *)"] }
+> ```
+
+**Guide files (`AGENTS.md`).** At startup `monocle agent` reads a guide file and
+appends it to the system prompt, so personal- and project-level instructions steer
+the agent. Two locations load in order — your personal `~/.monocle/` (applies
+everywhere), then the working directory (project-specific, loaded last so it wins
+on conflict). Each loaded guide is noted on stderr. This seeds a fresh session; a
+resumed `--session` replays its own saved prompt.
+
+In each location the **first** of these names that exists is used — at most one
+file per directory:
+
+| Priority | File | Why |
+|---|---|---|
+| 1 | `AGENTS.md` | the cross-tool open convention (Codex, Cursor, Amp, Jules, …) |
+| 2 | `AGENT.md` | Amp's fallback spelling |
+| 3 | `CLAUDE.md` | Claude Code |
+| 4 | `GEMINI.md` | Gemini CLI |
+
+So a repo that already has any of these works with no new file. (There is no
+`CODEX.md` — Codex reads `AGENTS.md`.)
+
+**Imports.** `AGENTS.md` itself is plain Markdown with no preprocessing, but
+`@path` imports are a common extension; we follow [Claude Code's
+semantics](https://code.claude.com/docs/en/memory), the most precisely specified:
+
+```markdown
+See @docs/style.md for conventions and @~/.monocle/shared-rules.md for mine.
+```
+
+- `@path/to/file` is expanded anywhere **outside** code spans and fenced blocks
+- relative paths resolve against **the importing file's own directory**; `~/` is
+  home; absolute paths work
+- imported files may import further, up to **4 hops** deep
+- backtick-wrap to escape: `` `@README` `` stays literal
+- a missing import is left in place as written
+
+Guide files support **no command execution** — imports are the only
+preprocessing (same as Claude Code's CLAUDE.md; `!`-style bash execution is a
+slash-command feature, not a memory-file one).
 
 **`monocle acp`** runs Monocle as an **[Agent Client Protocol](https://agentclientprotocol.com)**
 agent over stdio (JSON-RPC) — an editor, the Monocle desktop app, or Craft spawns it and

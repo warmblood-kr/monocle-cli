@@ -85,10 +85,11 @@ Monocle Chat (model: claude-sonnet-4-6)
 Router: https://api.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
 ---
-> 안녕하세요
+▸ chat
+❯ 안녕하세요
 안녕하세요! 무엇을 도와드릴까요?
 
-> /quit
+❯ /quit
 Bye.
 ```
 
