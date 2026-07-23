@@ -5,6 +5,8 @@
 //! tools, permission/sandboxing, session, and ACP surface come later.
 
 pub mod commands;
+pub mod guide;
+pub mod permission;
 pub mod providers;
 pub mod runner;
 pub mod session;
@@ -21,7 +23,7 @@ pub const SYSTEM_PROMPT: &str = "You are Monocle's headless agent. Use the provi
 session's working directory. Take minimal, verified steps. When finished, give a brief summary.";
 
 /// Default model id (routed/validated by monocle chat-proxy — we only pass it through).
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
 
 /// Default agent-loop step budget before giving up.
 pub const DEFAULT_MAX_STEPS: usize = 20;
