@@ -183,6 +183,13 @@ struct ChatArgs {
     /// `monocle chat list` to discover thread ids.)
     #[arg(long)]
     resume: Option<String>,
+    /// With `--responses`, treat an unresolved (unexecuted) tool_calls report
+    /// as a scriptable failure — nonzero exit — instead of just a stderr
+    /// warning. One-shot (piped input) only. Useful to verify a
+    /// server-executed tool (e.g. `web_search`) actually fired and resolved,
+    /// e.g. in a deploy-verification script.
+    #[arg(long = "verify-tool-firing")]
+    verify_tool_firing: bool,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -195,6 +202,7 @@ impl From<ChatArgs> for ChatOptions {
             files: a.file,
             responses: a.responses,
             resume: a.resume,
+            verify_tool_firing: a.verify_tool_firing,
         }
     }
 }
