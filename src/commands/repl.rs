@@ -303,10 +303,16 @@ impl Highlighter for ModelReplHelper {
 /// `on_line` receives each non-empty trimmed line (already added to history)
 /// and returns whether the loop should continue or quit. Ctrl-C at the idle
 /// prompt just starts a fresh line (rustyline surfaces it as `Interrupted`
-/// without raising SIGINT); Ctrl-D (EOF) quits with a "Bye." message. `prompt`
-/// must be plain text with no raw ANSI escapes — see `agent.rs`'s prompt
-/// comment for why (rustyline's cursor-column math assumes 0-width escapes,
-/// which breaks when a terminal doesn't actually interpret them as color).
+/// without raising SIGINT); Ctrl-D (EOF) quits with a "Bye." message. Any
+/// other `readline()` error (e.g. rustyline's UTF-8 decoder losing sync —
+/// observed after a bracketed-paste marker race with a fast terminal) is
+/// treated as a discarded line, not a fatal one: a single bad read shouldn't
+/// end an otherwise-healthy interactive session. Only
+/// `MAX_CONSECUTIVE_READLINE_ERRORS` in a row gives up, so a truly broken
+/// terminal/stream still can't spin forever. `prompt` must be plain text with
+/// no raw ANSI escapes — see `agent.rs`'s prompt comment for why (rustyline's
+/// cursor-column math assumes 0-width escapes, which breaks when a terminal
+/// doesn't actually interpret them as color).
 pub fn run_repl<H: Helper>(
     helper: H,
     history_path: PathBuf,
@@ -329,9 +335,11 @@ pub fn run_repl<H: Helper>(
     }
     let _ = rl.load_history(&history_path);
 
+    let mut consecutive_errors = 0u32;
     loop {
         match rl.readline(prompt) {
             Ok(line) => {
+                consecutive_errors = 0;
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -348,14 +356,36 @@ pub fn run_repl<H: Helper>(
                 break;
             }
             Err(e) => {
-                eprintln!("{} {e}", c::red("Error:"));
-                break;
+                consecutive_errors += 1;
+                eprintln!(
+                    "{} {e} (line discarded — often a transient terminal read hiccup; try again)",
+                    c::yellow("Warning:")
+                );
+                if readline_errors_exhausted(consecutive_errors) {
+                    eprintln!(
+                        "{} too many consecutive read errors — exiting",
+                        c::red("Error:")
+                    );
+                    break;
+                }
             }
         }
     }
 
     let _ = rl.save_history(&history_path);
     Ok(())
+}
+
+/// After this many consecutive non-EOF/non-Interrupted `readline()` errors in
+/// a row, `run_repl` gives up rather than looping forever — a guard against a
+/// truly broken terminal/stream, while still tolerating the occasional
+/// single-line hiccup (see `run_repl`'s `Err(e)` arm).
+const MAX_CONSECUTIVE_READLINE_ERRORS: u32 = 5;
+
+/// Pure so the give-up threshold is unit-testable without a real rustyline
+/// `Editor` (which `run_repl` can't easily inject a fake reader into).
+fn readline_errors_exhausted(consecutive: u32) -> bool {
+    consecutive >= MAX_CONSECUTIVE_READLINE_ERRORS
 }
 
 #[cfg(test)]
@@ -377,6 +407,22 @@ mod tests {
             commands: TEST_COMMANDS,
             models: model_ids(models),
         }
+    }
+
+    #[test]
+    fn readline_errors_exhausted_tolerates_occasional_hiccups() {
+        assert!(!readline_errors_exhausted(1));
+        assert!(!readline_errors_exhausted(
+            MAX_CONSECUTIVE_READLINE_ERRORS - 1
+        ));
+    }
+
+    #[test]
+    fn readline_errors_exhausted_gives_up_at_the_threshold() {
+        assert!(readline_errors_exhausted(MAX_CONSECUTIVE_READLINE_ERRORS));
+        assert!(readline_errors_exhausted(
+            MAX_CONSECUTIVE_READLINE_ERRORS + 1
+        ));
     }
 
     #[test]
