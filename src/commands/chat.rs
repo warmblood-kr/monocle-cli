@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Write};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -53,13 +54,19 @@ fn resolve_max_tokens(flag: Option<&str>) -> Option<i64> {
 /// the full request the caller has already assembled (system prompt + any prior
 /// turns + this turn) — this fn only executes the network call and returns the
 /// assembled response so the caller can append it to its own running history.
+///
+/// Also returns the time-to-first-byte (`/diag`'s "Time to first byte" line):
+/// the elapsed time from just before the network call to the FIRST streamed
+/// delta, captured once via the `on_delta` closure this fn already hands to
+/// `chat_stream` — no new streaming plumbing needed. `None` only if the stream
+/// produced zero deltas (e.g. an empty response).
 fn call_chat(
     provider: &MonocleProvider,
     model: &str,
     messages: Vec<Message>,
     max_tokens: Option<i64>,
     images: &[ImageAttachment],
-) -> Result<ChatResponse> {
+) -> Result<(ChatResponse, Option<Duration>)> {
     let req = ChatRequest {
         model: model.to_string(),
         messages,
@@ -71,7 +78,12 @@ fn call_chat(
     // the closure writes+flushes to this single handle (per-delta flush keeps the
     // output live).
     let mut out = std::io::stdout().lock();
+    let started = std::time::Instant::now();
+    let mut ttfb: Option<Duration> = None;
     let resp = provider.chat_stream(&req, &mut |delta| {
+        if ttfb.is_none() {
+            ttfb = Some(started.elapsed());
+        }
         let _ = out.write_all(delta.as_bytes());
         let _ = out.flush();
     })?;
@@ -80,7 +92,7 @@ fn call_chat(
     if resp.truncated {
         eprintln!("\n⚠ the response was cut short (partial output shown).");
     }
-    Ok(resp)
+    Ok((resp, ttfb))
 }
 
 /// Read piped stdin (if not a TTY) and resolve `--file` + inband `file:<path>`
@@ -337,7 +349,8 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             messages.push(Message::system(sp));
         }
         messages.push(Message::user(&text));
-        let resp = call_chat(&provider, &model, messages, max_tokens, &images)?;
+        // One-shot mode has no `/diag` to show — TTFB is discarded here.
+        let (resp, _ttfb) = call_chat(&provider, &model, messages, max_tokens, &images)?;
         if let Some(msg) = dropped_tool_calls_message(&resp.tool_calls, 0, "monocle chat") {
             eprintln!("{msg}");
         }
@@ -439,14 +452,17 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         let mark = convo.len();
         convo.push(Message::user(text));
         // Wrapped tightly around the network call itself (not REPL input-wait
-        // time) — this is what `/diag`'s `Latency:` line reports.
+        // time) — this is what `/diag`'s `Latency (total):` line reports.
+        // `call_chat`'s own `Duration` return is `/diag`'s `Time to first byte:`
+        // line — captured inside `call_chat` at its first streamed delta.
         let started = std::time::Instant::now();
         match call_chat(&provider, &model, convo.clone(), max_tokens, &images) {
-            Ok(resp) => {
+            Ok((resp, ttfb)) => {
                 diagnostics = Some(TurnDiagnostics::for_chat(
                     model.clone(),
                     resp.model.clone(),
                     format!("{turn_router_url}{}", endpoints::CHAT_COMPLETIONS),
+                    ttfb.map(|d| d.as_millis()),
                     started.elapsed().as_millis(),
                     resp.usage.clone(),
                 ));
@@ -680,7 +696,10 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         crate::diag::reset();
 
         // Wrapped tightly around the network call itself, same as the
-        // completions path — this is what `/diag`'s `Latency:` line reports.
+        // completions path — this is what `/diag`'s `Latency (total):` line
+        // reports. This path makes one blocking call (no streamed deltas), so
+        // there's no `Time to first byte:` to capture — see the `for_chat`
+        // call below.
         let started = std::time::Instant::now();
         match rc.respond(&model, &text, &images, thread_id.as_deref()) {
             Ok(reply) => {
@@ -688,6 +707,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                     model.clone(),
                     None,
                     format!("{jarvice_url}/api/responses"),
+                    // `--responses` makes one blocking call with no
+                    // incremental deltas — structurally no TTFB to report.
+                    None,
                     started.elapsed().as_millis(),
                     None,
                 ));
