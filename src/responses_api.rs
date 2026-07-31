@@ -55,6 +55,29 @@ pub struct ResponsesReply {
     /// would have. Callers should mention this count too, not just `tool_calls`,
     /// so a shape mismatch is never silent either (monocle-cli#101).
     pub unparsed_tool_calls: usize,
+    /// Names of the server-side tools jarvice actually EXECUTED on this turn,
+    /// from the top-level `tools_used` array (jarvice#1441).
+    ///
+    /// This is the POSITIVE counterpart of `tool_calls` above: that field says
+    /// "the model asked and nobody ran it", this one says "these ran". Without
+    /// it, `--verify-tool-firing` could only assert the absence of a leak,
+    /// which passes just as happily when no tool was ever attempted
+    /// (monocle-cli#118).
+    pub tools_used: Vec<String>,
+    /// Count of `tools_used` entries whose name couldn't be read. Counted
+    /// rather than dropped, for the same reason as `unparsed_tool_calls` —
+    /// and with an extra edge here: an unreadable entry is still EVIDENCE a
+    /// tool ran, so discarding it would let a shape mismatch masquerade as
+    /// "nothing ran" and pass a verification that should have failed.
+    pub unparsed_tools_used: usize,
+    /// Whether the server sent `tools_used` at all.
+    ///
+    /// Load-bearing, not cosmetic. `[]` means "nothing ran" (authoritative —
+    /// jarvice#1449 makes every live response state this). Absent means the
+    /// deployment predates the field, i.e. **we cannot know**. Collapsing the
+    /// two would either pass a real failure or fail every turn during a
+    /// rollout; both end with the check switched off.
+    pub tools_used_present: bool,
 }
 
 /// Build the `input` field: a plain string when there's no attachment (the
@@ -154,12 +177,45 @@ fn parse_reply(data: &Value, thread_id: Option<String>) -> Result<ResponsesReply
     let message = &data["choices"][0]["message"];
     let content = message["content"].as_str().unwrap_or_default().to_string();
     let (tool_calls, unparsed_tool_calls) = parse_tool_calls(&message["tool_calls"]);
+    // Top-level, a sibling of `choices` — not a field on the message.
+    let (tools_used, unparsed_tools_used, tools_used_present) =
+        parse_tools_used(data.get("tools_used"));
     Ok(ResponsesReply {
         content,
         thread_id,
         tool_calls,
         unparsed_tool_calls,
+        tools_used,
+        unparsed_tools_used,
+        tools_used_present,
     })
+}
+
+/// Read jarvice's top-level `tools_used` (jarvice#1441) into
+/// `(names, unparsed_count, present)`.
+///
+/// Per-entry, like `parse_tool_calls` — one entry we can't read must not
+/// discard its well-formed siblings. The difference that matters here is what
+/// an unreadable entry MEANS: it is still evidence that a tool ran, so it is
+/// counted rather than dropped. Silently dropping it would let a shape
+/// mismatch read as "nothing ran" and turn a failing verification green — the
+/// same silent-false-pass defect monocle-cli#118 exists to remove.
+///
+/// A missing or non-array value reports `present = false`: "this server never
+/// told us", which callers must keep distinct from `[]` ("nothing ran").
+fn parse_tools_used(value: Option<&Value>) -> (Vec<String>, usize, bool) {
+    let Some(entries) = value.and_then(|v| v.as_array()) else {
+        return (Vec::new(), 0, false);
+    };
+    let mut names = Vec::new();
+    let mut unparsed = 0usize;
+    for entry in entries {
+        match entry.get("name").and_then(|n| n.as_str()) {
+            Some(name) if !name.is_empty() => names.push(name.to_string()),
+            _ => unparsed += 1,
+        }
+    }
+    (names, unparsed, true)
 }
 
 /// Deserialize a `message.tool_calls` JSON value entry-by-entry rather than as
@@ -230,6 +286,76 @@ mod tests {
             message["tool_calls"] = tc;
         }
         json!({"choices": [{"message": message}]})
+    }
+
+    /// Same, plus jarvice's TOP-LEVEL `tools_used` (jarvice#1441 / #1449) —
+    /// a sibling of `choices`, not a field on the message.
+    fn body_with_tools_used(content: &str, tools_used: Option<Value>) -> Value {
+        let mut body = responses_body(content, None);
+        if let Some(tu) = tools_used {
+            body["tools_used"] = tu;
+        }
+        body
+    }
+
+    #[test]
+    fn tools_used_absent_is_reported_as_not_present() {
+        // A jarvice too old to know the field. Distinguishable from "[]"
+        // (nothing ran) only because we track presence separately — collapsing
+        // the two is what made positive verification impossible.
+        let reply = parse_reply(&body_with_tools_used("hello", None), None).unwrap();
+        assert!(!reply.tools_used_present);
+        assert!(reply.tools_used.is_empty());
+        assert_eq!(reply.unparsed_tools_used, 0);
+    }
+
+    #[test]
+    fn tools_used_empty_array_is_present_but_names_nothing() {
+        let reply = parse_reply(&body_with_tools_used("hello", Some(json!([]))), None).unwrap();
+        assert!(reply.tools_used_present);
+        assert!(reply.tools_used.is_empty());
+        assert_eq!(reply.unparsed_tools_used, 0);
+    }
+
+    #[test]
+    fn tools_used_names_are_extracted_in_order() {
+        let data = body_with_tools_used(
+            "hi",
+            Some(json!([
+                {"id": "call_1", "name": "web_search", "arguments": {"query": "x"}, "result": "r"},
+                {"id": "call_2", "name": "query_chat_history", "arguments": {}, "result": "r"},
+            ])),
+        );
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.tools_used, vec!["web_search", "query_chat_history"]);
+        assert_eq!(reply.unparsed_tools_used, 0);
+        assert!(reply.tools_used_present);
+    }
+
+    #[test]
+    fn tools_used_entry_without_a_name_is_counted_not_dropped() {
+        // An entry we can't read is still EVIDENCE that a tool ran. Dropping
+        // it would let a shape mismatch read as "nothing ran" — exactly the
+        // silent false-pass monocle-cli#118 exists to remove. Same per-entry
+        // tolerance as `parse_tool_calls` above, for the same reason.
+        let data = body_with_tools_used(
+            "hi",
+            Some(json!([
+                {"id": "call_1", "result": "r"},
+                {"id": "call_2", "name": "web_search"},
+            ])),
+        );
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.tools_used, vec!["web_search"]);
+        assert_eq!(reply.unparsed_tools_used, 1);
+        assert!(reply.tools_used_present);
+    }
+
+    #[test]
+    fn tools_used_of_the_wrong_type_is_treated_as_absent() {
+        let reply = parse_reply(&body_with_tools_used("hi", Some(json!("nope"))), None).unwrap();
+        assert!(!reply.tools_used_present);
+        assert!(reply.tools_used.is_empty());
     }
 
     #[test]
