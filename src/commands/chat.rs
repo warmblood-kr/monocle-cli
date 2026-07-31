@@ -35,6 +35,10 @@ pub struct ChatOptions {
     pub responses: bool,
     /// `--resume <ID>`: continue an existing `--responses` thread.
     pub resume: Option<String>,
+    /// `--verify-tool-firing`: with `--responses`, treat an unresolved
+    /// tool_calls report as a scriptable failure (nonzero exit) instead of
+    /// just a stderr warning. One-shot only.
+    pub verify_tool_firing: bool,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -230,6 +234,10 @@ fn dispatch_chat_command(
 }
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    if options.verify_tool_firing && !options.responses {
+        eprintln!("--verify-tool-firing requires --responses (server-executed tools are only observable there)");
+        std::process::exit(1);
+    }
     if options.responses {
         run_responses_chat(client, creds, options)
     } else {
@@ -538,6 +546,23 @@ fn dropped_tool_calls_message(
     ))
 }
 
+/// `--verify-tool-firing`: turn the existing dropped-tool-calls warning into
+/// a scriptable pass/fail. Today that warning is stderr-text-only and never
+/// affects the exit code, so a verification script (e.g. confirming a
+/// server-executed tool like `web_search` actually ran) has to grep stderr
+/// rather than check `$?` — see the manual ritual in jarvice#1217's
+/// prod-verified comment. Pure — no I/O/`process::exit` — so it's directly
+/// unit-testable; the call site does the actual `eprintln!`/exit, same
+/// convention as `dropped_tool_calls_message`.
+fn tool_firing_verification_result(
+    dropped_message: Option<&str>,
+) -> std::result::Result<String, String> {
+    match dropped_message {
+        Some(msg) => Err(format!("✗ tool-firing verification FAILED: {msg}")),
+        None => Ok("✓ tool-firing verification: passed (no unresolved tool_calls)".to_string()),
+    }
+}
+
 /// `--responses`: jarvice's `/api/responses` (see `responses_api` module
 /// docs). The server owns the conversation thread — this REPL only tracks
 /// the `thread_id` to pass on the next turn, never a local message history.
@@ -566,6 +591,12 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         );
         std::process::exit(1);
     }
+    if options.verify_tool_firing && stdin_is_tty {
+        eprintln!(
+            "--verify-tool-firing requires piped input. Pipe a tool-triggering prompt, e.g.:\n  echo \"search the web for today's date\" | monocle chat --responses --verify-tool-firing"
+        );
+        std::process::exit(1);
+    }
 
     // Auth FIRST, same rationale as the completions path — an expired/missing
     // login must surface before any local-input error masks it.
@@ -578,11 +609,20 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
         let reply = rc.respond(&model, &text, &images, options.resume.as_deref())?;
-        if let Some(msg) = dropped_tool_calls_message(
+        let dropped_msg = dropped_tool_calls_message(
             &reply.tool_calls,
             reply.unparsed_tool_calls,
             "--responses mode",
-        ) {
+        );
+        if options.verify_tool_firing {
+            match tool_firing_verification_result(dropped_msg.as_deref()) {
+                Ok(pass_msg) => eprintln!("{pass_msg}"),
+                Err(fail_msg) => {
+                    eprintln!("{fail_msg}");
+                    std::process::exit(1);
+                }
+            }
+        } else if let Some(msg) = dropped_msg {
             eprintln!("{msg}");
         }
         println!("{}", reply.content);
@@ -784,7 +824,8 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
 mod tests {
     use super::{
         chat_help_text, dispatch_chat_command, dropped_tool_calls_message, handle_help_command,
-        resolve_max_tokens, resolve_repl_attachments, TurnDiagnostics,
+        resolve_max_tokens, resolve_repl_attachments, tool_firing_verification_result,
+        TurnDiagnostics,
     };
     use crate::agent::providers::{FunctionCall, ToolCall};
     use crate::commands::repl::LoopControl;
@@ -832,6 +873,23 @@ mod tests {
         assert!(msg.contains("read_file"), "{msg}");
         assert!(msg.contains('1'), "{msg}");
         assert!(msg.contains("monocle chat"), "{msg}");
+    }
+
+    #[test]
+    fn tool_firing_verification_passes_when_nothing_dropped() {
+        let outcome = tool_firing_verification_result(None);
+        let msg = outcome.expect("no dropped tool_calls should be a pass");
+        assert!(msg.contains('✓'), "{msg}");
+    }
+
+    #[test]
+    fn tool_firing_verification_fails_when_something_dropped() {
+        let dropped = dropped_tool_calls_message(&[tool_call("web_search")], 0, "--responses mode")
+            .expect("should report");
+        let outcome = tool_firing_verification_result(Some(&dropped));
+        let msg = outcome.expect_err("a dropped tool_calls message should be a failure");
+        assert!(msg.contains('✗'), "{msg}");
+        assert!(msg.contains("web_search"), "{msg}");
     }
 
     // The shared `ModelReplHelper` (Completer/Hinter, slash-command +
