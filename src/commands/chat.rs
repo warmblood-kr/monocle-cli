@@ -36,10 +36,10 @@ pub struct ChatOptions {
     pub responses: bool,
     /// `--resume <ID>`: continue an existing `--responses` thread.
     pub resume: Option<String>,
-    /// `--verify-tool-firing`: with `--responses`, treat an unresolved
-    /// tool_calls report as a scriptable failure (nonzero exit) instead of
-    /// just a stderr warning. One-shot only.
-    pub verify_tool_firing: bool,
+    /// `--verify-tool-firing[=<tool>]`: with `--responses`, assert from the
+    /// server's `tools_used` that a tool actually ran, as an exit code.
+    /// `None` = flag absent. One-shot only.
+    pub verify_tool_firing: Option<ToolFiringExpectation>,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -246,7 +246,7 @@ fn dispatch_chat_command(
 }
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
-    if options.verify_tool_firing && !options.responses {
+    if options.verify_tool_firing.is_some() && !options.responses {
         eprintln!("--verify-tool-firing requires --responses (server-executed tools are only observable there)");
         std::process::exit(1);
     }
@@ -611,7 +611,34 @@ impl ToolFiringVerdict {
 /// The old negative check is kept as its own failure mode, not replaced: an
 /// unresolved `tool_calls` leak is a real defect whether or not other tools
 /// ran, so it is checked first and still fails.
+/// What `--verify-tool-firing` was asked to assert.
+///
+/// `Any` is the bare flag: "at least one server-side tool ran". That is the
+/// weaker question, and deliberately so — it answers "do server-side tools
+/// work at all", which is what you want right after a deploy.
+///
+/// `Named` is the stronger one, and the reason the value exists: with `Any`, a
+/// run that fired `query_chat_history` when you were checking `web_search`
+/// still goes green. That is the same shape as the defect this flag was
+/// rewritten to remove, one size smaller — the check cannot fail in the
+/// direction you actually care about. `pytest.raises` takes an exception type
+/// for the same reason.
+#[derive(Debug, Clone)]
+pub enum ToolFiringExpectation {
+    Any,
+    Named(String),
+}
+
+fn unparsed_note(unparsed_tools_used: usize) -> String {
+    // Passing QUIETLY on entries we could not read would be a miniature of the
+    // defect this change removes.
+    format!(
+        " (⚠ {unparsed_tools_used} `tools_used` entry/entries in an unrecognized shape — their names are unknown)"
+    )
+}
+
 fn tool_firing_verification(
+    expected: &ToolFiringExpectation,
     tools_used: &[String],
     unparsed_tools_used: usize,
     tools_used_present: bool,
@@ -628,31 +655,61 @@ fn tool_firing_verification(
         );
     }
 
-    // An entry we could not read is still evidence that a tool ran — counting
-    // it is the whole reason `parse_tools_used` does not discard it.
-    if tools_used.len() + unparsed_tools_used == 0 {
-        return ToolFiringVerdict::Failed(
-            "✗ tool-firing verification FAILED: the server reports that no tool ran (`tools_used` is empty)"
-                .to_string(),
-        );
-    }
+    match expected {
+        ToolFiringExpectation::Any => {
+            // An entry we could not read is still evidence that SOME tool ran —
+            // counting it is the whole reason `parse_tools_used` keeps it.
+            if tools_used.len() + unparsed_tools_used == 0 {
+                return ToolFiringVerdict::Failed(
+                    "✗ tool-firing verification FAILED: the server reports that no tool ran (`tools_used` is empty)"
+                        .to_string(),
+                );
+            }
+            let mut message = if tools_used.is_empty() {
+                "✓ tool-firing verification: passed".to_string()
+            } else {
+                format!(
+                    "✓ tool-firing verification: passed — {} ran",
+                    tools_used.join(", ")
+                )
+            };
+            if unparsed_tools_used > 0 {
+                message.push_str(&unparsed_note(unparsed_tools_used));
+            }
+            ToolFiringVerdict::Passed(message)
+        }
 
-    let mut message = if tools_used.is_empty() {
-        "✓ tool-firing verification: passed".to_string()
-    } else {
-        format!(
-            "✓ tool-firing verification: passed — {} ran",
-            tools_used.join(", ")
-        )
-    };
-    if unparsed_tools_used > 0 {
-        // Passing QUIETLY on entries we could not read would be a miniature of
-        // the defect this change removes.
-        message.push_str(&format!(
-            " (⚠ {unparsed_tools_used} `tools_used` entry/entries in an unrecognized shape — counted as evidence, but their names are unknown)"
-        ));
+        ToolFiringExpectation::Named(want) => {
+            if tools_used.iter().any(|t| t == want) {
+                let mut message = format!("✓ tool-firing verification: passed — {want} ran");
+                if unparsed_tools_used > 0 {
+                    message.push_str(&unparsed_note(unparsed_tools_used));
+                }
+                return ToolFiringVerdict::Passed(message);
+            }
+
+            // Entries exist but we could not read their names, so whether
+            // `want` ran is genuinely UNKNOWN. Reporting Failed here would
+            // assert "it did not run", which is not something we know — the
+            // same kind of claim-without-evidence this flag exists to stop.
+            if unparsed_tools_used > 0 {
+                return ToolFiringVerdict::CannotVerify(format!(
+                    "? tool-firing verification: CANNOT VERIFY — expected `{want}`, but {unparsed_tools_used} `tools_used` entry/entries came back in an unrecognized shape, so their names are unknown"
+                ));
+            }
+
+            if tools_used.is_empty() {
+                return ToolFiringVerdict::Failed(format!(
+                    "✗ tool-firing verification FAILED: expected `{want}`, but the server reports that no tool ran (`tools_used` is empty)"
+                ));
+            }
+
+            ToolFiringVerdict::Failed(format!(
+                "✗ tool-firing verification FAILED: expected `{want}`, but these ran instead: {}",
+                tools_used.join(", ")
+            ))
+        }
     }
-    ToolFiringVerdict::Passed(message)
 }
 
 /// `--responses`: jarvice's `/api/responses` (see `responses_api` module
@@ -683,7 +740,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         );
         std::process::exit(1);
     }
-    if options.verify_tool_firing && stdin_is_tty {
+    if options.verify_tool_firing.is_some() && stdin_is_tty {
         eprintln!(
             "--verify-tool-firing requires piped input. Pipe a tool-triggering prompt, e.g.:\n  echo \"search the web for today's date\" | monocle chat --responses --verify-tool-firing"
         );
@@ -714,8 +771,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         if let Some(id) = reply.thread_id {
             eprintln!("Thread: {id}");
         }
-        if options.verify_tool_firing {
+        if let Some(expected) = &options.verify_tool_firing {
             let verdict = tool_firing_verification(
+                expected,
                 &reply.tools_used,
                 reply.unparsed_tools_used,
                 reply.tools_used_present,
@@ -930,8 +988,8 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
 mod tests {
     use super::{
         chat_help_text, dispatch_chat_command, dropped_tool_calls_message, handle_help_command,
-        resolve_max_tokens, resolve_repl_attachments, tool_firing_verification, ToolFiringVerdict,
-        TurnDiagnostics,
+        resolve_max_tokens, resolve_repl_attachments, tool_firing_verification,
+        ToolFiringExpectation, ToolFiringVerdict, TurnDiagnostics,
     };
     use crate::agent::providers::{FunctionCall, ToolCall};
     use crate::commands::repl::LoopControl;
@@ -956,7 +1014,8 @@ mod tests {
 
     #[test]
     fn verification_passes_when_a_tool_ran_and_names_it() {
-        let v = tool_firing_verification(&["web_search".to_string()], 0, true, None);
+        let v =
+            tool_firing_verification(&NONE_EXPECTED, &["web_search".to_string()], 0, true, None);
         assert!(matches!(v, ToolFiringVerdict::Passed(_)), "got {v:?}");
         assert_eq!(v.exit_code(), 0);
         assert!(v.message().contains("web_search"), "got {}", v.message());
@@ -965,7 +1024,7 @@ mod tests {
     #[test]
     fn verification_fails_when_the_server_says_nothing_ran() {
         // `[]` is authoritative: the server knows, and says nothing ran.
-        let v = tool_firing_verification(&[], 0, true, None);
+        let v = tool_firing_verification(&NONE_EXPECTED, &[], 0, true, None);
         assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
         assert_eq!(v.exit_code(), 1);
     }
@@ -975,7 +1034,7 @@ mod tests {
         // Absent means the deployment predates tools_used, NOT that no tool
         // ran. Calling that a pass would reproduce the defect being fixed;
         // calling it a failure would cry wolf through every rollout.
-        let v = tool_firing_verification(&[], 0, false, None);
+        let v = tool_firing_verification(&NONE_EXPECTED, &[], 0, false, None);
         assert!(matches!(v, ToolFiringVerdict::CannotVerify(_)), "got {v:?}");
         assert_eq!(v.exit_code(), 2);
     }
@@ -984,7 +1043,7 @@ mod tests {
     fn verification_passes_on_unreadable_entries_but_says_so_out_loud() {
         // Entries we can't read still prove a tool ran, so this passes — but
         // passing QUIETLY would be a miniature of the same defect.
-        let v = tool_firing_verification(&[], 2, true, None);
+        let v = tool_firing_verification(&NONE_EXPECTED, &[], 2, true, None);
         assert!(matches!(v, ToolFiringVerdict::Passed(_)), "got {v:?}");
         assert!(
             v.message().contains('2'),
@@ -998,10 +1057,115 @@ mod tests {
         // The original negative check is KEPT as a distinct failure mode —
         // the positive check is added alongside it, not in place of it.
         let v = tool_firing_verification(
+            &NONE_EXPECTED,
             &["web_search".to_string()],
             0,
             true,
             Some("\u{26a0} model requested tool call(s)"),
+        );
+        assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 1);
+    }
+
+    // ---- monocle-cli#118 후속: 기대 툴 지정 (--verify-tool-firing=<tool>) ----
+    //
+    // 값 없는 형태는 "아무 툴이나 하나 돌았으면 통과"다. 그건 web_search 를
+    // 기대했는데 엉뚱한 툴이 돌아도 초록불이라는 뜻이고, 방금 고친 결함의
+    // 축소판이다. pytest.raises 가 예외 타입을 받는 것과 같은 이유로 기대
+    // 대상을 지정할 수 있어야 한다.
+
+    const NONE_EXPECTED: ToolFiringExpectation = ToolFiringExpectation::Any;
+
+    fn expect(name: &str) -> ToolFiringExpectation {
+        ToolFiringExpectation::Named(name.to_string())
+    }
+
+    #[test]
+    fn named_expectation_passes_when_that_tool_ran() {
+        let v = tool_firing_verification(
+            &expect("web_search"),
+            &["web_search".to_string()],
+            0,
+            true,
+            None,
+        );
+        assert!(matches!(v, ToolFiringVerdict::Passed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 0);
+        assert!(v.message().contains("web_search"));
+    }
+
+    #[test]
+    fn named_expectation_fails_when_a_different_tool_ran() {
+        // 이것이 이 변경의 이유다. 값 없는 형태였다면 통과였을 상황.
+        let v = tool_firing_verification(
+            &expect("web_search"),
+            &["query_chat_history".to_string()],
+            0,
+            true,
+            None,
+        );
+        assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 1);
+        assert!(
+            v.message().contains("query_chat_history"),
+            "무엇이 대신 돌았는지 말해야 한다: {}",
+            v.message()
+        );
+    }
+
+    #[test]
+    fn bare_flag_still_passes_on_any_tool() {
+        // 값이 선택적이므로 기존 사용법이 그대로 살아야 한다 (무회귀 가드).
+        let v = tool_firing_verification(
+            &NONE_EXPECTED,
+            &["query_chat_history".to_string()],
+            0,
+            true,
+            None,
+        );
+        assert!(matches!(v, ToolFiringVerdict::Passed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 0);
+    }
+
+    #[test]
+    fn named_expectation_with_absent_field_is_cannot_verify_not_mismatch() {
+        // 세 번째 종료 상태를 잃으면 안 된다. 서버가 필드를 안 주면
+        // "기대와 다름(1)"이 아니라 "판정 불가(2)"다 — 아니면 monocle-cli#118
+        // 에서 고친 것이 되살아난다.
+        let v = tool_firing_verification(&expect("web_search"), &[], 0, false, None);
+        assert!(matches!(v, ToolFiringVerdict::CannotVerify(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 2);
+    }
+
+    #[test]
+    fn named_expectation_fails_when_nothing_ran_at_all() {
+        let v = tool_firing_verification(&expect("web_search"), &[], 0, true, None);
+        assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 1);
+    }
+
+    #[test]
+    fn named_expectation_cannot_verify_when_names_were_unreadable() {
+        // 엔트리는 있으나 이름을 못 읽었다 = 그 툴이 돌았는지 **모른다**.
+        // Failed 로 내면 "안 돌았다"를 주장하는 것인데 그건 아는 바가 아니다.
+        let v = tool_firing_verification(&expect("web_search"), &[], 2, true, None);
+        assert!(matches!(v, ToolFiringVerdict::CannotVerify(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 2);
+        assert!(
+            v.message().contains('2'),
+            "개수를 드러내야 한다: {}",
+            v.message()
+        );
+    }
+
+    #[test]
+    fn unresolved_leak_still_fails_regardless_of_expectation() {
+        let v = tool_firing_verification(
+            &expect("web_search"),
+            &["web_search".to_string()],
+            0,
+            true,
+            Some("\u{26a0} leaked"),
         );
         assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
         assert_eq!(v.exit_code(), 1);

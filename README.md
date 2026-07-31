@@ -53,7 +53,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--verify-tool-firing]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--verify-tool-firing` (with `--responses`, one-shot) asserts a server-executed tool actually ran, as an exit code (`0` ran / `1` did not / `2` cannot verify) |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--verify-tool-firing[=<tool>]]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--verify-tool-firing[=<tool>]` (with `--responses`, one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine) |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
@@ -283,20 +283,35 @@ Notes:
   right now. This is separate from jarvice's own **server-executed** tools
   (e.g. `web_search`) — those run on jarvice and come back already resolved;
   see `--verify-tool-firing` below to check that they actually did.
-- **`--verify-tool-firing`** — one-shot only; asserts that a server-executed
-  tool **actually ran**, as a scriptable exit code. Useful after a
-  jarvice/chat-proxy deploy, without eyeballing stderr:
+- **`--verify-tool-firing[=<tool>]`** — one-shot only; asserts that a
+  server-executed tool **actually ran**, as a scriptable exit code. Useful
+  after a jarvice/chat-proxy deploy, without eyeballing stderr:
 
   ```bash
-  echo "search the web for today's date" | monocle chat --responses --verify-tool-firing
+  # 이 툴이 돌았는지 (권장)
+  echo "search the web for today's date" \
+    | monocle chat --responses --verify-tool-firing=web_search
   echo "exit: $?"
+
+  # 아무 툴이나 하나라도 돌았는지 (약한 형태)
+  echo "search the web for today's date" | monocle chat --responses --verify-tool-firing
   ```
 
-  | exit | meaning | printed to stderr |
-  |------|---------|-------------------|
-  | `0` | a tool ran | `✓ tool-firing verification: passed — web_search ran` |
-  | `1` | no tool ran, **or** an unresolved tool_calls report leaked back | `✗ tool-firing verification FAILED: ...` |
-  | `2` | **cannot verify** — this jarvice does not report `tools_used` (it predates the field) | `? tool-firing verification: CANNOT VERIFY — ...` |
+  **Name the tool you expect.** Bare, this only asks "did *any* tool run", so a
+  turn that fired `query_chat_history` when you were checking `web_search`
+  still goes green — the check cannot fail in the direction you care about.
+  `pytest.raises` takes an exception type for the same reason.
+
+  | exit | `--verify-tool-firing` (bare) | `--verify-tool-firing=web_search` |
+  |------|-------------------------------|-----------------------------------|
+  | `0` | some tool ran | **`web_search`** ran |
+  | `1` | no tool ran, **or** an unresolved tool_calls report leaked back | a different tool ran, or none ran, or a leak |
+  | `2` | jarvice did not report `tools_used` (predates the field) | same, **plus**: entries came back unreadable, so whether `web_search` ran is unknown |
+
+  Exit `2` is "could not determine", not "failed". With a named tool, entries
+  whose names could not be read report `2` rather than `1` — claiming the tool
+  did *not* run would assert something we do not know. Unreadable entries are
+  always counted and surfaced in the message, never passed over silently.
 
   The answer itself is always written to stdout first, whatever the verdict, so
   a failing check never swallows the output you need in order to see why it

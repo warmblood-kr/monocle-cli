@@ -9,7 +9,9 @@ use monocle_cli::commands::audio_transcribe::{audio_transcribe_command, AudioTra
 use monocle_cli::commands::audio_transcribe_azure::{
     audio_transcribe_azure_command, AudioTranscribeAzureOptions,
 };
-use monocle_cli::commands::chat::{chat_command, chat_list_command, ChatOptions};
+use monocle_cli::commands::chat::{
+    chat_command, chat_list_command, ChatOptions, ToolFiringExpectation,
+};
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
@@ -183,14 +185,17 @@ struct ChatArgs {
     /// `monocle chat list` to discover thread ids.)
     #[arg(long)]
     resume: Option<String>,
-    /// With `--responses`, assert that a server-executed tool (e.g.
-    /// `web_search`) actually RAN, as a scriptable exit code: 0 = a tool ran,
-    /// 1 = none ran (or an unresolved tool_calls report leaked back), 2 =
-    /// cannot verify, because this jarvice does not report `tools_used` and so
-    /// predates the field. One-shot (piped input) only. The answer is written
-    /// to stdout first regardless of the verdict.
-    #[arg(long = "verify-tool-firing")]
-    verify_tool_firing: bool,
+    /// With `--responses`, assert from the server's `tools_used` that a
+    /// server-executed tool actually RAN, as a scriptable exit code. Pass a
+    /// tool name to require THAT tool (`--verify-tool-firing=web_search`);
+    /// bare, it only requires that at least one tool ran. Exit codes: 0 = the
+    /// expected tool ran, 1 = it did not (a different tool ran, none ran, or an
+    /// unresolved tool_calls report leaked back), 2 = could not determine (this
+    /// jarvice does not report `tools_used`, or the entries were unreadable).
+    /// One-shot (piped input) only. The answer is written to stdout first
+    /// regardless of the verdict.
+    #[arg(long = "verify-tool-firing", num_args = 0..=1)]
+    verify_tool_firing: Option<Option<String>>,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -203,7 +208,10 @@ impl From<ChatArgs> for ChatOptions {
             files: a.file,
             responses: a.responses,
             resume: a.resume,
-            verify_tool_firing: a.verify_tool_firing,
+            verify_tool_firing: a.verify_tool_firing.map(|v| match v {
+                Some(name) => ToolFiringExpectation::Named(name),
+                None => ToolFiringExpectation::Any,
+            }),
         }
     }
 }
