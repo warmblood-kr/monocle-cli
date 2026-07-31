@@ -60,6 +60,11 @@ pub struct TurnDiagnostics {
     pub requested_model: String,
     pub served_model: Option<String>,
     pub endpoint: String,
+    /// Time to first byte — elapsed time until the first streamed chunk of
+    /// the turn's answer arrived. `None` wherever the backend doesn't stream
+    /// (the `--responses` path makes one blocking call with no incremental
+    /// deltas, so it structurally has no TTFB to report).
+    pub ttfb_ms: Option<u128>,
     pub latency_ms: u128,
     pub usage: Option<TokenUsage>,
     /// How many LLM calls this turn made. `None` for chat (always exactly
@@ -76,6 +81,7 @@ impl TurnDiagnostics {
         requested_model: String,
         served_model: Option<String>,
         endpoint: String,
+        ttfb_ms: Option<u128>,
         latency_ms: u128,
         usage: Option<TokenUsage>,
     ) -> Self {
@@ -83,6 +89,7 @@ impl TurnDiagnostics {
             requested_model,
             served_model,
             endpoint,
+            ttfb_ms,
             latency_ms,
             usage,
             steps: None,
@@ -95,6 +102,7 @@ impl TurnDiagnostics {
         requested_model: String,
         served_model: Option<String>,
         endpoint: String,
+        ttfb_ms: Option<u128>,
         latency_ms: u128,
         usage: Option<TokenUsage>,
         steps: u32,
@@ -103,6 +111,7 @@ impl TurnDiagnostics {
             requested_model,
             served_model,
             endpoint,
+            ttfb_ms,
             latency_ms,
             usage,
             steps: Some(steps),
@@ -122,7 +131,10 @@ pub fn format_diag(d: &TurnDiagnostics) -> String {
     if let Some(served) = &d.served_model {
         lines.push(format!("Served model: {served}"));
     }
-    lines.push(format!("Latency: {}ms", d.latency_ms));
+    if let Some(ttfb) = d.ttfb_ms {
+        lines.push(format!("Time to first byte: {ttfb}ms"));
+    }
+    lines.push(format!("Latency (total): {}ms", d.latency_ms));
     if let Some(steps) = d.steps {
         lines.push(format!("Steps: {steps}"));
     }
@@ -551,11 +563,14 @@ mod tests {
     fn format_diag_omits_served_model_and_usage_when_unavailable() {
         // The `--responses` path: only endpoint/requested-model/latency are
         // ever known — served model and usage must never render as a literal
-        // "None"/"null", they're just absent lines.
+        // "None"/"null", they're just absent lines. `ttfb_ms` is also `None`
+        // here (the `--responses` path doesn't stream), so its line is
+        // omitted too.
         let d = TurnDiagnostics {
             requested_model: "monocle-auto".to_string(),
             served_model: None,
             endpoint: "https://acme.monocle-ai.com/api/responses".to_string(),
+            ttfb_ms: None,
             latency_ms: 842,
             usage: None,
             steps: None,
@@ -566,7 +581,7 @@ mod tests {
             "--- diag ---\n\
              Endpoint: https://acme.monocle-ai.com/api/responses\n\
              Requested model: monocle-auto\n\
-             Latency: 842ms\n\
+             Latency (total): 842ms\n\
              --- end diag ---"
         );
         assert!(!block.contains("None"));
@@ -579,6 +594,7 @@ mod tests {
             requested_model: "monocle-auto".to_string(),
             served_model: Some("claude-sonnet-4-6".to_string()),
             endpoint: "https://api.monocle-ai.com/v1/chat/completions".to_string(),
+            ttfb_ms: None,
             latency_ms: 1234,
             usage: Some(TokenUsage {
                 prompt_tokens: 120,
@@ -594,7 +610,7 @@ mod tests {
              Endpoint: https://api.monocle-ai.com/v1/chat/completions\n\
              Requested model: monocle-auto\n\
              Served model: claude-sonnet-4-6\n\
-             Latency: 1234ms\n\
+             Latency (total): 1234ms\n\
              Tokens: 120 prompt + 45 completion = 165 total\n\
              --- end diag ---"
         );
@@ -609,6 +625,7 @@ mod tests {
             requested_model: "monocle-auto".to_string(),
             served_model: Some("claude-sonnet-4-6".to_string()),
             endpoint: "https://api.monocle-ai.com/agent".to_string(),
+            ttfb_ms: None,
             latency_ms: 2500,
             usage: Some(TokenUsage {
                 prompt_tokens: 300,
@@ -624,9 +641,41 @@ mod tests {
              Endpoint: https://api.monocle-ai.com/agent\n\
              Requested model: monocle-auto\n\
              Served model: claude-sonnet-4-6\n\
-             Latency: 2500ms\n\
+             Latency (total): 2500ms\n\
              Steps: 3\n\
              Tokens: 300 prompt + 80 completion = 380 total\n\
+             --- end diag ---"
+        );
+    }
+
+    /// When `ttfb_ms` IS known (the streaming chat/agent paths), it renders as
+    /// its own line ahead of the total-latency line — this is the whole point
+    /// of the two numbers: "how fast did it start" vs "how long to finish".
+    #[test]
+    fn format_diag_shows_ttfb_ahead_of_total_latency_when_present() {
+        let d = TurnDiagnostics {
+            requested_model: "monocle-auto".to_string(),
+            served_model: Some("claude-sonnet-4-6".to_string()),
+            endpoint: "https://api.monocle-ai.com/v1/chat/completions".to_string(),
+            ttfb_ms: Some(312),
+            latency_ms: 4219,
+            usage: Some(TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                total_tokens: 165,
+            }),
+            steps: None,
+        };
+        let block = format_diag(&d);
+        assert_eq!(
+            block,
+            "--- diag ---\n\
+             Endpoint: https://api.monocle-ai.com/v1/chat/completions\n\
+             Requested model: monocle-auto\n\
+             Served model: claude-sonnet-4-6\n\
+             Time to first byte: 312ms\n\
+             Latency (total): 4219ms\n\
+             Tokens: 120 prompt + 45 completion = 165 total\n\
              --- end diag ---"
         );
     }
@@ -643,6 +692,7 @@ mod tests {
             requested_model: "monocle-auto".to_string(),
             served_model: None,
             endpoint: "https://api.monocle-ai.com/agent".to_string(),
+            ttfb_ms: None,
             latency_ms: 10,
             usage: None,
             steps: Some(1),

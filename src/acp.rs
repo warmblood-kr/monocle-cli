@@ -318,6 +318,7 @@ impl Agent for MonocleAgent {
                 served_model: None,
                 usage: None,
                 steps: 0,
+                first_delta_at: None,
             };
             let mut approver = AcpApprover {
                 calls: updates,
@@ -356,7 +357,8 @@ impl Agent for MonocleAgent {
                 }));
             }
             // Wrapped tightly around the agent-core loop itself — this is what
-            // `/diag`'s `Latency:` line reports.
+            // `/diag`'s `Latency (total):` line reports (and, via the
+            // observer's first `on_text_delta`, its `Time to first byte:` line).
             let started = std::time::Instant::now();
             let requested_model = model.clone();
             let agent = CoreAgent::with_max_steps(&provider, &tools, ctx, model, DEFAULT_MAX_STEPS);
@@ -372,6 +374,9 @@ impl Agent for MonocleAgent {
                     requested_model,
                     observer.served_model.clone(),
                     turn_endpoint,
+                    observer
+                        .first_delta_at
+                        .map(|t| t.duration_since(started).as_millis()),
                     started.elapsed().as_millis(),
                     observer.usage.clone(),
                     observer.steps,
@@ -438,6 +443,10 @@ struct AcpObserver {
     served_model: Option<String>,
     usage: Option<TokenUsage>,
     steps: u32,
+    /// Set on the first `on_text_delta` call this turn — used to compute
+    /// `/diag`'s "time to first byte" line, mirroring
+    /// `commands::agent::CliObserver`.
+    first_delta_at: Option<std::time::Instant>,
 }
 
 impl AcpObserver {
@@ -453,6 +462,9 @@ impl AcpObserver {
 
 impl Observer for AcpObserver {
     fn on_text_delta(&mut self, delta: &str) {
+        if self.first_delta_at.is_none() {
+            self.first_delta_at = Some(std::time::Instant::now());
+        }
         self.send(acp::SessionUpdate::AgentMessageChunk(
             acp::ContentChunk::new(acp::ContentBlock::from(delta.to_string())),
         ));
@@ -1167,6 +1179,7 @@ mod tests {
             served_model: None,
             usage: None,
             steps: 0,
+            first_delta_at: None,
         };
         (observer, rx)
     }
@@ -1625,6 +1638,7 @@ mod tests {
                 DEFAULT_MODEL.to_string(),
                 Some("claude-sonnet-4-6".to_string()),
                 "https://api.example.com/v1/chat/completions".to_string(),
+                Some(7),
                 42,
                 None,
                 2,
@@ -1634,7 +1648,8 @@ mod tests {
         let out = agent.management_response(&key, Management::Diag);
         assert!(out.contains("Steps: 2"), "{out}");
         assert!(out.contains("claude-sonnet-4-6"), "{out}");
-        assert!(out.contains("42ms"), "{out}");
+        assert!(out.contains("Time to first byte: 7ms"), "{out}");
+        assert!(out.contains("Latency (total): 42ms"), "{out}");
     }
 
     #[test]

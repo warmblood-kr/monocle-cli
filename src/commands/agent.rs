@@ -46,9 +46,15 @@ struct CliObserver {
     served_model: Option<String>,
     usage: Option<TokenUsage>,
     steps: u32,
+    /// Set on the first `on_text_delta` call this turn — used to compute
+    /// `/diag`'s "time to first byte" line (relative to `run_turn`'s `started`).
+    first_delta_at: Option<std::time::Instant>,
 }
 impl Observer for CliObserver {
     fn on_text_delta(&mut self, delta: &str) {
+        if self.first_delta_at.is_none() {
+            self.first_delta_at = Some(std::time::Instant::now());
+        }
         // Stream assistant text to stdout as it arrives (tool progress goes to stderr).
         let mut out = std::io::stdout();
         let _ = out.write_all(delta.as_bytes());
@@ -259,7 +265,8 @@ impl Repl<'_> {
                 &mut allow
             };
         // Wrapped tightly around the agent-core loop itself — this is what
-        // `/diag`'s `Latency:` line reports.
+        // `/diag`'s `Latency (total):` line reports (and, via the observer's
+        // first `on_text_delta`, its `Time to first byte:` line).
         let started = std::time::Instant::now();
         let mut observer = CliObserver::default();
         if let Err(e) = agent.run(&mut self.convo, approver, &mut observer, &self.cancel) {
@@ -280,6 +287,9 @@ impl Repl<'_> {
             self.model.clone(),
             observer.served_model.clone(),
             turn_endpoint,
+            observer
+                .first_delta_at
+                .map(|t| t.duration_since(started).as_millis()),
             started.elapsed().as_millis(),
             observer.usage.clone(),
             observer.steps,

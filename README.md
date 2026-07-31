@@ -126,15 +126,19 @@ see which concrete model actually served the response:
 Endpoint: https://api.monocle-ai.com/v1/chat/completions
 Requested model: monocle-auto
 Served model: claude-sonnet-4-6
-Latency: 842ms
+Time to first byte: 312ms
+Latency (total): 842ms
 Tokens: 120 prompt + 45 completion = 165 total
 --- end diag ---
 ```
 
-`Served model` and `Tokens` are only shown when the backend reports them (always true for
-`monocle chat`'s default path; `--responses`, below, reports neither today, so those lines
-are simply omitted rather than printed as empty). Before the first turn, `/diag` just
-prints a hint to send a message first.
+`Time to first byte` is how long the response took to *start* streaming; `Latency (total)`
+is how long the full reply took to finish. `Served model` and `Tokens` are only shown when
+the backend reports them (always true for `monocle chat`'s default path; `--responses`,
+below, reports neither today, so those lines are simply omitted rather than printed as
+empty); `--responses` also makes a single blocking call with no incremental deltas, so
+`Time to first byte` has nothing to measure there and is omitted too. Before the first
+turn, `/diag` just prints a hint to send a message first.
 
 `/help` re-prints the REPL's onboarding message (the same lines shown when the
 session starts) — handy if you've scrolled past it.
@@ -245,8 +249,9 @@ echo "and in Python?" | monocle chat --responses --resume 3fa3b2c1-...
 ```
 
 `/diag` also works in this REPL, but the Responses API doesn't echo back a served
-model or token usage, so those lines are omitted — only `Endpoint`/`Requested
-model`/`Latency` are shown.
+model or token usage, and (being a single blocking call, not streamed) has no
+time-to-first-byte to report either — so those lines are omitted, and only
+`Endpoint`/`Requested model`/`Latency (total)` are shown.
 
 List your existing threads (including ones started in jarvice's own web UI —
 both share the same storage) with the `list` subcommand:
@@ -408,8 +413,8 @@ persists across sessions in `~/.monocle/agent_history`.
 In the interactive REPL, lines starting with `/` are local management commands (handled
 without calling the model, printed to stderr): `/help` lists them, `/config` shows the
 session config (model, max-steps, workdir, session), `/status` adds your login status,
-`/diag` shows diagnostics (served model, endpoint, latency, tokens, and step count) for
-the last turn, `/model` shows the current model (or `/model <id>` switches it for later
+`/diag` shows diagnostics (served model, endpoint, time to first byte, total latency,
+tokens, and step count) for the last turn, `/model` shows the current model (or `/model <id>` switches it for later
 turns), and `/exit` (or `/quit`, Ctrl-D) quits. `/model <TAB>` fuzzy-completes against the
 model ids available to your account (fetched once at startup) — e.g. `/model cla<TAB>`
 narrows to matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in
