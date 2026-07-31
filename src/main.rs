@@ -183,11 +183,12 @@ struct ChatArgs {
     /// `monocle chat list` to discover thread ids.)
     #[arg(long)]
     resume: Option<String>,
-    /// With `--responses`, treat an unresolved (unexecuted) tool_calls report
-    /// as a scriptable failure — nonzero exit — instead of just a stderr
-    /// warning. One-shot (piped input) only. Useful to verify a
-    /// server-executed tool (e.g. `web_search`) actually fired and resolved,
-    /// e.g. in a deploy-verification script.
+    /// With `--responses`, assert that a server-executed tool (e.g.
+    /// `web_search`) actually RAN, as a scriptable exit code: 0 = a tool ran,
+    /// 1 = none ran (or an unresolved tool_calls report leaked back), 2 =
+    /// cannot verify, because this jarvice does not report `tools_used` and so
+    /// predates the field. One-shot (piped input) only. The answer is written
+    /// to stdout first regardless of the verdict.
     #[arg(long = "verify-tool-firing")]
     verify_tool_firing: bool,
 }

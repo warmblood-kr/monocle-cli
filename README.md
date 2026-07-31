@@ -53,7 +53,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--verify-tool-firing]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--verify-tool-firing` (with `--responses`, one-shot) exits non-zero if a tool request came back unresolved |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--verify-tool-firing]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--verify-tool-firing` (with `--responses`, one-shot) asserts a server-executed tool actually ran, as an exit code (`0` ran / `1` did not / `2` cannot verify) |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
@@ -283,18 +283,39 @@ Notes:
   right now. This is separate from jarvice's own **server-executed** tools
   (e.g. `web_search`) — those run on jarvice and come back already resolved;
   see `--verify-tool-firing` below to check that they actually did.
-- **`--verify-tool-firing`** — one-shot only; turns the warning above from
-  stderr-text into a scriptable check. If the reply comes back with an
-  unresolved tool_calls report, this exits non-zero (and prints
-  `✗ tool-firing verification FAILED: ...`) instead of just warning; if
-  nothing was dropped, it prints `✓ tool-firing verification: passed` and
-  exits `0`. Useful to confirm a server-executed tool actually fired end to
-  end (e.g. after a jarvice/chat-proxy deploy) without eyeballing stderr:
+- **`--verify-tool-firing`** — one-shot only; asserts that a server-executed
+  tool **actually ran**, as a scriptable exit code. Useful after a
+  jarvice/chat-proxy deploy, without eyeballing stderr:
 
   ```bash
   echo "search the web for today's date" | monocle chat --responses --verify-tool-firing
   echo "exit: $?"
   ```
+
+  | exit | meaning | printed to stderr |
+  |------|---------|-------------------|
+  | `0` | a tool ran | `✓ tool-firing verification: passed — web_search ran` |
+  | `1` | no tool ran, **or** an unresolved tool_calls report leaked back | `✗ tool-firing verification FAILED: ...` |
+  | `2` | **cannot verify** — this jarvice does not report `tools_used` (it predates the field) | `? tool-firing verification: CANNOT VERIFY — ...` |
+
+  The answer itself is always written to stdout first, whatever the verdict, so
+  a failing check never swallows the output you need in order to see why it
+  failed.
+
+  Exit `2` is deliberately not folded into `1`. jarvice reports the tools it
+  executed in a `tools_used` field
+  ([jarvice#1441](https://github.com/warmblood-kr/jarvice/issues/1441)); an
+  **empty** `tools_used` is the server stating that nothing ran (a real
+  failure), while an **absent** one only means the deployment is older than the
+  field — which is not evidence either way. Reporting the second as a pass
+  would make this check unable to fail in the direction it claims to check;
+  reporting it as a failure would cry wolf through every rollout. Deploy the
+  server side first, then re-run.
+
+  Before
+  [monocle-cli#118](https://github.com/warmblood-kr/monocle-cli/issues/118)
+  this flag only checked that no *unresolved* tool_calls came back, so a prompt
+  that fired no tool at all also passed.
 - **Known auth gap**: this endpoint currently rejects the CLI's access token
   with a 401 (`JWT missing required claim: email`) against real staging/prod
   tenants — the same open issue that blocks `monocle mcp` today. It's fine to
