@@ -602,6 +602,24 @@ mod tests {
     }
 
     #[test]
+    fn empty_model_in_first_chunk_does_not_lock_out_later_real_model() {
+        let (resp, _deltas) = run_stream(vec![
+            Ok(Some(
+                "data: {\"model\":\"\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}"
+                    .to_string(),
+            )),
+            Ok(Some(
+                "data: {\"model\":\"some-real-model\",\"choices\":[{\"delta\":{\"content\":\"!\"}}]}"
+                    .to_string(),
+            )),
+            Ok(Some("data: [DONE]".to_string())),
+            Ok(None),
+        ]);
+        let resp = resp.expect("normal completion should succeed");
+        assert_eq!(resp.model.as_deref(), Some("some-real-model"));
+    }
+
+    #[test]
     fn truncation_mid_tool_call_drops_the_tool_call() {
         // A partial tool_call delta (name + start of arguments), then a drop.
         let tool_delta = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
