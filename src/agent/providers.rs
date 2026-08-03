@@ -320,7 +320,10 @@ fn assemble_sse_stream(
             Err(_) => continue,
         };
         if model.is_none() {
-            model = v["model"].as_str().map(String::from);
+            model = v["model"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(String::from);
         }
         if usage.is_none() {
             usage = parse_usage(&v);
