@@ -13,6 +13,7 @@ use monocle_cli::commands::chat::{
     chat_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
+use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
@@ -58,6 +59,9 @@ Commands:
 
   Audio:
     audio    Call audio (STT / TTS) endpoints directly for debugging
+
+  Images:
+    image-edit  Call the image-edit endpoint directly for debugging
 
   Maintenance:
     upgrade  Update monocle to the latest release
@@ -139,6 +143,33 @@ enum Commands {
     Audio {
         #[command(subcommand)]
         command: AudioCommands,
+    },
+    /// Call the image-edit endpoint directly for debugging
+    #[command(name = "image-edit")]
+    ImageEdit {
+        /// Source image path (png | jpeg | webp)
+        image: String,
+        /// Edit instruction (required)
+        #[arg(long)]
+        prompt: String,
+        /// Model ID (required; the router only allows image-capable models)
+        #[arg(long)]
+        model: String,
+        /// Output size (e.g., 1024x1024)
+        #[arg(long)]
+        size: Option<String>,
+        /// Output quality (model-dependent)
+        #[arg(long)]
+        quality: Option<String>,
+        /// Input fidelity (model-dependent)
+        #[arg(long = "input-fidelity")]
+        input_fidelity: Option<String>,
+        /// Number of images to generate
+        #[arg(long)]
+        n: Option<String>,
+        /// Override MIME type (image/png | image/jpeg | image/webp)
+        #[arg(long = "content-type")]
+        content_type: Option<String>,
     },
     /// [Deprecated] Use `monocle chat` / `monocle models` instead
     #[command(hide = true)]
@@ -372,6 +403,29 @@ fn main() {
             },
         ),
         Commands::Audio { command } => run_audio(&client, &creds, command),
+        Commands::ImageEdit {
+            image,
+            prompt,
+            model,
+            size,
+            quality,
+            input_fidelity,
+            n,
+            content_type,
+        } => image_edit_command(
+            &client,
+            &creds,
+            &image,
+            ImageEditOptions {
+                prompt,
+                model,
+                size,
+                quality,
+                input_fidelity,
+                n,
+                content_type,
+            },
+        ),
         Commands::Upgrade { check } => upgrade_command(&client, check),
         Commands::Model { command } => {
             match command {
@@ -508,6 +562,52 @@ mod tests {
             }
             _ => panic!("expected Chat command"),
         }
+    }
+
+    #[test]
+    fn image_edit_parses_hyphenated_name_and_required_flags() {
+        let cli = Cli::parse_from([
+            "monocle",
+            "image-edit",
+            "cat.png",
+            "--prompt",
+            "add a hat",
+            "--model",
+            "some-image-model",
+        ]);
+        match cli.command {
+            Commands::ImageEdit {
+                image,
+                prompt,
+                model,
+                size,
+                ..
+            } => {
+                assert_eq!(image, "cat.png");
+                assert_eq!(prompt, "add a hat");
+                assert_eq!(model, "some-image-model");
+                assert!(size.is_none());
+            }
+            _ => panic!("expected ImageEdit command"),
+        }
+    }
+
+    #[test]
+    fn image_edit_requires_prompt_and_model() {
+        // Both flags are required: neither may silently default.
+        assert!(Cli::try_parse_from(["monocle", "image-edit", "cat.png"]).is_err());
+        assert!(
+            Cli::try_parse_from(["monocle", "image-edit", "cat.png", "--prompt", "add a hat"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "monocle",
+            "image-edit",
+            "cat.png",
+            "--model",
+            "some-image-model"
+        ])
+        .is_err());
     }
 
     #[test]
