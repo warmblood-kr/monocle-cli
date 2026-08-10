@@ -59,6 +59,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
 | `monocle audio speech-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML TTS |
+| `monocle image-edit <image> --prompt <text> --model <id> [--size <WxH>] [--quality <q>] [--input-fidelity <f>] [--n <n>] [--content-type <mime>]` | Image editing probe — posts one image to `/v1/images/edits` and prints the raw response |
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
@@ -399,6 +400,43 @@ monocle audio speech-azure \
 ```
 
 On failure each command prints the HTTP status and response body to stderr and exits non-zero, which makes it easy to spot bad parameters or backend errors.
+
+## 🖼️ Image editing
+
+`monocle image-edit` calls `/v1/images/edits` directly — the image counterpart of `monocle audio …`. It is a one-shot debugging probe: one source image plus a prompt go up as multipart, and the **raw response body is printed to stdout** untouched (which host was hit goes to stderr), so you can observe exactly what the router returned.
+
+```bash
+monocle image-edit cat.png --prompt "add a party hat" --model <image-model-id>
+```
+
+`--model` is required — the router only allows image-capable models, and there is no sensible default to guess. `monocle models` lists what your tenant has.
+
+Tune the request with the optional parameters, which are only sent when you pass them:
+
+```bash
+monocle image-edit cat.png \
+  --prompt "add a party hat" \
+  --model <image-model-id> \
+  --size 1024x1024 \
+  --quality high \
+  --input-fidelity high \
+  --n 1
+```
+
+The endpoint only accepts `image/png`, `image/jpeg`, and `image/webp`. The content type is taken from the file extension (`.png` / `.jpg` / `.jpeg` / `.webp`); an unknown extension fails locally with a clear message instead of a server-side 400. Override it when the extension lies or is missing:
+
+```bash
+monocle image-edit blob --prompt "make it warmer" --model <image-model-id> --content-type image/png
+```
+
+The body is printed verbatim, so inspect it first — this command exists to show you what the endpoint actually returns. If it comes back in the OpenAI images shape (base64 in `data[].b64_json`), pipe it rather than reading it raw:
+
+```bash
+monocle image-edit cat.png --prompt "add a party hat" --model <image-model-id> \
+  | jq -r '.data[0].b64_json' | base64 -d > edited.png
+```
+
+Deliberately minimal: one image, no mask, no image arrays. On failure it prints the HTTP status and body to stderr and exits non-zero, like the audio commands.
 
 ## ⬆️ Upgrading
 
