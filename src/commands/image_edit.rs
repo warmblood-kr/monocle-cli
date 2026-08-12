@@ -27,15 +27,14 @@ pub struct ImageEditOptions {
 
 /// The MIME types the images/edits route accepts. Anything else comes back as a
 /// 400 from the server, so an unknown extension is refused here instead of on
-/// the wire. Neither existing table fits: `audio_io`'s is audio-only (a `.png`
-/// falls through to `application/octet-stream`) and `attachment.rs`'s also
-/// allows `image/gif`, which this route rejects.
+/// the wire. Delegates the extension→MIME lookup to `attachment::mime_by_ext`
+/// (the canonical table) but narrows it: that table also maps `gif` →
+/// `image/gif`, which this route rejects, so `gif` is excluded here even
+/// though the shared table would resolve it.
 fn mime_by_ext(ext: &str) -> Option<&'static str> {
-    match ext {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        _ => None,
+    match crate::attachment::mime_by_ext(ext)? {
+        "image/gif" => None,
+        mime => Some(mime),
     }
 }
 

@@ -14,7 +14,7 @@ use crate::error::{AppError, Result};
 /// token before it is treated as a path (e.g. `file:./a.png.` in "...a.png.").
 const TRAILING_PUNCT: [char; 9] = ['.', ',', ';', ':', '!', '?', ')', '\'', '"'];
 
-fn mime_by_ext(ext: &str) -> Option<&'static str> {
+pub(crate) fn mime_by_ext(ext: &str) -> Option<&'static str> {
     match ext {
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
