@@ -13,9 +13,10 @@ use crate::attachment;
 use crate::auth::{get_access_token, jarvice_url_for, try_access_token, AuthSession};
 use crate::commands::model_list::{fetch_model_ids, handle_model_command};
 use crate::commands::repl::{
-    handle_diag_command, mode_banner, run_repl, LoopControl, ModelReplHelper, TurnDiagnostics,
-    PROMPT,
+    format_diag, handle_diag_command, mode_banner, run_repl, LoopControl, ModelReplHelper,
+    TurnDiagnostics, PROMPT,
 };
+use crate::config::{Config, ConfigData};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
@@ -201,6 +202,8 @@ fn chat_help_text() -> String {
         ),
         "/diag shows diagnostics for the last turn (only what the backend reports is shown)."
             .to_string(),
+        "/diag on / /diag off toggles always showing diagnostics after every response (saved to ~/.monocle/config.json)."
+            .to_string(),
         "/help shows this message again.".to_string(),
     ]
     .join("\n")
@@ -217,6 +220,38 @@ fn handle_help_command(trimmed: &str) -> bool {
     true
 }
 
+/// Handle `/diag on` / `/diag off`, or fall through to the shared bare-`/diag`
+/// handler (last-turn display). Persists the preference via `cfg` (best-effort
+/// — a write failure only warns, since the in-session toggle still takes
+/// effect either way) and flips `*always_on` for the rest of this REPL
+/// session. `cfg` is a parameter (not `Config::new()` inline) so tests can
+/// inject a `Config::with_home` pointed at a tempdir instead of writing to
+/// the real `~/.monocle/config.json`.
+fn handle_diag_toggle(
+    trimmed: &str,
+    diagnostics: &Option<TurnDiagnostics>,
+    always_on: &mut bool,
+    cfg: &Config,
+) -> bool {
+    match trimmed {
+        "/diag on" | "/diag off" => {
+            let value = trimmed == "/diag on";
+            *always_on = value;
+            if let Err(e) = cfg.write(&ConfigData {
+                diag_always_on: value,
+            }) {
+                eprintln!("Warning: failed to save diagnostics preference: {e}");
+            }
+            eprintln!(
+                "Diagnostics always-on is now {} (saved to ~/.monocle/config.json).",
+                if value { "ON" } else { "OFF" }
+            );
+            true
+        }
+        _ => handle_diag_command(trimmed, diagnostics),
+    }
+}
+
 /// Dispatch a slash-command line to whichever handler recognizes it (shared
 /// by both REPL loops, so the two don't drift out of sync). Returns
 /// `Some(control)` when `trimmed` was consumed as a recognized command — the
@@ -226,6 +261,8 @@ fn dispatch_chat_command(
     trimmed: &str,
     model: &mut String,
     diagnostics: &Option<TurnDiagnostics>,
+    diag_always_on: &mut bool,
+    cfg: &Config,
 ) -> Option<LoopControl> {
     if trimmed == "/quit" || trimmed == "/exit" {
         eprintln!("Bye.");
@@ -236,7 +273,7 @@ fn dispatch_chat_command(
     if handle_model_command(trimmed, model) {
         return Some(LoopControl::Continue);
     }
-    if handle_diag_command(trimmed, diagnostics) {
+    if handle_diag_toggle(trimmed, diagnostics, diag_always_on, cfg) {
         return Some(LoopControl::Continue);
     }
     if handle_help_command(trimmed) {
@@ -406,9 +443,18 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     // Last turn's diagnostics, shown on demand by `/diag` — `None` until the
     // first successful turn.
     let mut diagnostics: Option<TurnDiagnostics> = None;
+    // Persisted via `/diag on`/`/diag off` (see `handle_diag_toggle`) —
+    // loaded once here so a prior session's preference survives a restart.
+    let cfg = Config::new();
+    let mut diag_always_on = cfg.read().diag_always_on;
+    if diag_always_on {
+        eprintln!("Diagnostics always-on (usage shown after every response).");
+    }
 
     run_repl(helper, history_path, PROMPT, |trimmed| {
-        if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
+        if let Some(control) =
+            dispatch_chat_command(trimmed, &mut model, &diagnostics, &mut diag_always_on, &cfg)
+        {
             return Ok(control);
         }
 
@@ -481,6 +527,12 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
                 let mut out = std::io::stdout();
                 out.write_all(b"\n\n")?;
                 out.flush()?;
+                // `/diag on` mode: print this turn's diagnostics (never the
+                // response body, which already went to stdout above) without
+                // requiring the user to type `/diag`.
+                if diag_always_on {
+                    eprintln!("{}", format_diag(diagnostics.as_ref().unwrap()));
+                }
             }
             Err(e) => {
                 convo.truncate(mark);
@@ -813,6 +865,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     // learns a served model or token usage (see `TurnDiagnostics` docs), so
     // those fields stay `None` for the life of the session.
     let mut diagnostics: Option<TurnDiagnostics> = None;
+    // Persisted via `/diag on`/`/diag off` (see `handle_diag_toggle`) —
+    // loaded once here so a prior session's preference survives a restart.
+    let cfg = Config::new();
+    let mut diag_always_on = cfg.read().diag_always_on;
+    if diag_always_on {
+        eprintln!("Diagnostics always-on (usage shown after every response, when the backend reports it).");
+    }
 
     // Replay prior history for an existing thread, REPL-only (never in the
     // one-shot path above, never on stdout — this repo treats stdout as
@@ -847,7 +906,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     eprintln!("{}", mode_banner("chat", crate::colors::cyan));
 
     run_repl(helper, history_path, PROMPT, |trimmed| {
-        if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
+        if let Some(control) =
+            dispatch_chat_command(trimmed, &mut model, &diagnostics, &mut diag_always_on, &cfg)
+        {
             return Ok(control);
         }
 
@@ -913,6 +974,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                     }
                 }
                 println!();
+                // `/diag on` mode — see the completions path's identical
+                // comment. This path's diagnostics never carry usage (the
+                // backend doesn't report it here), but `format_diag` already
+                // omits absent fields rather than printing "None".
+                if diag_always_on {
+                    eprintln!("{}", format_diag(diagnostics.as_ref().unwrap()));
+                }
             }
             Err(e) => {
                 // A failed turn must not leave stale diagnostics from an
@@ -993,6 +1061,7 @@ mod tests {
     };
     use crate::agent::providers::{FunctionCall, ToolCall};
     use crate::commands::repl::LoopControl;
+    use crate::config::Config;
 
     fn tool_call(name: &str) -> ToolCall {
         ToolCall {
@@ -1214,16 +1283,27 @@ mod tests {
     // `handle_diag_command` already have their own coverage; this just
     // confirms the shared entry point recognizes `/quit`/`/exit` and passes
     // through anything else as ordinary chat input.
+    /// A `Config` rooted at a fresh tempdir — every `dispatch_chat_command`
+    /// test uses this instead of `Config::new()` so no test ever touches the
+    /// real `~/.monocle/config.json`.
+    fn test_config() -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::with_home(dir.path());
+        (dir, cfg)
+    }
+
     #[test]
     fn dispatch_chat_command_quit_and_exit_stop_the_repl() {
         let mut model = "monocle-auto".to_string();
         let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
         assert!(matches!(
-            dispatch_chat_command("/quit", &mut model, &diagnostics),
+            dispatch_chat_command("/quit", &mut model, &diagnostics, &mut always_on, &cfg),
             Some(LoopControl::Quit)
         ));
         assert!(matches!(
-            dispatch_chat_command("/exit", &mut model, &diagnostics),
+            dispatch_chat_command("/exit", &mut model, &diagnostics, &mut always_on, &cfg),
             Some(LoopControl::Quit)
         ));
     }
@@ -1232,17 +1312,66 @@ mod tests {
     fn dispatch_chat_command_unrecognized_line_is_chat_input() {
         let mut model = "monocle-auto".to_string();
         let diagnostics: Option<TurnDiagnostics> = None;
-        assert!(dispatch_chat_command("hello there", &mut model, &diagnostics).is_none());
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
+        assert!(dispatch_chat_command(
+            "hello there",
+            &mut model,
+            &diagnostics,
+            &mut always_on,
+            &cfg
+        )
+        .is_none());
     }
 
     #[test]
     fn dispatch_chat_command_recognizes_help() {
         let mut model = "monocle-auto".to_string();
         let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
         assert!(matches!(
-            dispatch_chat_command("/help", &mut model, &diagnostics),
+            dispatch_chat_command("/help", &mut model, &diagnostics, &mut always_on, &cfg),
             Some(LoopControl::Continue)
         ));
+    }
+
+    #[test]
+    fn dispatch_chat_command_diag_on_off_flips_flag_and_persists() {
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
+
+        assert!(matches!(
+            dispatch_chat_command("/diag on", &mut model, &diagnostics, &mut always_on, &cfg),
+            Some(LoopControl::Continue)
+        ));
+        assert!(always_on);
+        assert!(cfg.read().diag_always_on);
+
+        assert!(matches!(
+            dispatch_chat_command("/diag off", &mut model, &diagnostics, &mut always_on, &cfg),
+            Some(LoopControl::Continue)
+        ));
+        assert!(!always_on);
+        assert!(!cfg.read().diag_always_on);
+    }
+
+    #[test]
+    fn dispatch_chat_command_bare_diag_still_shows_last_turn() {
+        // `/diag` (no argument) must still fall through to the shared
+        // last-turn display, not be swallowed by the on/off branch.
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
+        assert!(matches!(
+            dispatch_chat_command("/diag", &mut model, &diagnostics, &mut always_on, &cfg),
+            Some(LoopControl::Continue)
+        ));
+        // Unaffected by a bare `/diag`.
+        assert!(!always_on);
     }
 
     #[test]

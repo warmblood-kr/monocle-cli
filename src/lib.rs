@@ -8,6 +8,7 @@ pub mod audio_io;
 pub mod auth;
 pub mod colors;
 pub mod commands;
+pub mod config;
 pub mod credentials;
 pub mod diag;
 pub mod endpoints;
