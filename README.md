@@ -59,6 +59,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
 | `monocle audio speech-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML TTS |
+| `monocle image-generate --prompt <text> --model <id> [--size <WxH>] [--quality <q>] [--n <count>]` | Call the image-generation endpoint directly for debugging (text prompt → new image, no input image) |
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
@@ -399,6 +400,16 @@ monocle audio speech-azure \
 ```
 
 On failure each command prints the HTTP status and response body to stderr and exits non-zero, which makes it easy to spot bad parameters or backend errors.
+
+## 🖼️ Images
+
+`monocle image-generate` calls chat-proxy's image-generation endpoint (`/v1/images/generations`) directly, printing the raw JSON response to stdout — a one-shot debugging probe, same style as the `audio` commands above (no input image; for that, use an image-editing endpoint/tool instead).
+
+```bash
+monocle image-generate --prompt "a cat wearing a hat" --model gpt-image-1 --size 1024x1024
+```
+
+The response body (printed as-is) carries the image as base64 (`data[].b64_json`), matching the OpenAI Images API shape.
 
 ## ⬆️ Upgrading
 

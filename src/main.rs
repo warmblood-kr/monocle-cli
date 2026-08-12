@@ -13,6 +13,7 @@ use monocle_cli::commands::chat::{
     chat_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
+use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
@@ -58,6 +59,9 @@ Commands:
 
   Audio:
     audio    Call audio (STT / TTS) endpoints directly for debugging
+
+  Images:
+    image-generate  Call the image-generate endpoint directly for debugging
 
   Maintenance:
     upgrade  Update monocle to the latest release
@@ -139,6 +143,25 @@ enum Commands {
     Audio {
         #[command(subcommand)]
         command: AudioCommands,
+    },
+    /// Call the image-generate endpoint directly for debugging
+    #[command(name = "image-generate")]
+    ImageGenerate {
+        /// Generation prompt (required)
+        #[arg(long)]
+        prompt: String,
+        /// Model ID (required; the router only allows image-capable models)
+        #[arg(long)]
+        model: String,
+        /// Output size (e.g., 1024x1024)
+        #[arg(long)]
+        size: Option<String>,
+        /// Output quality (model-dependent)
+        #[arg(long)]
+        quality: Option<String>,
+        /// Number of images to generate
+        #[arg(long)]
+        n: Option<String>,
     },
     /// [Deprecated] Use `monocle chat` / `monocle models` instead
     #[command(hide = true)]
@@ -372,6 +395,23 @@ fn main() {
             },
         ),
         Commands::Audio { command } => run_audio(&client, &creds, command),
+        Commands::ImageGenerate {
+            prompt,
+            model,
+            size,
+            quality,
+            n,
+        } => image_generate_command(
+            &client,
+            &creds,
+            ImageGenerateOptions {
+                prompt,
+                model,
+                size,
+                quality,
+                n,
+            },
+        ),
         Commands::Upgrade { check } => upgrade_command(&client, check),
         Commands::Model { command } => {
             match command {
@@ -508,6 +548,48 @@ mod tests {
             }
             _ => panic!("expected Chat command"),
         }
+    }
+
+    #[test]
+    fn image_generate_parses_hyphenated_name_and_required_flags() {
+        let cli = Cli::parse_from([
+            "monocle",
+            "image-generate",
+            "--prompt",
+            "a cat wearing a hat",
+            "--model",
+            "some-image-model",
+        ]);
+        match cli.command {
+            Commands::ImageGenerate {
+                prompt,
+                model,
+                size,
+                ..
+            } => {
+                assert_eq!(prompt, "a cat wearing a hat");
+                assert_eq!(model, "some-image-model");
+                assert!(size.is_none());
+            }
+            _ => panic!("expected ImageGenerate command"),
+        }
+    }
+
+    #[test]
+    fn image_generate_requires_prompt_and_model() {
+        // Both flags are required: neither may silently default.
+        assert!(Cli::try_parse_from(["monocle", "image-generate"]).is_err());
+        assert!(Cli::try_parse_from([
+            "monocle",
+            "image-generate",
+            "--prompt",
+            "a cat wearing a hat"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["monocle", "image-generate", "--model", "some-image-model"])
+                .is_err()
+        );
     }
 
     #[test]
