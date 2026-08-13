@@ -140,6 +140,11 @@ empty); `--responses` also makes a single blocking call with no incremental delt
 `Time to first byte` has nothing to measure there and is omitted too. Before the first
 turn, `/diag` just prints a hint to send a message first.
 
+`/diag on` makes diagnostics print automatically after every reply, instead of only
+on demand — handy for keeping an eye on token usage as you go. `/diag off` turns it
+back off. The setting is saved to `~/.monocle/config.json` and persists across
+sessions until toggled again.
+
 `/help` re-prints the REPL's onboarding message (the same lines shown when the
 session starts) — handy if you've scrolled past it.
 
