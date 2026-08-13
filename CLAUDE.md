@@ -16,6 +16,10 @@ cargo fmt               # 포매팅
 
 ## Conventions
 - 커밋 메시지, PR, 이슈: 한국어
+- **PR 종결 키워드는 owner를 반드시 붙일 것**: `Closes owner/repo#N` — 맨
+  `Closes repo#N`(owner 없이)은 GitHub가 해석하지 않고 조용히 무시된다. 이
+  레포에서 실제로 두 번 발생: #113, #115 둘 다 기본 브랜치로 머지됐는데
+  이 형태 때문에 자동으로 안 닫혀서 나중에 수동으로 닫아야 했다.
 - 브랜치 전략: `feature branch → devel → staging → main`
 - 버전: `Cargo.toml`의 `version` 한 곳 (릴리스 태그 `vX.Y.Z`와 일치해야 CI 통과)
 - 자격증명 파일(`~/.monocle/credentials.json`)은 drop-in 호환 계약 — JSON 스키마/키
