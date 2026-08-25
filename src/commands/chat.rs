@@ -37,6 +37,9 @@ pub struct ChatOptions {
     pub responses: bool,
     /// `--resume <ID>`: continue an existing `--responses` thread.
     pub resume: Option<String>,
+    /// `--tool-ids <id,...>`: with `--responses`, MCP/connected-app server
+    /// ids to activate for this turn (jarvice's `ResponseRequest.tools`).
+    pub tool_ids: Vec<String>,
     /// `--verify-tool-firing[=<tool>]`: with `--responses`, assert from the
     /// server's `tools_used` that a tool actually ran, as an exit code.
     /// `None` = flag absent. One-shot only.
@@ -809,7 +812,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
-        let reply = rc.respond(&model, &text, &images, options.resume.as_deref())?;
+        let reply = rc.respond(
+            &model,
+            &text,
+            &images,
+            options.resume.as_deref(),
+            &options.tool_ids,
+        )?;
         let dropped_msg = dropped_tool_calls_message(
             &reply.tool_calls,
             reply.unparsed_tool_calls,
@@ -944,7 +953,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         // there's no `Time to first byte:` to capture — see the `for_chat`
         // call below.
         let started = std::time::Instant::now();
-        match rc.respond(&model, &text, &images, thread_id.as_deref()) {
+        match rc.respond(
+            &model,
+            &text,
+            &images,
+            thread_id.as_deref(),
+            &options.tool_ids,
+        ) {
             Ok(reply) => {
                 diagnostics = Some(TurnDiagnostics::for_chat(
                     model.clone(),

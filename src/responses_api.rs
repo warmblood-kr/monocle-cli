@@ -99,6 +99,32 @@ fn build_input(text: &str, images: &[ImageAttachment]) -> Value {
     json!(parts)
 }
 
+/// Build the full `/api/responses` request body. `tool_ids` is omitted
+/// entirely when empty, matching jarvice's `Optional[list[str]] = None`
+/// default (`ResponseRequest.tools`) — an empty `tools: []` would be a
+/// different, wrong signal ("activate zero tools") from "field absent"
+/// ("use the model's own static config").
+fn build_request_body(
+    model: &str,
+    text: &str,
+    images: &[ImageAttachment],
+    thread_id: Option<&str>,
+    tool_ids: &[String],
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "input": build_input(text, images),
+        "stream": false,
+    });
+    if let Some(id) = thread_id {
+        body["thread"] = json!({"thread_id": id});
+    }
+    if !tool_ids.is_empty() {
+        body["tools"] = json!(tool_ids);
+    }
+    body
+}
+
 pub struct ResponsesClient<'a> {
     client: &'a Client,
     token: String,
@@ -127,23 +153,22 @@ impl<'a> ResponsesClient<'a> {
     /// `--system-prompt` has nothing to attach to here, unlike the plain
     /// `/v1/chat/completions` path. Callers should warn and ignore it rather
     /// than silently dropping it.
+    ///
+    /// `tool_ids`: MCP/connected-app server ids to activate for this turn
+    /// (jarvice's `ResponseRequest.tools`, `models/responses.py:44`). Without
+    /// it, a turn only gets tools from the model's own static `meta.toolIds`
+    /// config (monocle-cli#129 / monocle#627) — there is no per-turn
+    /// selection otherwise. Omitted from the request body when empty,
+    /// matching jarvice's `Optional[list[str]] = None` default.
     pub fn respond(
         &self,
         model: &str,
         text: &str,
         images: &[ImageAttachment],
         thread_id: Option<&str>,
+        tool_ids: &[String],
     ) -> Result<ResponsesReply> {
-        let input = build_input(text, images);
-
-        let mut body = json!({
-            "model": model,
-            "input": input,
-            "stream": false,
-        });
-        if let Some(id) = thread_id {
-            body["thread"] = json!({"thread_id": id});
-        }
+        let body = build_request_body(model, text, images, thread_id, tool_ids);
 
         let bearer = format!("Bearer {}", self.token);
         let resp = self.client.post_json(
@@ -276,6 +301,19 @@ mod tests {
             build_input("", &images),
             json!([{"type": "input_image", "image_url": "https://example.com/a.png"}])
         );
+    }
+
+    #[test]
+    fn empty_tool_ids_are_omitted_from_the_request_body() {
+        let body = build_request_body("m", "hi", &[], None, &[]);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn tool_ids_are_sent_as_the_tools_field() {
+        let tool_ids = vec!["ms365-server-id".to_string()];
+        let body = build_request_body("m", "hi", &[], None, &tool_ids);
+        assert_eq!(body["tools"], json!(["ms365-server-id"]));
     }
 
     /// Build a minimal `/api/responses`-shaped body, optionally with a

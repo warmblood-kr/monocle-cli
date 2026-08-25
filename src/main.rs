@@ -185,6 +185,12 @@ struct ChatArgs {
     /// `monocle chat list` to discover thread ids.)
     #[arg(long)]
     resume: Option<String>,
+    /// With `--responses`, MCP/connected-app server ids to activate for this
+    /// turn (comma-separated). Without this, a turn only gets tools from the
+    /// model's own static config — there is no other way to select which MCP
+    /// servers are on for a given `--responses` call.
+    #[arg(long = "tool-ids", value_delimiter = ',')]
+    tool_ids: Vec<String>,
     /// With `--responses`, assert from the server's `tools_used` that a
     /// server-executed tool actually RAN, as a scriptable exit code. Pass a
     /// tool name to require THAT tool (`--verify-tool-firing=web_search`);
@@ -208,6 +214,7 @@ impl From<ChatArgs> for ChatOptions {
             files: a.file,
             responses: a.responses,
             resume: a.resume,
+            tool_ids: a.tool_ids,
             verify_tool_firing: a.verify_tool_firing.map(|v| match v {
                 Some(name) => ToolFiringExpectation::Named(name),
                 None => ToolFiringExpectation::Any,
