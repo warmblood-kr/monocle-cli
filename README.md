@@ -295,7 +295,7 @@ Notes:
 
   ```bash
   echo "오늘 받은 메일 있나요?" \
-    | monocle chat --responses --tool-ids <ms365-server-id> --verify-tool-firing
+    | monocle chat --responses --tool-ids ms365-a1b2c3d4-... --verify-tool-firing
   ```
 - **`--verify-tool-firing[=<tool>]`** — one-shot only; asserts that a
   server-executed tool **actually ran**, as a scriptable exit code. Useful
