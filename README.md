@@ -53,7 +53,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--verify-tool-firing[=<tool>]]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--verify-tool-firing[=<tool>]` (with `--responses`, one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine) |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--tool-ids <id,...>` (with `--responses`) activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (with `--responses`, one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine) |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
@@ -288,6 +288,15 @@ Notes:
   right now. This is separate from jarvice's own **server-executed** tools
   (e.g. `web_search`) — those run on jarvice and come back already resolved;
   see `--verify-tool-firing` below to check that they actually did.
+- **`--tool-ids <id,...>`** — MCP/connected-app server ids to activate for
+  this turn (comma-separated). Without it, a turn only gets whatever tools
+  are in the model's own static config — there's no other way to pick which
+  MCP servers are on for a given call:
+
+  ```bash
+  echo "오늘 받은 메일 있나요?" \
+    | monocle chat --responses --tool-ids ms365-a1b2c3d4-... --verify-tool-firing
+  ```
 - **`--verify-tool-firing[=<tool>]`** — one-shot only; asserts that a
   server-executed tool **actually ran**, as a scriptable exit code. Useful
   after a jarvice/chat-proxy deploy, without eyeballing stderr:
