@@ -297,8 +297,9 @@ Notes:
   not an error, it's **silently dropped**, so zero tools get activated and
   `--verify-tool-firing` reports exit 1 — indistinguishable from the tool not
   being wired up at all unless you already know to check the prefix. Use
-  `mcp:{server}` to activate a whole server, or `mcp:{server}__{tool}` for one
-  tool within it:
+  `mcp:{server}` to activate a whole server (confirmed working live below); a
+  tool-level form, `mcp:{server}__{tool}`, is also supported in jarvice's code
+  but has not been exercised live as of this writing:
 
   ```bash
   echo "오늘 받은 메일 있나요?" \
