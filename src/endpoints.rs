@@ -8,3 +8,5 @@ pub const AUDIO_TRANSCRIPTIONS: &str = "/v1/audio/transcriptions";
 pub const AUDIO_SPEECH: &str = "/v1/audio/speech";
 pub const AZURE_SPEECH_TO_TEXT: &str = "/v1/speechtotext/transcriptions:transcribe";
 pub const AZURE_TEXT_TO_SPEECH: &str = "/v1/azure/texttospeech/cognitiveservices/v1";
+pub const IMAGE_GENERATIONS: &str = "/v1/images/generations";
+pub const IMAGE_EDITS: &str = "/v1/images/edits";
