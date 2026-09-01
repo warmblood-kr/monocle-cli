@@ -13,6 +13,8 @@ use monocle_cli::commands::chat::{
     chat_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
+use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
+use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
@@ -58,6 +60,9 @@ Commands:
 
   Audio:
     audio    Call audio (STT / TTS) endpoints directly for debugging
+
+  Image:
+    image    Generate or edit images via chat-proxy (OpenAI compatible)
 
   Maintenance:
     upgrade  Update monocle to the latest release
@@ -139,6 +144,11 @@ enum Commands {
     Audio {
         #[command(subcommand)]
         command: AudioCommands,
+    },
+    /// Generate or edit images via chat-proxy (OpenAI compatible)
+    Image {
+        #[command(subcommand)]
+        command: ImageCommands,
     },
     /// [Deprecated] Use `monocle chat` / `monocle models` instead
     #[command(hide = true)]
@@ -320,6 +330,53 @@ enum AudioCommands {
 }
 
 #[derive(Subcommand)]
+enum ImageCommands {
+    /// Generate an image via /v1/images/generations (OpenAI compatible)
+    Generate {
+        prompt: Option<String>,
+        /// Model ID (e.g., gpt-image-1)
+        #[arg(long)]
+        model: String,
+        /// e.g. 1024x1024
+        #[arg(long)]
+        size: Option<String>,
+        /// Number of images to generate
+        #[arg(long)]
+        n: Option<u32>,
+        /// Model-dependent quality setting
+        #[arg(long)]
+        quality: Option<String>,
+        /// Write image(s) here (a second+ image gets `-1`, `-2`, ... suffixed)
+        #[arg(short = 'o', long)]
+        output: String,
+    },
+    /// Edit an image via /v1/images/edits (OpenAI compatible; gpt-image models only)
+    Edit {
+        /// Local image path (png/jpg/webp)
+        image: String,
+        prompt: Option<String>,
+        /// Model ID (must be a gpt-image model)
+        #[arg(long)]
+        model: String,
+        /// Local mask image path (same format as `image`)
+        #[arg(long)]
+        mask: Option<String>,
+        /// e.g. 1024x1024
+        #[arg(long)]
+        size: Option<String>,
+        /// Number of images to generate
+        #[arg(long)]
+        n: Option<u32>,
+        /// Model-dependent quality setting
+        #[arg(long)]
+        quality: Option<String>,
+        /// Write image(s) here (a second+ image gets `-1`, `-2`, ... suffixed)
+        #[arg(short = 'o', long)]
+        output: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ModelCommands {
     /// [Deprecated] Use `monocle models` instead
     List,
@@ -379,6 +436,7 @@ fn main() {
             },
         ),
         Commands::Audio { command } => run_audio(&client, &creds, command),
+        Commands::Image { command } => run_image(&client, &creds, command),
         Commands::Upgrade { check } => upgrade_command(&client, check),
         Commands::Model { command } => {
             match command {
@@ -487,6 +545,53 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
             creds,
             ssml.as_deref(),
             AudioSpeechAzureOptions { format, output },
+        ),
+    }
+}
+
+fn run_image(client: &Client, creds: &Credentials, command: ImageCommands) -> Result<()> {
+    match command {
+        ImageCommands::Generate {
+            prompt,
+            model,
+            size,
+            n,
+            quality,
+            output,
+        } => image_generate_command(
+            client,
+            creds,
+            prompt.as_deref(),
+            ImageGenerateOptions {
+                model,
+                size,
+                n,
+                quality,
+                output,
+            },
+        ),
+        ImageCommands::Edit {
+            image,
+            prompt,
+            model,
+            mask,
+            size,
+            n,
+            quality,
+            output,
+        } => image_edit_command(
+            client,
+            creds,
+            &image,
+            prompt.as_deref(),
+            ImageEditOptions {
+                model,
+                mask,
+                size,
+                n,
+                quality,
+                output,
+            },
         ),
     }
 }

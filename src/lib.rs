@@ -13,6 +13,7 @@ pub mod credentials;
 pub mod diag;
 pub mod endpoints;
 pub mod error;
+pub mod image_io;
 pub mod jarvice_chats;
 pub mod net;
 pub mod oidc;

@@ -59,6 +59,8 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
 | `monocle audio speech-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML TTS |
+| `monocle image generate [prompt] --model <id> -o <path> [--size <WxH>] [--n <n>] [--quality <q>]` | OpenAI-compatible image generation (prompt arg or stdin) |
+| `monocle image edit <image> [prompt] --model <id> -o <path> [--mask <path>] [--size <WxH>] [--n <n>] [--quality <q>]` | OpenAI-compatible image edit (gpt-image models only; prompt arg or stdin) |
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
@@ -413,6 +415,40 @@ monocle audio speech-azure \
 ```
 
 On failure each command prints the HTTP status and response body to stderr and exits non-zero, which makes it easy to spot bad parameters or backend errors.
+
+## 🖼️ Image (generate / edit)
+
+`monocle image …` calls chat-proxy's OpenAI-compatible image endpoints directly, the same way `monocle audio …` does for STT/TTS. There is no separate "upload a file, then reference it by id" step — an edit sends the image bytes straight in the request, matching chat-proxy's own `/v1/images/edits` contract.
+
+### Generate
+
+`/v1/images/generations`:
+
+```bash
+monocle image generate "a red bicycle on a white background" --model gpt-image-1 -o bike.png
+```
+
+Pipe a prompt in from another tool:
+
+```bash
+echo "a watercolor mountain landscape" | monocle image generate --model gpt-image-1 -o landscape.png
+```
+
+`--n <n>` greater than 1 writes additional files with `-1`, `-2`, ... spliced before the extension (`bike.png`, `bike-1.png`, ...).
+
+### Edit
+
+`/v1/images/edits` — **gpt-image models only** (Gemini image editing is a separate, non-OpenAI-shaped surface not covered by this subcommand):
+
+```bash
+monocle image edit mockup.png "add a second monitor on the desk" --model gpt-image-1 -o mockup-edited.png
+```
+
+With a mask (same image format as `image`: png/jpg/webp):
+
+```bash
+monocle image edit mockup.png "replace the sky" --model gpt-image-1 --mask sky-mask.png -o mockup-edited.png
+```
 
 ## ⬆️ Upgrading
 

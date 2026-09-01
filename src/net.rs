@@ -161,19 +161,24 @@ impl Client {
         send("POST", url, req)
     }
 
-    /// POST `multipart/form-data` with one binary file part plus text fields.
+    /// POST `multipart/form-data` with one or more binary file parts plus text
+    /// fields (e.g. an audio upload sends one `file` part; an image edit sends
+    /// an `image` part and an optional `mask` part).
     pub fn post_multipart(
         &self,
         url: &str,
         headers: &[(&str, &str)],
-        file: FilePart,
+        files: Vec<FilePart>,
         text_fields: &[(&str, &str)],
     ) -> Result<Resp> {
-        let part = reqwest::blocking::multipart::Part::bytes(file.data)
-            .file_name(file.filename)
-            .mime_str(&file.content_type)
-            .map_err(|e| AppError(e.to_string()))?;
-        let mut form = reqwest::blocking::multipart::Form::new().part(file.field, part);
+        let mut form = reqwest::blocking::multipart::Form::new();
+        for file in files {
+            let part = reqwest::blocking::multipart::Part::bytes(file.data)
+                .file_name(file.filename)
+                .mime_str(&file.content_type)
+                .map_err(|e| AppError(e.to_string()))?;
+            form = form.part(file.field, part);
+        }
         for (k, v) in text_fields {
             form = form.text(k.to_string(), v.to_string());
         }
