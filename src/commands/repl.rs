@@ -60,6 +60,11 @@ pub struct TurnDiagnostics {
     pub requested_model: String,
     pub served_model: Option<String>,
     pub endpoint: String,
+    /// Time to first byte — elapsed time until the first streamed chunk of
+    /// the turn's answer arrived. `None` wherever the backend doesn't stream
+    /// (the `--responses` path makes one blocking call with no incremental
+    /// deltas, so it structurally has no TTFB to report).
+    pub ttfb_ms: Option<u128>,
     pub latency_ms: u128,
     pub usage: Option<TokenUsage>,
     /// How many LLM calls this turn made. `None` for chat (always exactly
@@ -76,6 +81,7 @@ impl TurnDiagnostics {
         requested_model: String,
         served_model: Option<String>,
         endpoint: String,
+        ttfb_ms: Option<u128>,
         latency_ms: u128,
         usage: Option<TokenUsage>,
     ) -> Self {
@@ -83,6 +89,7 @@ impl TurnDiagnostics {
             requested_model,
             served_model,
             endpoint,
+            ttfb_ms,
             latency_ms,
             usage,
             steps: None,
@@ -95,6 +102,7 @@ impl TurnDiagnostics {
         requested_model: String,
         served_model: Option<String>,
         endpoint: String,
+        ttfb_ms: Option<u128>,
         latency_ms: u128,
         usage: Option<TokenUsage>,
         steps: u32,
@@ -103,6 +111,7 @@ impl TurnDiagnostics {
             requested_model,
             served_model,
             endpoint,
+            ttfb_ms,
             latency_ms,
             usage,
             steps: Some(steps),
@@ -122,7 +131,10 @@ pub fn format_diag(d: &TurnDiagnostics) -> String {
     if let Some(served) = &d.served_model {
         lines.push(format!("Served model: {served}"));
     }
-    lines.push(format!("Latency: {}ms", d.latency_ms));
+    if let Some(ttfb) = d.ttfb_ms {
+        lines.push(format!("Time to first byte: {ttfb}ms"));
+    }
+    lines.push(format!("Latency (total): {}ms", d.latency_ms));
     if let Some(steps) = d.steps {
         lines.push(format!("Steps: {steps}"));
     }
@@ -303,10 +315,16 @@ impl Highlighter for ModelReplHelper {
 /// `on_line` receives each non-empty trimmed line (already added to history)
 /// and returns whether the loop should continue or quit. Ctrl-C at the idle
 /// prompt just starts a fresh line (rustyline surfaces it as `Interrupted`
-/// without raising SIGINT); Ctrl-D (EOF) quits with a "Bye." message. `prompt`
-/// must be plain text with no raw ANSI escapes — see `agent.rs`'s prompt
-/// comment for why (rustyline's cursor-column math assumes 0-width escapes,
-/// which breaks when a terminal doesn't actually interpret them as color).
+/// without raising SIGINT); Ctrl-D (EOF) quits with a "Bye." message. Any
+/// other `readline()` error (e.g. rustyline's UTF-8 decoder losing sync —
+/// observed after a bracketed-paste marker race with a fast terminal) is
+/// treated as a discarded line, not a fatal one: a single bad read shouldn't
+/// end an otherwise-healthy interactive session. Only
+/// `MAX_CONSECUTIVE_READLINE_ERRORS` in a row gives up, so a truly broken
+/// terminal/stream still can't spin forever. `prompt` must be plain text with
+/// no raw ANSI escapes — see `agent.rs`'s prompt comment for why (rustyline's
+/// cursor-column math assumes 0-width escapes, which breaks when a terminal
+/// doesn't actually interpret them as color).
 pub fn run_repl<H: Helper>(
     helper: H,
     history_path: PathBuf,
@@ -329,9 +347,11 @@ pub fn run_repl<H: Helper>(
     }
     let _ = rl.load_history(&history_path);
 
+    let mut consecutive_errors = 0u32;
     loop {
         match rl.readline(prompt) {
             Ok(line) => {
+                consecutive_errors = 0;
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -348,14 +368,36 @@ pub fn run_repl<H: Helper>(
                 break;
             }
             Err(e) => {
-                eprintln!("{} {e}", c::red("Error:"));
-                break;
+                consecutive_errors += 1;
+                eprintln!(
+                    "{} {e} (line discarded — often a transient terminal read hiccup; try again)",
+                    c::yellow("Warning:")
+                );
+                if readline_errors_exhausted(consecutive_errors) {
+                    eprintln!(
+                        "{} too many consecutive read errors — exiting",
+                        c::red("Error:")
+                    );
+                    break;
+                }
             }
         }
     }
 
     let _ = rl.save_history(&history_path);
     Ok(())
+}
+
+/// After this many consecutive non-EOF/non-Interrupted `readline()` errors in
+/// a row, `run_repl` gives up rather than looping forever — a guard against a
+/// truly broken terminal/stream, while still tolerating the occasional
+/// single-line hiccup (see `run_repl`'s `Err(e)` arm).
+const MAX_CONSECUTIVE_READLINE_ERRORS: u32 = 5;
+
+/// Pure so the give-up threshold is unit-testable without a real rustyline
+/// `Editor` (which `run_repl` can't easily inject a fake reader into).
+fn readline_errors_exhausted(consecutive: u32) -> bool {
+    consecutive >= MAX_CONSECUTIVE_READLINE_ERRORS
 }
 
 #[cfg(test)]
@@ -377,6 +419,22 @@ mod tests {
             commands: TEST_COMMANDS,
             models: model_ids(models),
         }
+    }
+
+    #[test]
+    fn readline_errors_exhausted_tolerates_occasional_hiccups() {
+        assert!(!readline_errors_exhausted(1));
+        assert!(!readline_errors_exhausted(
+            MAX_CONSECUTIVE_READLINE_ERRORS - 1
+        ));
+    }
+
+    #[test]
+    fn readline_errors_exhausted_gives_up_at_the_threshold() {
+        assert!(readline_errors_exhausted(MAX_CONSECUTIVE_READLINE_ERRORS));
+        assert!(readline_errors_exhausted(
+            MAX_CONSECUTIVE_READLINE_ERRORS + 1
+        ));
     }
 
     #[test]
@@ -551,11 +609,14 @@ mod tests {
     fn format_diag_omits_served_model_and_usage_when_unavailable() {
         // The `--responses` path: only endpoint/requested-model/latency are
         // ever known — served model and usage must never render as a literal
-        // "None"/"null", they're just absent lines.
+        // "None"/"null", they're just absent lines. `ttfb_ms` is also `None`
+        // here (the `--responses` path doesn't stream), so its line is
+        // omitted too.
         let d = TurnDiagnostics {
             requested_model: "monocle-auto".to_string(),
             served_model: None,
             endpoint: "https://acme.monocle-ai.com/api/responses".to_string(),
+            ttfb_ms: None,
             latency_ms: 842,
             usage: None,
             steps: None,
@@ -566,7 +627,7 @@ mod tests {
             "--- diag ---\n\
              Endpoint: https://acme.monocle-ai.com/api/responses\n\
              Requested model: monocle-auto\n\
-             Latency: 842ms\n\
+             Latency (total): 842ms\n\
              --- end diag ---"
         );
         assert!(!block.contains("None"));
@@ -579,6 +640,7 @@ mod tests {
             requested_model: "monocle-auto".to_string(),
             served_model: Some("claude-sonnet-4-6".to_string()),
             endpoint: "https://api.monocle-ai.com/v1/chat/completions".to_string(),
+            ttfb_ms: None,
             latency_ms: 1234,
             usage: Some(TokenUsage {
                 prompt_tokens: 120,
@@ -594,7 +656,7 @@ mod tests {
              Endpoint: https://api.monocle-ai.com/v1/chat/completions\n\
              Requested model: monocle-auto\n\
              Served model: claude-sonnet-4-6\n\
-             Latency: 1234ms\n\
+             Latency (total): 1234ms\n\
              Tokens: 120 prompt + 45 completion = 165 total\n\
              --- end diag ---"
         );
@@ -609,6 +671,7 @@ mod tests {
             requested_model: "monocle-auto".to_string(),
             served_model: Some("claude-sonnet-4-6".to_string()),
             endpoint: "https://api.monocle-ai.com/agent".to_string(),
+            ttfb_ms: None,
             latency_ms: 2500,
             usage: Some(TokenUsage {
                 prompt_tokens: 300,
@@ -624,9 +687,41 @@ mod tests {
              Endpoint: https://api.monocle-ai.com/agent\n\
              Requested model: monocle-auto\n\
              Served model: claude-sonnet-4-6\n\
-             Latency: 2500ms\n\
+             Latency (total): 2500ms\n\
              Steps: 3\n\
              Tokens: 300 prompt + 80 completion = 380 total\n\
+             --- end diag ---"
+        );
+    }
+
+    /// When `ttfb_ms` IS known (the streaming chat/agent paths), it renders as
+    /// its own line ahead of the total-latency line — this is the whole point
+    /// of the two numbers: "how fast did it start" vs "how long to finish".
+    #[test]
+    fn format_diag_shows_ttfb_ahead_of_total_latency_when_present() {
+        let d = TurnDiagnostics {
+            requested_model: "monocle-auto".to_string(),
+            served_model: Some("claude-sonnet-4-6".to_string()),
+            endpoint: "https://api.monocle-ai.com/v1/chat/completions".to_string(),
+            ttfb_ms: Some(312),
+            latency_ms: 4219,
+            usage: Some(TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                total_tokens: 165,
+            }),
+            steps: None,
+        };
+        let block = format_diag(&d);
+        assert_eq!(
+            block,
+            "--- diag ---\n\
+             Endpoint: https://api.monocle-ai.com/v1/chat/completions\n\
+             Requested model: monocle-auto\n\
+             Served model: claude-sonnet-4-6\n\
+             Time to first byte: 312ms\n\
+             Latency (total): 4219ms\n\
+             Tokens: 120 prompt + 45 completion = 165 total\n\
              --- end diag ---"
         );
     }
@@ -643,6 +738,7 @@ mod tests {
             requested_model: "monocle-auto".to_string(),
             served_model: None,
             endpoint: "https://api.monocle-ai.com/agent".to_string(),
+            ttfb_ms: None,
             latency_ms: 10,
             usage: None,
             steps: Some(1),

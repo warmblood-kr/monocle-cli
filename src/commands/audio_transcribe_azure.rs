@@ -88,12 +88,12 @@ pub fn audio_transcribe_azure_command(
     let resp = client.post_multipart(
         &format!("{}{}", session.router_url, endpoints::AZURE_SPEECH_TO_TEXT),
         &auth_headers(&bearer),
-        FilePart {
+        vec![FilePart {
             field: "audio".to_string(),
             filename: input.filename,
             content_type: input.content_type,
             data: input.data,
-        },
+        }],
         // Server expects `definition` as a plain string form field.
         &[("definition", &definition)],
     )?;

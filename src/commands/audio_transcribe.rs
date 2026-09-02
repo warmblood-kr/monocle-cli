@@ -54,12 +54,12 @@ pub fn audio_transcribe_command(
     let resp = client.post_multipart(
         &format!("{}{}", session.router_url, endpoints::AUDIO_TRANSCRIPTIONS),
         &auth_headers(&bearer),
-        FilePart {
+        vec![FilePart {
             field: "file".to_string(),
             filename: input.filename,
             content_type: input.content_type,
             data: input.data,
-        },
+        }],
         &fields,
     )?;
 

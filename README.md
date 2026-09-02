@@ -53,12 +53,14 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead |
+| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--tool-ids <id,...>` (with `--responses`) activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (with `--responses`, one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine) |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
 | `monocle audio speech-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML TTS |
+| `monocle image generate [prompt] --model <id> -o <path> [--size <WxH>] [--n <n>] [--quality <q>]` | OpenAI-compatible image generation (prompt arg or stdin) |
+| `monocle image edit <image> [prompt] --model <id> -o <path> [--mask <path>] [--size <WxH>] [--n <n>] [--quality <q>]` | OpenAI-compatible image edit (gpt-image models only; prompt arg or stdin) |
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
@@ -126,15 +128,24 @@ see which concrete model actually served the response:
 Endpoint: https://api.monocle-ai.com/v1/chat/completions
 Requested model: monocle-auto
 Served model: claude-sonnet-4-6
-Latency: 842ms
+Time to first byte: 312ms
+Latency (total): 842ms
 Tokens: 120 prompt + 45 completion = 165 total
 --- end diag ---
 ```
 
-`Served model` and `Tokens` are only shown when the backend reports them (always true for
-`monocle chat`'s default path; `--responses`, below, reports neither today, so those lines
-are simply omitted rather than printed as empty). Before the first turn, `/diag` just
-prints a hint to send a message first.
+`Time to first byte` is how long the response took to *start* streaming; `Latency (total)`
+is how long the full reply took to finish. `Served model` and `Tokens` are only shown when
+the backend reports them (always true for `monocle chat`'s default path; `--responses`,
+below, reports neither today, so those lines are simply omitted rather than printed as
+empty); `--responses` also makes a single blocking call with no incremental deltas, so
+`Time to first byte` has nothing to measure there and is omitted too. Before the first
+turn, `/diag` just prints a hint to send a message first.
+
+`/diag on` makes diagnostics print automatically after every reply, instead of only
+on demand — handy for keeping an eye on token usage as you go. `/diag off` turns it
+back off. The setting is saved to `~/.monocle/config.json` and persists across
+sessions until toggled again.
 
 `/help` re-prints the REPL's onboarding message (the same lines shown when the
 session starts) — handy if you've scrolled past it.
@@ -245,8 +256,9 @@ echo "and in Python?" | monocle chat --responses --resume 3fa3b2c1-...
 ```
 
 `/diag` also works in this REPL, but the Responses API doesn't echo back a served
-model or token usage, so those lines are omitted — only `Endpoint`/`Requested
-model`/`Latency` are shown.
+model or token usage, and (being a single blocking call, not streamed) has no
+time-to-first-byte to report either — so those lines are omitted, and only
+`Endpoint`/`Requested model`/`Latency (total)` are shown.
 
 List your existing threads (including ones started in jarvice's own web UI —
 both share the same storage) with the `list` subcommand:
@@ -269,13 +281,80 @@ Notes:
   it's fully generated, unlike the plain chat path's live token stream.
 - **`--system-prompt`/`--system-prompt-file`/`--max-tokens` are ignored** — the
   endpoint has no equivalent fields (a warning is printed if you pass them).
-- **Tool calls aren't executed** — this mode doesn't run a tool loop yet; if a
-  tool-calling model requests one, a warning is printed to stderr — naming it
-  when its shape parses, or noting the count when it doesn't — instead of
-  silently dropping it (see
+- **Tool calls aren't executed client-side** — this mode doesn't run a tool
+  loop itself; if the model requests a tool this CLI can't run locally, a
+  warning is printed to stderr — naming it when its shape parses, or noting
+  the count when it doesn't — instead of silently dropping it (see
   [monocle-cli#101](https://github.com/warmblood-kr/monocle-cli/issues/101)).
   `monocle agent` executes tools client-side today, if that's what you need
-  right now.
+  right now. This is separate from jarvice's own **server-executed** tools
+  (e.g. `web_search`) — those run on jarvice and come back already resolved;
+  see `--verify-tool-firing` below to check that they actually did.
+- **`--tool-ids <id,...>`** — MCP/connected-app server ids to activate for
+  this turn (comma-separated). Without it, a turn only gets whatever tools
+  are in the model's own static config — there's no other way to pick which
+  MCP servers are on for a given call. Values are sent to jarvice exactly as
+  given — CLI does no prefixing — and jarvice only activates entries that
+  start with `mcp:`; a bare server id (e.g. `ms365` instead of `mcp:ms365`) is
+  not an error, it's **silently dropped**, so zero tools get activated and
+  `--verify-tool-firing` reports exit 1 — indistinguishable from the tool not
+  being wired up at all unless you already know to check the prefix. Use
+  `mcp:{server}` to activate a whole server (confirmed working live below); a
+  tool-level form, `mcp:{server}__{tool}`, is also supported in jarvice's code
+  but has not been exercised live as of this writing:
+
+  ```bash
+  echo "오늘 받은 메일 있나요?" \
+    | monocle chat --responses --tool-ids mcp:ms365 --verify-tool-firing
+  ```
+- **`--verify-tool-firing[=<tool>]`** — one-shot only; asserts that a
+  server-executed tool **actually ran**, as a scriptable exit code. Useful
+  after a jarvice/chat-proxy deploy, without eyeballing stderr:
+
+  ```bash
+  # 이 툴이 돌았는지 (권장)
+  echo "search the web for today's date" \
+    | monocle chat --responses --verify-tool-firing=web_search
+  echo "exit: $?"
+
+  # 아무 툴이나 하나라도 돌았는지 (약한 형태)
+  echo "search the web for today's date" | monocle chat --responses --verify-tool-firing
+  ```
+
+  **Name the tool you expect.** Bare, this only asks "did *any* tool run", so a
+  turn that fired `query_chat_history` when you were checking `web_search`
+  still goes green — the check cannot fail in the direction you care about.
+  `pytest.raises` takes an exception type for the same reason.
+
+  | exit | `--verify-tool-firing` (bare) | `--verify-tool-firing=web_search` |
+  |------|-------------------------------|-----------------------------------|
+  | `0` | some tool ran | **`web_search`** ran |
+  | `1` | no tool ran, **or** an unresolved tool_calls report leaked back | a different tool ran, or none ran, or a leak |
+  | `2` | jarvice did not report `tools_used` (predates the field) | same, **plus**: entries came back unreadable, so whether `web_search` ran is unknown |
+
+  Exit `2` is "could not determine", not "failed". With a named tool, entries
+  whose names could not be read report `2` rather than `1` — claiming the tool
+  did *not* run would assert something we do not know. Unreadable entries are
+  always counted and surfaced in the message, never passed over silently.
+
+  The answer itself is always written to stdout first, whatever the verdict, so
+  a failing check never swallows the output you need in order to see why it
+  failed.
+
+  Exit `2` is deliberately not folded into `1`. jarvice reports the tools it
+  executed in a `tools_used` field
+  ([jarvice#1441](https://github.com/warmblood-kr/jarvice/issues/1441)); an
+  **empty** `tools_used` is the server stating that nothing ran (a real
+  failure), while an **absent** one only means the deployment is older than the
+  field — which is not evidence either way. Reporting the second as a pass
+  would make this check unable to fail in the direction it claims to check;
+  reporting it as a failure would cry wolf through every rollout. Deploy the
+  server side first, then re-run.
+
+  Before
+  [monocle-cli#118](https://github.com/warmblood-kr/monocle-cli/issues/118)
+  this flag only checked that no *unresolved* tool_calls came back, so a prompt
+  that fired no tool at all also passed.
 - **Known auth gap**: this endpoint currently rejects the CLI's access token
   with a 401 (`JWT missing required claim: email`) against real staging/prod
   tenants — the same open issue that blocks `monocle mcp` today. It's fine to
@@ -345,6 +424,40 @@ monocle audio speech-azure \
 
 On failure each command prints the HTTP status and response body to stderr and exits non-zero, which makes it easy to spot bad parameters or backend errors.
 
+## 🖼️ Image (generate / edit)
+
+`monocle image …` calls chat-proxy's OpenAI-compatible image endpoints directly, the same way `monocle audio …` does for STT/TTS. There is no separate "upload a file, then reference it by id" step — an edit sends the image bytes straight in the request, matching chat-proxy's own `/v1/images/edits` contract.
+
+### Generate
+
+`/v1/images/generations`:
+
+```bash
+monocle image generate "a red bicycle on a white background" --model gpt-image-1 -o bike.png
+```
+
+Pipe a prompt in from another tool:
+
+```bash
+echo "a watercolor mountain landscape" | monocle image generate --model gpt-image-1 -o landscape.png
+```
+
+`--n <n>` greater than 1 writes additional files with `-1`, `-2`, ... spliced before the extension (`bike.png`, `bike-1.png`, ...).
+
+### Edit
+
+`/v1/images/edits` — **gpt-image models only** (Gemini image editing is a separate, non-OpenAI-shaped surface not covered by this subcommand):
+
+```bash
+monocle image edit mockup.png "add a second monitor on the desk" --model gpt-image-1 -o mockup-edited.png
+```
+
+With a mask (same image format as `image`: png/jpg/webp):
+
+```bash
+monocle image edit mockup.png "replace the sky" --model gpt-image-1 --mask sky-mask.png -o mockup-edited.png
+```
+
 ## ⬆️ Upgrading
 
 Update to the latest GitHub Release in place — same prebuilt binary as the
@@ -394,8 +507,8 @@ persists across sessions in `~/.monocle/agent_history`.
 In the interactive REPL, lines starting with `/` are local management commands (handled
 without calling the model, printed to stderr): `/help` lists them, `/config` shows the
 session config (model, max-steps, workdir, session), `/status` adds your login status,
-`/diag` shows diagnostics (served model, endpoint, latency, tokens, and step count) for
-the last turn, `/model` shows the current model (or `/model <id>` switches it for later
+`/diag` shows diagnostics (served model, endpoint, time to first byte, total latency,
+tokens, and step count) for the last turn, `/model` shows the current model (or `/model <id>` switches it for later
 turns), and `/exit` (or `/quit`, Ctrl-D) quits. `/model <TAB>` fuzzy-completes against the
 model ids available to your account (fetched once at startup) — e.g. `/model cla<TAB>`
 narrows to matching ids, and a bare `/model <TAB>` lists them all; if you're not logged in

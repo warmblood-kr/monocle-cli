@@ -5,6 +5,8 @@ pub mod audio_transcribe;
 pub mod audio_transcribe_azure;
 pub mod chat;
 pub mod claude;
+pub mod image_edit;
+pub mod image_generate;
 pub mod login;
 pub mod model_list;
 pub mod repl;

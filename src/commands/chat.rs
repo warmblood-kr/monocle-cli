@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Write};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -12,9 +13,10 @@ use crate::attachment;
 use crate::auth::{get_access_token, jarvice_url_for, try_access_token, AuthSession};
 use crate::commands::model_list::{fetch_model_ids, handle_model_command};
 use crate::commands::repl::{
-    handle_diag_command, mode_banner, run_repl, LoopControl, ModelReplHelper, TurnDiagnostics,
-    PROMPT,
+    format_diag, handle_diag_command, mode_banner, run_repl, LoopControl, ModelReplHelper,
+    TurnDiagnostics, PROMPT,
 };
+use crate::config::{Config, ConfigData};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
@@ -35,6 +37,13 @@ pub struct ChatOptions {
     pub responses: bool,
     /// `--resume <ID>`: continue an existing `--responses` thread.
     pub resume: Option<String>,
+    /// `--tool-ids <id,...>`: with `--responses`, MCP/connected-app server
+    /// ids to activate for this turn (jarvice's `ResponseRequest.tools`).
+    pub tool_ids: Vec<String>,
+    /// `--verify-tool-firing[=<tool>]`: with `--responses`, assert from the
+    /// server's `tools_used` that a tool actually ran, as an exit code.
+    /// `None` = flag absent. One-shot only.
+    pub verify_tool_firing: Option<ToolFiringExpectation>,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -53,13 +62,19 @@ fn resolve_max_tokens(flag: Option<&str>) -> Option<i64> {
 /// the full request the caller has already assembled (system prompt + any prior
 /// turns + this turn) — this fn only executes the network call and returns the
 /// assembled response so the caller can append it to its own running history.
+///
+/// Also returns the time-to-first-byte (`/diag`'s "Time to first byte" line):
+/// the elapsed time from just before the network call to the FIRST streamed
+/// delta, captured once via the `on_delta` closure this fn already hands to
+/// `chat_stream` — no new streaming plumbing needed. `None` only if the stream
+/// produced zero deltas (e.g. an empty response).
 fn call_chat(
     provider: &MonocleProvider,
     model: &str,
     messages: Vec<Message>,
     max_tokens: Option<i64>,
     images: &[ImageAttachment],
-) -> Result<ChatResponse> {
+) -> Result<(ChatResponse, Option<Duration>)> {
     let req = ChatRequest {
         model: model.to_string(),
         messages,
@@ -71,7 +86,12 @@ fn call_chat(
     // the closure writes+flushes to this single handle (per-delta flush keeps the
     // output live).
     let mut out = std::io::stdout().lock();
+    let started = std::time::Instant::now();
+    let mut ttfb: Option<Duration> = None;
     let resp = provider.chat_stream(&req, &mut |delta| {
+        if ttfb.is_none() {
+            ttfb = Some(started.elapsed());
+        }
         let _ = out.write_all(delta.as_bytes());
         let _ = out.flush();
     })?;
@@ -80,7 +100,7 @@ fn call_chat(
     if resp.truncated {
         eprintln!("\n⚠ the response was cut short (partial output shown).");
     }
-    Ok(resp)
+    Ok((resp, ttfb))
 }
 
 /// Read piped stdin (if not a TTY) and resolve `--file` + inband `file:<path>`
@@ -185,6 +205,8 @@ fn chat_help_text() -> String {
         ),
         "/diag shows diagnostics for the last turn (only what the backend reports is shown)."
             .to_string(),
+        "/diag on / /diag off toggles always showing diagnostics after every response (saved to ~/.monocle/config.json)."
+            .to_string(),
         "/help shows this message again.".to_string(),
     ]
     .join("\n")
@@ -201,6 +223,38 @@ fn handle_help_command(trimmed: &str) -> bool {
     true
 }
 
+/// Handle `/diag on` / `/diag off`, or fall through to the shared bare-`/diag`
+/// handler (last-turn display). Persists the preference via `cfg` (best-effort
+/// — a write failure only warns, since the in-session toggle still takes
+/// effect either way) and flips `*always_on` for the rest of this REPL
+/// session. `cfg` is a parameter (not `Config::new()` inline) so tests can
+/// inject a `Config::with_home` pointed at a tempdir instead of writing to
+/// the real `~/.monocle/config.json`.
+fn handle_diag_toggle(
+    trimmed: &str,
+    diagnostics: &Option<TurnDiagnostics>,
+    always_on: &mut bool,
+    cfg: &Config,
+) -> bool {
+    match trimmed {
+        "/diag on" | "/diag off" => {
+            let value = trimmed == "/diag on";
+            *always_on = value;
+            if let Err(e) = cfg.write(&ConfigData {
+                diag_always_on: value,
+            }) {
+                eprintln!("Warning: failed to save diagnostics preference: {e}");
+            }
+            eprintln!(
+                "Diagnostics always-on is now {} (saved to ~/.monocle/config.json).",
+                if value { "ON" } else { "OFF" }
+            );
+            true
+        }
+        _ => handle_diag_command(trimmed, diagnostics),
+    }
+}
+
 /// Dispatch a slash-command line to whichever handler recognizes it (shared
 /// by both REPL loops, so the two don't drift out of sync). Returns
 /// `Some(control)` when `trimmed` was consumed as a recognized command — the
@@ -210,6 +264,8 @@ fn dispatch_chat_command(
     trimmed: &str,
     model: &mut String,
     diagnostics: &Option<TurnDiagnostics>,
+    diag_always_on: &mut bool,
+    cfg: &Config,
 ) -> Option<LoopControl> {
     if trimmed == "/quit" || trimmed == "/exit" {
         eprintln!("Bye.");
@@ -220,7 +276,7 @@ fn dispatch_chat_command(
     if handle_model_command(trimmed, model) {
         return Some(LoopControl::Continue);
     }
-    if handle_diag_command(trimmed, diagnostics) {
+    if handle_diag_toggle(trimmed, diagnostics, diag_always_on, cfg) {
         return Some(LoopControl::Continue);
     }
     if handle_help_command(trimmed) {
@@ -230,6 +286,10 @@ fn dispatch_chat_command(
 }
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    if options.verify_tool_firing.is_some() && !options.responses {
+        eprintln!("--verify-tool-firing requires --responses (server-executed tools are only observable there)");
+        std::process::exit(1);
+    }
     if options.responses {
         run_responses_chat(client, creds, options)
     } else {
@@ -337,7 +397,8 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             messages.push(Message::system(sp));
         }
         messages.push(Message::user(&text));
-        let resp = call_chat(&provider, &model, messages, max_tokens, &images)?;
+        // One-shot mode has no `/diag` to show — TTFB is discarded here.
+        let (resp, _ttfb) = call_chat(&provider, &model, messages, max_tokens, &images)?;
         if let Some(msg) = dropped_tool_calls_message(&resp.tool_calls, 0, "monocle chat") {
             eprintln!("{msg}");
         }
@@ -385,9 +446,18 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     // Last turn's diagnostics, shown on demand by `/diag` — `None` until the
     // first successful turn.
     let mut diagnostics: Option<TurnDiagnostics> = None;
+    // Persisted via `/diag on`/`/diag off` (see `handle_diag_toggle`) —
+    // loaded once here so a prior session's preference survives a restart.
+    let cfg = Config::new();
+    let mut diag_always_on = cfg.read().diag_always_on;
+    if diag_always_on {
+        eprintln!("Diagnostics always-on (usage shown after every response).");
+    }
 
     run_repl(helper, history_path, PROMPT, |trimmed| {
-        if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
+        if let Some(control) =
+            dispatch_chat_command(trimmed, &mut model, &diagnostics, &mut diag_always_on, &cfg)
+        {
             return Ok(control);
         }
 
@@ -439,14 +509,17 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         let mark = convo.len();
         convo.push(Message::user(text));
         // Wrapped tightly around the network call itself (not REPL input-wait
-        // time) — this is what `/diag`'s `Latency:` line reports.
+        // time) — this is what `/diag`'s `Latency (total):` line reports.
+        // `call_chat`'s own `Duration` return is `/diag`'s `Time to first byte:`
+        // line — captured inside `call_chat` at its first streamed delta.
         let started = std::time::Instant::now();
         match call_chat(&provider, &model, convo.clone(), max_tokens, &images) {
-            Ok(resp) => {
+            Ok((resp, ttfb)) => {
                 diagnostics = Some(TurnDiagnostics::for_chat(
                     model.clone(),
                     resp.model.clone(),
                     format!("{turn_router_url}{}", endpoints::CHAT_COMPLETIONS),
+                    ttfb.map(|d| d.as_millis()),
                     started.elapsed().as_millis(),
                     resp.usage.clone(),
                 ));
@@ -457,6 +530,12 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
                 let mut out = std::io::stdout();
                 out.write_all(b"\n\n")?;
                 out.flush()?;
+                // `/diag on` mode: print this turn's diagnostics (never the
+                // response body, which already went to stdout above) without
+                // requiring the user to type `/diag`.
+                if diag_always_on {
+                    eprintln!("{}", format_diag(diagnostics.as_ref().unwrap()));
+                }
             }
             Err(e) => {
                 convo.truncate(mark);
@@ -538,6 +617,156 @@ fn dropped_tool_calls_message(
     ))
 }
 
+/// `--verify-tool-firing`: turn the dropped-tool-calls warning into a
+/// scriptable pass/fail, so a verification script can check `$?` instead of
+/// grepping stderr. Pure — no I/O, no `process::exit` — so it is directly
+/// unit-testable; the call site does the `eprintln!` and the exit, same
+/// convention as `dropped_tool_calls_message`.
+///
+/// The three outcomes it must keep apart. It used to have two, and the wrong
+/// two: it passed whenever `message.tool_calls` came back empty, which is
+/// equally true of "the tool ran fine" and "no tool was ever attempted". A
+/// control that cannot fail in the direction it claims to check is not a
+/// control — it converts "I checked nothing" into a green tick.
+///
+/// `CannotVerify` is the third, and it is not a hedge: while jarvice omitted
+/// `tools_used` when empty, "nothing ran" and "this server is too old to say"
+/// were the same bytes on the wire. jarvice#1449 made live responses always
+/// state it, so absence now means exactly one thing — an old deployment —
+/// which is a different answer from failure and gets a different exit code.
+#[derive(Debug)]
+pub enum ToolFiringVerdict {
+    Passed(String),
+    Failed(String),
+    CannotVerify(String),
+}
+
+impl ToolFiringVerdict {
+    /// The stderr line for this verdict.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Passed(m) | Self::Failed(m) | Self::CannotVerify(m) => m,
+        }
+    }
+
+    /// 0 = a tool ran · 1 = it did not · 2 = the server could not say.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Passed(_) => 0,
+            Self::Failed(_) => 1,
+            Self::CannotVerify(_) => 2,
+        }
+    }
+}
+
+/// Assert from POSITIVE evidence that a server-side tool actually ran, rather
+/// than from the absence of a leak. Replaces `tool_firing_verification_result`
+/// (monocle-cli#118).
+///
+/// The old negative check is kept as its own failure mode, not replaced: an
+/// unresolved `tool_calls` leak is a real defect whether or not other tools
+/// ran, so it is checked first and still fails.
+/// What `--verify-tool-firing` was asked to assert.
+///
+/// `Any` is the bare flag: "at least one server-side tool ran". That is the
+/// weaker question, and deliberately so — it answers "do server-side tools
+/// work at all", which is what you want right after a deploy.
+///
+/// `Named` is the stronger one, and the reason the value exists: with `Any`, a
+/// run that fired `query_chat_history` when you were checking `web_search`
+/// still goes green. That is the same shape as the defect this flag was
+/// rewritten to remove, one size smaller — the check cannot fail in the
+/// direction you actually care about. `pytest.raises` takes an exception type
+/// for the same reason.
+#[derive(Debug, Clone)]
+pub enum ToolFiringExpectation {
+    Any,
+    Named(String),
+}
+
+fn unparsed_note(unparsed_tools_used: usize) -> String {
+    // Passing QUIETLY on entries we could not read would be a miniature of the
+    // defect this change removes.
+    format!(
+        " (⚠ {unparsed_tools_used} `tools_used` entry/entries in an unrecognized shape — their names are unknown)"
+    )
+}
+
+fn tool_firing_verification(
+    expected: &ToolFiringExpectation,
+    tools_used: &[String],
+    unparsed_tools_used: usize,
+    tools_used_present: bool,
+    dropped_message: Option<&str>,
+) -> ToolFiringVerdict {
+    if let Some(msg) = dropped_message {
+        return ToolFiringVerdict::Failed(format!("✗ tool-firing verification FAILED: {msg}"));
+    }
+
+    if !tools_used_present {
+        return ToolFiringVerdict::CannotVerify(
+            "? tool-firing verification: CANNOT VERIFY — this jarvice did not report `tools_used`, so it predates the field (jarvice#1441). Absence is not evidence that no tool ran; deploy the server side first, then re-run."
+                .to_string(),
+        );
+    }
+
+    match expected {
+        ToolFiringExpectation::Any => {
+            // An entry we could not read is still evidence that SOME tool ran —
+            // counting it is the whole reason `parse_tools_used` keeps it.
+            if tools_used.len() + unparsed_tools_used == 0 {
+                return ToolFiringVerdict::Failed(
+                    "✗ tool-firing verification FAILED: the server reports that no tool ran (`tools_used` is empty)"
+                        .to_string(),
+                );
+            }
+            let mut message = if tools_used.is_empty() {
+                "✓ tool-firing verification: passed".to_string()
+            } else {
+                format!(
+                    "✓ tool-firing verification: passed — {} ran",
+                    tools_used.join(", ")
+                )
+            };
+            if unparsed_tools_used > 0 {
+                message.push_str(&unparsed_note(unparsed_tools_used));
+            }
+            ToolFiringVerdict::Passed(message)
+        }
+
+        ToolFiringExpectation::Named(want) => {
+            if tools_used.iter().any(|t| t == want) {
+                let mut message = format!("✓ tool-firing verification: passed — {want} ran");
+                if unparsed_tools_used > 0 {
+                    message.push_str(&unparsed_note(unparsed_tools_used));
+                }
+                return ToolFiringVerdict::Passed(message);
+            }
+
+            // Entries exist but we could not read their names, so whether
+            // `want` ran is genuinely UNKNOWN. Reporting Failed here would
+            // assert "it did not run", which is not something we know — the
+            // same kind of claim-without-evidence this flag exists to stop.
+            if unparsed_tools_used > 0 {
+                return ToolFiringVerdict::CannotVerify(format!(
+                    "? tool-firing verification: CANNOT VERIFY — expected `{want}`, but {unparsed_tools_used} `tools_used` entry/entries came back in an unrecognized shape, so their names are unknown"
+                ));
+            }
+
+            if tools_used.is_empty() {
+                return ToolFiringVerdict::Failed(format!(
+                    "✗ tool-firing verification FAILED: expected `{want}`, but the server reports that no tool ran (`tools_used` is empty)"
+                ));
+            }
+
+            ToolFiringVerdict::Failed(format!(
+                "✗ tool-firing verification FAILED: expected `{want}`, but these ran instead: {}",
+                tools_used.join(", ")
+            ))
+        }
+    }
+}
+
 /// `--responses`: jarvice's `/api/responses` (see `responses_api` module
 /// docs). The server owns the conversation thread — this REPL only tracks
 /// the `thread_id` to pass on the next turn, never a local message history.
@@ -566,6 +795,12 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         );
         std::process::exit(1);
     }
+    if options.verify_tool_firing.is_some() && stdin_is_tty {
+        eprintln!(
+            "--verify-tool-firing requires piped input. Pipe a tool-triggering prompt, e.g.:\n  echo \"search the web for today's date\" | monocle chat --responses --verify-tool-firing"
+        );
+        std::process::exit(1);
+    }
 
     // Auth FIRST, same rationale as the completions path — an expired/missing
     // login must surface before any local-input error masks it.
@@ -577,17 +812,41 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
-        let reply = rc.respond(&model, &text, &images, options.resume.as_deref())?;
-        if let Some(msg) = dropped_tool_calls_message(
+        let reply = rc.respond(
+            &model,
+            &text,
+            &images,
+            options.resume.as_deref(),
+            &options.tool_ids,
+        )?;
+        let dropped_msg = dropped_tool_calls_message(
             &reply.tool_calls,
             reply.unparsed_tool_calls,
             "--responses mode",
-        ) {
-            eprintln!("{msg}");
-        }
+        );
+        // The answer goes out FIRST, whatever the verdict (monocle-cli#118):
+        // the previous order exited before printing it, so a failing check
+        // swallowed the one thing you need in order to see why it failed.
+        // stdout stays the answer channel, stderr the verdict channel.
         println!("{}", reply.content);
         if let Some(id) = reply.thread_id {
             eprintln!("Thread: {id}");
+        }
+        if let Some(expected) = &options.verify_tool_firing {
+            let verdict = tool_firing_verification(
+                expected,
+                &reply.tools_used,
+                reply.unparsed_tools_used,
+                reply.tools_used_present,
+                dropped_msg.as_deref(),
+            );
+            eprintln!("{}", verdict.message());
+            let code = verdict.exit_code();
+            if code != 0 {
+                std::process::exit(code);
+            }
+        } else if let Some(msg) = dropped_msg {
+            eprintln!("{msg}");
         }
         return Ok(());
     }
@@ -615,6 +874,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     // learns a served model or token usage (see `TurnDiagnostics` docs), so
     // those fields stay `None` for the life of the session.
     let mut diagnostics: Option<TurnDiagnostics> = None;
+    // Persisted via `/diag on`/`/diag off` (see `handle_diag_toggle`) —
+    // loaded once here so a prior session's preference survives a restart.
+    let cfg = Config::new();
+    let mut diag_always_on = cfg.read().diag_always_on;
+    if diag_always_on {
+        eprintln!("Diagnostics always-on (usage shown after every response, when the backend reports it).");
+    }
 
     // Replay prior history for an existing thread, REPL-only (never in the
     // one-shot path above, never on stdout — this repo treats stdout as
@@ -649,7 +915,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     eprintln!("{}", mode_banner("chat", crate::colors::cyan));
 
     run_repl(helper, history_path, PROMPT, |trimmed| {
-        if let Some(control) = dispatch_chat_command(trimmed, &mut model, &diagnostics) {
+        if let Some(control) =
+            dispatch_chat_command(trimmed, &mut model, &diagnostics, &mut diag_always_on, &cfg)
+        {
             return Ok(control);
         }
 
@@ -680,14 +948,26 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         crate::diag::reset();
 
         // Wrapped tightly around the network call itself, same as the
-        // completions path — this is what `/diag`'s `Latency:` line reports.
+        // completions path — this is what `/diag`'s `Latency (total):` line
+        // reports. This path makes one blocking call (no streamed deltas), so
+        // there's no `Time to first byte:` to capture — see the `for_chat`
+        // call below.
         let started = std::time::Instant::now();
-        match rc.respond(&model, &text, &images, thread_id.as_deref()) {
+        match rc.respond(
+            &model,
+            &text,
+            &images,
+            thread_id.as_deref(),
+            &options.tool_ids,
+        ) {
             Ok(reply) => {
                 diagnostics = Some(TurnDiagnostics::for_chat(
                     model.clone(),
                     None,
                     format!("{jarvice_url}/api/responses"),
+                    // `--responses` makes one blocking call with no
+                    // incremental deltas — structurally no TTFB to report.
+                    None,
                     started.elapsed().as_millis(),
                     None,
                 ));
@@ -709,6 +989,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                     }
                 }
                 println!();
+                // `/diag on` mode — see the completions path's identical
+                // comment. This path's diagnostics never carry usage (the
+                // backend doesn't report it here), but `format_diag` already
+                // omits absent fields rather than printing "None".
+                if diag_always_on {
+                    eprintln!("{}", format_diag(diagnostics.as_ref().unwrap()));
+                }
             }
             Err(e) => {
                 // A failed turn must not leave stale diagnostics from an
@@ -784,10 +1071,12 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
 mod tests {
     use super::{
         chat_help_text, dispatch_chat_command, dropped_tool_calls_message, handle_help_command,
-        resolve_max_tokens, resolve_repl_attachments, TurnDiagnostics,
+        resolve_max_tokens, resolve_repl_attachments, tool_firing_verification,
+        ToolFiringExpectation, ToolFiringVerdict, TurnDiagnostics,
     };
     use crate::agent::providers::{FunctionCall, ToolCall};
     use crate::commands::repl::LoopControl;
+    use crate::config::Config;
 
     fn tool_call(name: &str) -> ToolCall {
         ToolCall {
@@ -798,6 +1087,172 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    // ---- monocle-cli#118: POSITIVE tool-firing verification ----
+    //
+    // The old check passed whenever `message.tool_calls` came back empty, so
+    // "the tool ran fine" and "no tool was ever attempted" both went green.
+    // A control that cannot fail in the direction it claims to check is not a
+    // control. These pin the three outcomes it must now distinguish.
+
+    #[test]
+    fn verification_passes_when_a_tool_ran_and_names_it() {
+        let v =
+            tool_firing_verification(&NONE_EXPECTED, &["web_search".to_string()], 0, true, None);
+        assert!(matches!(v, ToolFiringVerdict::Passed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 0);
+        assert!(v.message().contains("web_search"), "got {}", v.message());
+    }
+
+    #[test]
+    fn verification_fails_when_the_server_says_nothing_ran() {
+        // `[]` is authoritative: the server knows, and says nothing ran.
+        let v = tool_firing_verification(&NONE_EXPECTED, &[], 0, true, None);
+        assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 1);
+    }
+
+    #[test]
+    fn verification_cannot_verify_when_the_field_is_absent() {
+        // Absent means the deployment predates tools_used, NOT that no tool
+        // ran. Calling that a pass would reproduce the defect being fixed;
+        // calling it a failure would cry wolf through every rollout.
+        let v = tool_firing_verification(&NONE_EXPECTED, &[], 0, false, None);
+        assert!(matches!(v, ToolFiringVerdict::CannotVerify(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 2);
+    }
+
+    #[test]
+    fn verification_passes_on_unreadable_entries_but_says_so_out_loud() {
+        // Entries we can't read still prove a tool ran, so this passes — but
+        // passing QUIETLY would be a miniature of the same defect.
+        let v = tool_firing_verification(&NONE_EXPECTED, &[], 2, true, None);
+        assert!(matches!(v, ToolFiringVerdict::Passed(_)), "got {v:?}");
+        assert!(
+            v.message().contains('2'),
+            "the unparsed count must surface, got: {}",
+            v.message()
+        );
+    }
+
+    #[test]
+    fn verification_still_fails_when_unresolved_tool_calls_leaked() {
+        // The original negative check is KEPT as a distinct failure mode —
+        // the positive check is added alongside it, not in place of it.
+        let v = tool_firing_verification(
+            &NONE_EXPECTED,
+            &["web_search".to_string()],
+            0,
+            true,
+            Some("\u{26a0} model requested tool call(s)"),
+        );
+        assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 1);
+    }
+
+    // ---- monocle-cli#118 후속: 기대 툴 지정 (--verify-tool-firing=<tool>) ----
+    //
+    // 값 없는 형태는 "아무 툴이나 하나 돌았으면 통과"다. 그건 web_search 를
+    // 기대했는데 엉뚱한 툴이 돌아도 초록불이라는 뜻이고, 방금 고친 결함의
+    // 축소판이다. pytest.raises 가 예외 타입을 받는 것과 같은 이유로 기대
+    // 대상을 지정할 수 있어야 한다.
+
+    const NONE_EXPECTED: ToolFiringExpectation = ToolFiringExpectation::Any;
+
+    fn expect(name: &str) -> ToolFiringExpectation {
+        ToolFiringExpectation::Named(name.to_string())
+    }
+
+    #[test]
+    fn named_expectation_passes_when_that_tool_ran() {
+        let v = tool_firing_verification(
+            &expect("web_search"),
+            &["web_search".to_string()],
+            0,
+            true,
+            None,
+        );
+        assert!(matches!(v, ToolFiringVerdict::Passed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 0);
+        assert!(v.message().contains("web_search"));
+    }
+
+    #[test]
+    fn named_expectation_fails_when_a_different_tool_ran() {
+        // 이것이 이 변경의 이유다. 값 없는 형태였다면 통과였을 상황.
+        let v = tool_firing_verification(
+            &expect("web_search"),
+            &["query_chat_history".to_string()],
+            0,
+            true,
+            None,
+        );
+        assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 1);
+        assert!(
+            v.message().contains("query_chat_history"),
+            "무엇이 대신 돌았는지 말해야 한다: {}",
+            v.message()
+        );
+    }
+
+    #[test]
+    fn bare_flag_still_passes_on_any_tool() {
+        // 값이 선택적이므로 기존 사용법이 그대로 살아야 한다 (무회귀 가드).
+        let v = tool_firing_verification(
+            &NONE_EXPECTED,
+            &["query_chat_history".to_string()],
+            0,
+            true,
+            None,
+        );
+        assert!(matches!(v, ToolFiringVerdict::Passed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 0);
+    }
+
+    #[test]
+    fn named_expectation_with_absent_field_is_cannot_verify_not_mismatch() {
+        // 세 번째 종료 상태를 잃으면 안 된다. 서버가 필드를 안 주면
+        // "기대와 다름(1)"이 아니라 "판정 불가(2)"다 — 아니면 monocle-cli#118
+        // 에서 고친 것이 되살아난다.
+        let v = tool_firing_verification(&expect("web_search"), &[], 0, false, None);
+        assert!(matches!(v, ToolFiringVerdict::CannotVerify(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 2);
+    }
+
+    #[test]
+    fn named_expectation_fails_when_nothing_ran_at_all() {
+        let v = tool_firing_verification(&expect("web_search"), &[], 0, true, None);
+        assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 1);
+    }
+
+    #[test]
+    fn named_expectation_cannot_verify_when_names_were_unreadable() {
+        // 엔트리는 있으나 이름을 못 읽었다 = 그 툴이 돌았는지 **모른다**.
+        // Failed 로 내면 "안 돌았다"를 주장하는 것인데 그건 아는 바가 아니다.
+        let v = tool_firing_verification(&expect("web_search"), &[], 2, true, None);
+        assert!(matches!(v, ToolFiringVerdict::CannotVerify(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 2);
+        assert!(
+            v.message().contains('2'),
+            "개수를 드러내야 한다: {}",
+            v.message()
+        );
+    }
+
+    #[test]
+    fn unresolved_leak_still_fails_regardless_of_expectation() {
+        let v = tool_firing_verification(
+            &expect("web_search"),
+            &["web_search".to_string()],
+            0,
+            true,
+            Some("\u{26a0} leaked"),
+        );
+        assert!(matches!(v, ToolFiringVerdict::Failed(_)), "got {v:?}");
+        assert_eq!(v.exit_code(), 1);
     }
 
     #[test]
@@ -843,16 +1298,27 @@ mod tests {
     // `handle_diag_command` already have their own coverage; this just
     // confirms the shared entry point recognizes `/quit`/`/exit` and passes
     // through anything else as ordinary chat input.
+    /// A `Config` rooted at a fresh tempdir — every `dispatch_chat_command`
+    /// test uses this instead of `Config::new()` so no test ever touches the
+    /// real `~/.monocle/config.json`.
+    fn test_config() -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::with_home(dir.path());
+        (dir, cfg)
+    }
+
     #[test]
     fn dispatch_chat_command_quit_and_exit_stop_the_repl() {
         let mut model = "monocle-auto".to_string();
         let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
         assert!(matches!(
-            dispatch_chat_command("/quit", &mut model, &diagnostics),
+            dispatch_chat_command("/quit", &mut model, &diagnostics, &mut always_on, &cfg),
             Some(LoopControl::Quit)
         ));
         assert!(matches!(
-            dispatch_chat_command("/exit", &mut model, &diagnostics),
+            dispatch_chat_command("/exit", &mut model, &diagnostics, &mut always_on, &cfg),
             Some(LoopControl::Quit)
         ));
     }
@@ -861,17 +1327,66 @@ mod tests {
     fn dispatch_chat_command_unrecognized_line_is_chat_input() {
         let mut model = "monocle-auto".to_string();
         let diagnostics: Option<TurnDiagnostics> = None;
-        assert!(dispatch_chat_command("hello there", &mut model, &diagnostics).is_none());
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
+        assert!(dispatch_chat_command(
+            "hello there",
+            &mut model,
+            &diagnostics,
+            &mut always_on,
+            &cfg
+        )
+        .is_none());
     }
 
     #[test]
     fn dispatch_chat_command_recognizes_help() {
         let mut model = "monocle-auto".to_string();
         let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
         assert!(matches!(
-            dispatch_chat_command("/help", &mut model, &diagnostics),
+            dispatch_chat_command("/help", &mut model, &diagnostics, &mut always_on, &cfg),
             Some(LoopControl::Continue)
         ));
+    }
+
+    #[test]
+    fn dispatch_chat_command_diag_on_off_flips_flag_and_persists() {
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
+
+        assert!(matches!(
+            dispatch_chat_command("/diag on", &mut model, &diagnostics, &mut always_on, &cfg),
+            Some(LoopControl::Continue)
+        ));
+        assert!(always_on);
+        assert!(cfg.read().diag_always_on);
+
+        assert!(matches!(
+            dispatch_chat_command("/diag off", &mut model, &diagnostics, &mut always_on, &cfg),
+            Some(LoopControl::Continue)
+        ));
+        assert!(!always_on);
+        assert!(!cfg.read().diag_always_on);
+    }
+
+    #[test]
+    fn dispatch_chat_command_bare_diag_still_shows_last_turn() {
+        // `/diag` (no argument) must still fall through to the shared
+        // last-turn display, not be swallowed by the on/off branch.
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
+        assert!(matches!(
+            dispatch_chat_command("/diag", &mut model, &diagnostics, &mut always_on, &cfg),
+            Some(LoopControl::Continue)
+        ));
+        // Unaffected by a bare `/diag`.
+        assert!(!always_on);
     }
 
     #[test]
