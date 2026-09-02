@@ -293,11 +293,19 @@ Notes:
 - **`--tool-ids <id,...>`** — MCP/connected-app server ids to activate for
   this turn (comma-separated). Without it, a turn only gets whatever tools
   are in the model's own static config — there's no other way to pick which
-  MCP servers are on for a given call:
+  MCP servers are on for a given call. Values are sent to jarvice exactly as
+  given — CLI does no prefixing — and jarvice only activates entries that
+  start with `mcp:`; a bare server id (e.g. `ms365` instead of `mcp:ms365`) is
+  not an error, it's **silently dropped**, so zero tools get activated and
+  `--verify-tool-firing` reports exit 1 — indistinguishable from the tool not
+  being wired up at all unless you already know to check the prefix. Use
+  `mcp:{server}` to activate a whole server (confirmed working live below); a
+  tool-level form, `mcp:{server}__{tool}`, is also supported in jarvice's code
+  but has not been exercised live as of this writing:
 
   ```bash
   echo "오늘 받은 메일 있나요?" \
-    | monocle chat --responses --tool-ids ms365-a1b2c3d4-... --verify-tool-firing
+    | monocle chat --responses --tool-ids mcp:ms365 --verify-tool-firing
   ```
 - **`--verify-tool-firing[=<tool>]`** — one-shot only; asserts that a
   server-executed tool **actually ran**, as a scriptable exit code. Useful
