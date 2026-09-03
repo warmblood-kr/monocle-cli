@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use crate::agent::providers::{ensure_tool_call_ids, ImageAttachment, ToolCall};
 use crate::error::{AppError, Result};
 use crate::net::Client;
-use crate::origin::auth_headers;
+use crate::origin::responses_headers;
 
 /// One turn's reply, plus the thread id to pass as `--resume`/the next turn's
 /// `thread_id` to keep the conversation going. jarvice always resolves (and
@@ -173,7 +173,7 @@ impl<'a> ResponsesClient<'a> {
         let bearer = format!("Bearer {}", self.token);
         let resp = self.client.post_json(
             &format!("{}/api/responses", self.jarvice_url),
-            &auth_headers(&bearer),
+            &responses_headers(&bearer),
             &body,
         )?;
         if !resp.ok() {
