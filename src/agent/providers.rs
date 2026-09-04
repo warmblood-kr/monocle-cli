@@ -320,7 +320,10 @@ fn assemble_sse_stream(
             Err(_) => continue,
         };
         if model.is_none() {
-            model = v["model"].as_str().map(String::from);
+            model = v["model"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(String::from);
         }
         if usage.is_none() {
             usage = parse_usage(&v);
@@ -599,6 +602,24 @@ mod tests {
         assert!(!resp.truncated);
         assert!(resp.tool_calls.is_empty());
         assert_eq!(deltas, vec!["Hello".to_string(), " world".to_string()]);
+    }
+
+    #[test]
+    fn empty_model_in_first_chunk_does_not_lock_out_later_real_model() {
+        let (resp, _deltas) = run_stream(vec![
+            Ok(Some(
+                "data: {\"model\":\"\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}"
+                    .to_string(),
+            )),
+            Ok(Some(
+                "data: {\"model\":\"some-real-model\",\"choices\":[{\"delta\":{\"content\":\"!\"}}]}"
+                    .to_string(),
+            )),
+            Ok(Some("data: [DONE]".to_string())),
+            Ok(None),
+        ]);
+        let resp = resp.expect("normal completion should succeed");
+        assert_eq!(resp.model.as_deref(), Some("some-real-model"));
     }
 
     #[test]
