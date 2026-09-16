@@ -34,7 +34,7 @@ pub const PROMPT: &str = "\u{276F} "; // ❯ — the modern CLI prompt glyph (St
 /// — shared so `monocle chat`'s and `monocle agent`'s banners (and any future
 /// REPL mode's) can't drift on the glyph or format the way the prompt caret
 /// itself briefly did before `PROMPT` was unified. Callers still choose their
-/// own color (agent: orange, "the active/acting mode" per DESIGN.md; chat:
+/// own color (agent: orange, the brand accent; chat:
 /// cyan, informational) and print it themselves, since some banners (agent's)
 /// append extra context (the workdir) that isn't part of this shared shape.
 pub fn mode_banner(label: &str, colorize: impl Fn(&str) -> String) -> String {
