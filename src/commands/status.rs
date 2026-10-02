@@ -31,12 +31,12 @@ pub fn status_command(store: &Credentials, home: &Path) {
         }
     };
 
-    // A status check should opportunistically keep credentials fresh without
-    // turning a refresh failure into a status-command failure.
-    if ensure_fresh_token(&Client::new(), store).is_ok() {
-        if let Some(refreshed) = store.read() {
-            creds = refreshed;
-        }
+    if let Err(e) = ensure_fresh_token(&Client::new(), store) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    if let Some(refreshed) = store.read() {
+        creds = refreshed;
     }
 
     let now = now_ms();
