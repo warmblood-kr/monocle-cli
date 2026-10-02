@@ -50,9 +50,6 @@ pub fn jarvice_url_for(creds: &CredentialsData) -> String {
     )
 }
 
-/// Non-exiting variant of [`get_access_token`]. Returns an [`AppError`] instead
-/// of printing to stderr and calling `std::process::exit(1)`, so long-lived
-/// callers (e.g. the ACP server) can fail a single request and stay alive.
 /// Return a usable access token, serializing refreshes across processes.
 /// The lock is held from the post-lock read through any refresh and write.
 pub fn ensure_fresh_token(client: &Client, creds: &Credentials) -> Result<AuthSession> {
@@ -84,11 +81,9 @@ pub fn ensure_fresh_token(client: &Client, creds: &Credentials) -> Result<AuthSe
     if expires_at.is_some_and(|exp| now_ms() + EXPIRY_BUFFER_MS >= exp) {
         match refresh_access_token(client, &stored, creds) {
             Ok(refreshed) => active = refreshed,
-            Err(_) => {
-                return Err(AppError::new(
-                        "Token refresh failed. Run `monocle login --tenant <domain>` to re-authenticate.",
-                    ));
-            }
+            // refresh.rs's 400/401 message already says to run `monocle login`;
+            // transient errors (network, 5xx) keep their own text.
+            Err(e) => return Err(AppError::new(format!("Token refresh failed: {e}"))),
         }
     }
 
@@ -107,6 +102,9 @@ fn jwt_exp_ms(token: &str) -> Option<Option<i64>> {
     Some(exp.and_then(|seconds| seconds.checked_mul(1000)))
 }
 
+/// Non-exiting variant of [`get_access_token`]. Returns an [`AppError`] instead
+/// of printing to stderr and calling `std::process::exit(1)`, so long-lived
+/// callers (e.g. the ACP server) can fail a single request and stay alive.
 pub fn try_access_token(client: &Client, creds: &Credentials) -> Result<AuthSession> {
     ensure_fresh_token(client, creds)
 }
