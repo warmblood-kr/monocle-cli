@@ -6,10 +6,10 @@
 use crate::credentials::{Credentials, CredentialsData};
 use crate::error::{AppError, Result};
 use crate::net::Client;
-use crate::refresh::refresh_access_token;
+use crate::refresh::{decode_id_token_payload, refresh_access_token};
 use crate::util::{now_ms, parse_iso_ms};
 
-const EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
+const EXPIRY_BUFFER_MS: i64 = 120 * 1000;
 
 pub struct AuthSession {
     pub token: String,
@@ -50,10 +50,18 @@ pub fn jarvice_url_for(creds: &CredentialsData) -> String {
     )
 }
 
-/// Non-exiting variant of [`get_access_token`]. Returns an [`AppError`] instead
-/// of printing to stderr and calling `std::process::exit(1)`, so long-lived
-/// callers (e.g. the ACP server) can fail a single request and stay alive.
-pub fn try_access_token(client: &Client, creds: &Credentials) -> Result<AuthSession> {
+/// Return a usable access token, serializing refreshes across processes.
+/// The lock is held from the post-lock read through any refresh and write.
+pub fn ensure_fresh_token(client: &Client, creds: &Credentials) -> Result<AuthSession> {
+    let dir = creds.dir();
+    std::fs::create_dir_all(&dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".refresh.lock"))?;
+    lock.lock()?;
+
     let stored = match creds.read() {
         Some(c) => c,
         None => {
@@ -63,17 +71,19 @@ pub fn try_access_token(client: &Client, creds: &Credentials) -> Result<AuthSess
         }
     };
 
-    // Refresh only when we can parse the expiry AND it is within the buffer.
-    // (JS compares against NaN as `false`, i.e. unparseable expiry → no refresh.)
     let mut active = stored.clone();
-    if let Some(expires_at) = parse_iso_ms(&stored.access_token_expires_at) {
-        if now_ms() + EXPIRY_BUFFER_MS > expires_at {
-            match refresh_access_token(client, &stored, creds) {
-                Ok(refreshed) => active = refreshed,
-                Err(e) => {
-                    return Err(AppError::new(format!("Token refresh failed: {e}")));
-                }
-            }
+    let jwt_exp = jwt_exp_ms(&stored.access_token);
+    let expires_at = match jwt_exp {
+        Some(Some(exp)) => Some(exp),
+        Some(None) => None,
+        None => parse_iso_ms(&stored.access_token_expires_at),
+    };
+    if expires_at.is_some_and(|exp| now_ms() + EXPIRY_BUFFER_MS >= exp) {
+        match refresh_access_token(client, &stored, creds) {
+            Ok(refreshed) => active = refreshed,
+            // refresh.rs's 400/401 message already says to run `monocle login`;
+            // transient errors (network, 5xx) keep their own text.
+            Err(e) => return Err(AppError::new(format!("Token refresh failed: {e}"))),
         }
     }
 
@@ -82,6 +92,21 @@ pub fn try_access_token(client: &Client, creds: &Credentials) -> Result<AuthSess
         token: active.access_token,
         router_url,
     })
+}
+
+/// `Some(None)` means a JWT payload was decoded but has no usable `exp`; `None`
+/// means the access token is not a parseable JWT and the ISO field may be used.
+fn jwt_exp_ms(token: &str) -> Option<Option<i64>> {
+    let payload = decode_id_token_payload(token).ok()?;
+    let exp = payload.get("exp").and_then(serde_json::Value::as_i64);
+    Some(exp.and_then(|seconds| seconds.checked_mul(1000)))
+}
+
+/// Non-exiting variant of [`get_access_token`]. Returns an [`AppError`] instead
+/// of printing to stderr and calling `std::process::exit(1)`, so long-lived
+/// callers (e.g. the ACP server) can fail a single request and stay alive.
+pub fn try_access_token(client: &Client, creds: &Credentials) -> Result<AuthSession> {
+    ensure_fresh_token(client, creds)
 }
 
 pub fn get_access_token(client: &Client, creds: &Credentials) -> AuthSession {
