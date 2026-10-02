@@ -2,7 +2,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::auth::ensure_fresh_token;
 use crate::credentials::Credentials;
+use crate::net::Client;
 use crate::util::{now_ms, parse_iso_ms};
 
 fn format_remaining(ms: i64) -> String {
@@ -20,14 +22,22 @@ fn format_remaining(ms: i64) -> String {
     }
 }
 
-pub fn status_command(creds: &Credentials, home: &Path) {
-    let creds = match creds.read() {
+pub fn status_command(store: &Credentials, home: &Path) {
+    let mut creds = match store.read() {
         Some(c) => c,
         None => {
             eprintln!("Not logged in. Run `monocle login --tenant <domain>` first.");
             return;
         }
     };
+
+    // A status check should opportunistically keep credentials fresh without
+    // turning a refresh failure into a status-command failure.
+    if ensure_fresh_token(&Client::new(), store).is_ok() {
+        if let Some(refreshed) = store.read() {
+            creds = refreshed;
+        }
+    }
 
     let now = now_ms();
 

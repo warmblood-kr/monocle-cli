@@ -13,8 +13,8 @@ use monocle_cli::credentials::{Credentials, CredentialsData};
 use monocle_cli::net::Client;
 
 fn jwt(exp: i64) -> String {
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(format!(r#"{{"exp":{exp}}}"#));
+    let payload =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
     format!("header.{payload}.signature")
 }
 
@@ -67,9 +67,7 @@ fn expired_jwt_refreshes_and_persists_credentials() {
     let server = refresh_stub(200, calls.clone());
     let dir = tempfile::tempdir().unwrap();
     let creds = Credentials::with_home(dir.path());
-    creds
-        .write(&initial_creds(&server.addr, jwt(1)))
-        .unwrap();
+    creds.write(&initial_creds(&server.addr, jwt(1))).unwrap();
 
     let session = ensure_fresh_token(&Client::new(), &creds).unwrap();
 
@@ -103,12 +101,17 @@ fn invalid_refresh_errors_without_exposing_token_values() {
         let original = initial_creds(&server.addr, jwt(1));
         creds.write(&original).unwrap();
 
-        let err = ensure_fresh_token(&Client::new(), &creds)
-            .unwrap_err()
-            .to_string();
+        let err = match ensure_fresh_token(&Client::new(), &creds) {
+            Ok(_) => panic!("invalid refresh must fail"),
+            Err(err) => err.to_string(),
+        };
 
         assert!(err.contains("monocle login"), "got: {err}");
-        for secret in [&original.access_token, &original.refresh_token, &original.id_token] {
+        for secret in [
+            &original.access_token,
+            &original.refresh_token,
+            &original.id_token,
+        ] {
             assert!(!err.contains(secret), "error leaked a credential: {err}");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
