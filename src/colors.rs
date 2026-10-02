@@ -44,7 +44,7 @@ pub fn red(s: &str) -> String {
     wrap("31", "39", s)
 }
 
-/// Monocle brand orange (#f97316, DESIGN.md §2 Primary/Orange/500) via
+/// Monocle brand orange (#f97316, `accent` in monocle/DESIGN.md) via
 /// truecolor ANSI. Reserved for the handful of deliberate brand touchpoints —
 /// today, just `monocle agent`'s "▸ agent" mode banner (`monocle chat`'s "▸
 /// chat" banner deliberately stays cyan, see `commands::repl::mode_banner`) —

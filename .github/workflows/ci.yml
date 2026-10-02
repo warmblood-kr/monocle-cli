@@ -29,3 +29,38 @@ jobs:
         run: cargo test
       - name: Build
         run: cargo build --release
+
+  cargo-audit:
+    # Plain `cargo audit` exits 0 on `unmaintained`/`unsound`/`yanked`
+    # advisories — only `--deny warnings` turns those into a failed build.
+    # That gap is not hypothetical here: it is exactly what let
+    # RUSTSEC-2026-0221 (event-listener 5.4.1, unsound) sit in this
+    # lockfile unnoticed. Do not drop the flag to make a red go away.
+    #
+    # A red here can appear with no commit of ours, because RustSec
+    # publishes advisories on its own schedule. That is correct behavior,
+    # not a flake: read the advisory and bump the crate, don't just re-run
+    # the job. If no patched version exists yet (`unmaintained` advisories
+    # often have none), the only moves are replacing the crate, or
+    # `cargo audit --ignore RUSTSEC-XXXX-NNNN` with a comment naming a
+    # dated expiry to revisit — never ignore with no expiry.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2
+        with:
+          tool: cargo-audit
+      - name: Report crate and finding counts
+        run: |
+          cargo audit --json > audit.json
+          crates=$(jq -r '.lockfile."dependency-count"' audit.json)
+          vulns=$(jq -r '.vulnerabilities.count' audit.json)
+          warns=$(jq -r '[.warnings[]? | length] | add // 0' audit.json)
+          {
+            echo "### cargo audit"
+            echo "- crates scanned: $crates"
+            echo "- vulnerabilities: $vulns"
+            echo "- warnings (unmaintained/unsound/yanked/notice): $warns"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Gate on findings
+        run: cargo audit --no-fetch --deny warnings

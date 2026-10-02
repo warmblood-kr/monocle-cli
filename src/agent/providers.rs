@@ -136,6 +136,13 @@ pub struct ChatRequest {
     /// re-embedded into later requests (the assistant's textual reply about
     /// them is what persists in history).
     pub images: Vec<ImageAttachment>,
+    /// Non-image file attachments (e.g. spreadsheets). This plain
+    /// `/v1/chat/completions` path has no upload/ingestion capability for
+    /// these — only jarvice's `/api/responses` path
+    /// (`responses_api::ResponsesClient::respond`) does — so `build_body`
+    /// errors loudly rather than silently dropping or mis-sending them if any
+    /// ever reach here.
+    pub files: Vec<FileAttachment>,
 }
 
 /// One resolved image, ready to drop into an OpenAI `image_url` content part —
@@ -144,6 +151,16 @@ pub struct ChatRequest {
 #[derive(Debug, Clone)]
 pub struct ImageAttachment {
     pub url: String,
+}
+
+/// A resolved non-image local file, ready to be uploaded to jarvice's file
+/// ingestion endpoint (`POST /api/v1/files/`) and attached as an
+/// `input_file` block — see `responses_api::ResponsesClient::respond`.
+#[derive(Debug, Clone)]
+pub struct FileAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
 }
 
 /// The assistant's reply for one turn.
@@ -446,7 +463,17 @@ impl MonocleProvider {
         self.router_url = session.router_url;
     }
 
-    fn build_body(&self, req: &ChatRequest, stream: bool) -> Value {
+    fn build_body(&self, req: &ChatRequest, stream: bool) -> Result<Value> {
+        // Non-image file attachments have no ingestion path here — only
+        // `--responses` (jarvice's `/api/responses`, via
+        // `ResponsesClient::respond`) can upload and attach them. Fail loudly
+        // rather than silently dropping the attachment or looping over it as
+        // if it were an image.
+        if !req.files.is_empty() {
+            return Err(AppError::new(
+                "non-image file attachments require --responses",
+            ));
+        }
         let mut messages = json!(req.messages);
         // Vision requests (monocle-cli file-attach plan): rewrite the last
         // `user` message's `content` from a plain string into the OpenAI
@@ -485,7 +512,7 @@ impl MonocleProvider {
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools);
         }
-        body
+        Ok(body)
     }
 }
 
@@ -495,7 +522,7 @@ impl LlmProvider for MonocleProvider {
         let resp = self.client.post_json(
             &format!("{}{}", self.router_url, endpoints::CHAT_COMPLETIONS),
             &auth_headers(&bearer),
-            &self.build_body(req, false),
+            &self.build_body(req, false)?,
         )?;
         if !resp.ok() {
             return Err(AppError::new(format!(
@@ -517,7 +544,7 @@ impl LlmProvider for MonocleProvider {
         let mut stream = self.client.post_json_stream(
             &format!("{}{}", self.router_url, endpoints::CHAT_COMPLETIONS),
             &auth_headers(&bearer),
-            &self.build_body(req, true),
+            &self.build_body(req, true)?,
         )?;
 
         if !stream.ok() {
@@ -755,7 +782,7 @@ mod tests {
             max_tokens: Some(100),
             ..Default::default()
         };
-        let body = provider.build_body(&req, false);
+        let body = provider.build_body(&req, false).unwrap();
         assert_eq!(body["messages"][0]["content"], json!("be terse"));
         assert_eq!(body["messages"][1]["content"], json!("hello"));
         assert!(body["messages"][1]["content"].is_string());
@@ -773,13 +800,13 @@ mod tests {
             messages: vec![Message::user("hello")],
             ..Default::default()
         };
-        let streaming_body = provider.build_body(&req, true);
+        let streaming_body = provider.build_body(&req, true).unwrap();
         assert_eq!(
             streaming_body["stream_options"],
             json!({"include_usage": true})
         );
 
-        let non_streaming_body = provider.build_body(&req, false);
+        let non_streaming_body = provider.build_body(&req, false).unwrap();
         assert!(non_streaming_body.get("stream_options").is_none());
     }
 
@@ -799,7 +826,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let body = provider.build_body(&req, false);
+        let body = provider.build_body(&req, false).unwrap();
 
         // System message untouched.
         assert_eq!(body["messages"][0]["content"], json!("be terse"));
@@ -832,9 +859,31 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = provider.build_body(&req, false);
+        let body = provider.build_body(&req, false).unwrap();
         let parts = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["type"], json!("image_url"));
+    }
+
+    #[test]
+    fn build_body_with_file_attachments_errors_instead_of_panicking() {
+        // Step 3's guard: a non-image file attachment has no ingestion path
+        // on this plain `/v1/chat/completions` provider — only `--responses`
+        // (`ResponsesClient::respond`) can upload one. This must fail loudly
+        // and clearly, not panic and not silently loop over the file as if it
+        // were an image.
+        let provider = dummy_provider();
+        let req = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message::user("what's in this spreadsheet?")],
+            files: vec![FileAttachment {
+                filename: "data.xlsx".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                data: vec![1, 2, 3],
+            }],
+            ..Default::default()
+        };
+        let err = provider.build_body(&req, false).unwrap_err().to_string();
+        assert_eq!(err, "non-image file attachments require --responses");
     }
 }

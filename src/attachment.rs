@@ -7,8 +7,18 @@ use std::path::Path;
 
 use base64::Engine;
 
-use crate::agent::providers::ImageAttachment;
+use crate::agent::providers::{FileAttachment, ImageAttachment};
 use crate::error::{AppError, Result};
+
+/// A resolved `--file`/inband `file:` attachment: either an image (existing
+/// behavior, unchanged) or a non-image local file to be uploaded through
+/// jarvice's file-ingestion endpoint (`--responses` only — see
+/// `responses_api::ResponsesClient::respond`).
+#[derive(Debug, Clone)]
+pub enum Attachment {
+    Image(ImageAttachment),
+    File(FileAttachment),
+}
 
 /// Sentence punctuation trimmed off the trailing end of a captured `file:`
 /// token before it is treated as a path (e.g. `file:./a.png.` in "...a.png.").
@@ -25,19 +35,24 @@ fn mime_by_ext(ext: &str) -> Option<&'static str> {
 }
 
 /// Resolve a `--file` value or an inband `file:<path>` reference into an
-/// [`ImageAttachment`].
+/// [`Attachment`].
 ///
 /// - `http://` / `https://` → passed through verbatim as a remote
-///   `image_url.url` (no fetch, no base64).
+///   `image_url.url` (no fetch, no base64) — always an [`Attachment::Image`],
+///   unconditionally, exactly as before.
 /// - Anything else is treated as a local path: read the bytes, guess MIME by
-///   extension, and if it's `image/*` encode as a `data:<mime>;base64,...`
-///   URI. A missing file or a non-image MIME is a hard, typed error (matches
-///   the file-not-found style in `audio_io::resolve_audio_input`).
-pub fn resolve(value: &str) -> Result<ImageAttachment> {
+///   extension. `image/*` encodes as a `data:<mime>;base64,...` URI
+///   (`Attachment::Image`, unchanged behavior). Any other extension (including
+///   unrecognized ones, which fall back to `application/octet-stream`) is no
+///   longer a hard-reject — it resolves as `Attachment::File`, the raw bytes
+///   ready for jarvice's file-ingestion upload (`--responses` only). A missing
+///   file is still a hard, typed error (matches the file-not-found style in
+///   `audio_io::resolve_audio_input`).
+pub fn resolve(value: &str) -> Result<Attachment> {
     if value.starts_with("http://") || value.starts_with("https://") {
-        return Ok(ImageAttachment {
+        return Ok(Attachment::Image(ImageAttachment {
             url: value.to_string(),
-        });
+        }));
     }
 
     let path = Path::new(value);
@@ -51,17 +66,25 @@ pub fn resolve(value: &str) -> Result<ImageAttachment> {
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
     let mime = mime_by_ext(&ext).unwrap_or("application/octet-stream");
-    if !mime.starts_with("image/") {
-        return Err(AppError::new(format!(
-            "unsupported type: {mime} (from extension \"{ext}\" of {value})"
-        )));
+    let data = std::fs::read(path)?;
+
+    if mime.starts_with("image/") {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        return Ok(Attachment::Image(ImageAttachment {
+            url: format!("data:{mime};base64,{b64}"),
+        }));
     }
 
-    let data = std::fs::read(path)?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-    Ok(ImageAttachment {
-        url: format!("data:{mime};base64,{b64}"),
-    })
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(value)
+        .to_string();
+    Ok(Attachment::File(FileAttachment {
+        filename,
+        content_type: mime.to_string(),
+        data,
+    }))
 }
 
 /// Scan `text` for inband `file:<path>` tokens (Org-mode-style — NOT a strict
@@ -128,13 +151,23 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Unwrap the `Image` variant, panicking with a clear message otherwise —
+    /// keeps the image-attachment tests below reading the same as before the
+    /// `Attachment` enum existed.
+    fn expect_image(att: Attachment) -> ImageAttachment {
+        match att {
+            Attachment::Image(img) => img,
+            Attachment::File(f) => panic!("expected an image attachment, got a file: {f:?}"),
+        }
+    }
+
     #[test]
     fn resolves_local_png_to_data_uri() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.png");
         std::fs::write(&path, b"not a real png but bytes are enough").unwrap();
 
-        let img = resolve(path.to_str().unwrap()).expect("should resolve");
+        let img = expect_image(resolve(path.to_str().unwrap()).expect("should resolve"));
         let expected_b64 = base64::engine::general_purpose::STANDARD
             .encode(b"not a real png but bytes are enough");
         assert_eq!(img.url, format!("data:image/png;base64,{expected_b64}"));
@@ -142,10 +175,10 @@ mod tests {
 
     #[test]
     fn http_url_passes_through_unencoded() {
-        let img = resolve("https://example.com/a.png").expect("should pass through");
+        let img = expect_image(resolve("https://example.com/a.png").expect("should pass through"));
         assert_eq!(img.url, "https://example.com/a.png");
 
-        let img = resolve("http://example.com/a.png").expect("should pass through");
+        let img = expect_image(resolve("http://example.com/a.png").expect("should pass through"));
         assert_eq!(img.url, "http://example.com/a.png");
     }
 
@@ -159,30 +192,44 @@ mod tests {
     }
 
     #[test]
-    fn non_image_extension_errors_with_typed_message() {
+    fn non_image_extension_resolves_as_a_file_attachment() {
+        // The hard-reject this test used to assert is exactly what this
+        // feature removes: a non-image local file (any extension, including
+        // one absent from `mime_by_ext`) is no longer an error — it resolves
+        // as `Attachment::File`, ready for jarvice's upload path.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notes.heic");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(b"hello").unwrap();
 
-        let err = resolve(path.to_str().unwrap()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.starts_with("unsupported type:"),
-            "unexpected message: {msg}"
-        );
-        // Regression: the rejected extension (and the offending path) must be
-        // named in the error — otherwise the user has no way to diagnose
-        // "what happened with this file/format" (the whole point of the
-        // feature).
-        assert!(
-            msg.contains("heic"),
-            "error should name the rejected extension: {msg}"
-        );
-        assert!(
-            msg.contains(path.to_str().unwrap()),
-            "error should name the offending path: {msg}"
-        );
+        let att = resolve(path.to_str().unwrap()).expect("should resolve as a file attachment");
+        match att {
+            Attachment::File(file) => {
+                assert_eq!(file.filename, "notes.heic");
+                assert_eq!(file.content_type, "application/octet-stream");
+                assert_eq!(file.data, b"hello");
+            }
+            Attachment::Image(img) => panic!("expected a file attachment, got an image: {img:?}"),
+        }
+    }
+
+    #[test]
+    fn recognized_non_image_extension_still_resolves_as_a_file_attachment() {
+        // A recognized but still non-image extension (e.g. a spreadsheet)
+        // also resolves as a file, not an image — `mime_by_ext` only maps
+        // image extensions today.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.csv");
+        std::fs::write(&path, b"a,b\n1,2").unwrap();
+
+        let att = resolve(path.to_str().unwrap()).expect("should resolve");
+        match att {
+            Attachment::File(file) => {
+                assert_eq!(file.filename, "report.csv");
+                assert_eq!(file.data, b"a,b\n1,2");
+            }
+            Attachment::Image(_) => panic!("expected a file attachment"),
+        }
     }
 
     #[test]

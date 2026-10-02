@@ -24,10 +24,10 @@
 
 use serde_json::{json, Value};
 
-use crate::agent::providers::{ensure_tool_call_ids, ImageAttachment, ToolCall};
+use crate::agent::providers::{ensure_tool_call_ids, FileAttachment, ImageAttachment, ToolCall};
 use crate::error::{AppError, Result};
-use crate::net::Client;
-use crate::origin::responses_headers;
+use crate::net::{Client, FilePart};
+use crate::origin::{auth_headers, responses_headers};
 
 /// One turn's reply, plus the thread id to pass as `--resume`/the next turn's
 /// `thread_id` to keep the conversation going. jarvice always resolves (and
@@ -82,11 +82,16 @@ pub struct ResponsesReply {
 
 /// Build the `input` field: a plain string when there's no attachment (the
 /// common case, and the shape jarvice's own docs lead with), or a content-
-/// block list (`input_text` + `input_image`) once at least one image is
-/// attached. An image-only turn (empty `text`) omits the `input_text` block
-/// rather than sending an empty one.
-fn build_input(text: &str, images: &[ImageAttachment]) -> Value {
-    if images.is_empty() {
+/// block list (`input_text` + `input_image` + `input_file`) once at least one
+/// attachment is present. An attachment-only turn (empty `text`) omits the
+/// `input_text` block rather than sending an empty one.
+///
+/// `file_ids` are jarvice file ids already uploaded via `POST
+/// /api/v1/files/` (see `ResponsesClient::respond`) — this fn only builds the
+/// reference block (`{"type": "input_file", "file_id": id}`), matching the
+/// shape jarvice's own web frontend sends and its `InputFile` model expects.
+fn build_input(text: &str, images: &[ImageAttachment], file_ids: &[String]) -> Value {
+    if images.is_empty() && file_ids.is_empty() {
         return json!(text);
     }
     let mut parts: Vec<Value> = Vec::new();
@@ -95,6 +100,9 @@ fn build_input(text: &str, images: &[ImageAttachment]) -> Value {
     }
     for img in images {
         parts.push(json!({"type": "input_image", "image_url": img.url}));
+    }
+    for id in file_ids {
+        parts.push(json!({"type": "input_file", "file_id": id}));
     }
     json!(parts)
 }
@@ -108,12 +116,13 @@ fn build_request_body(
     model: &str,
     text: &str,
     images: &[ImageAttachment],
+    file_ids: &[String],
     thread_id: Option<&str>,
     tool_ids: &[String],
 ) -> Value {
     let mut body = json!({
         "model": model,
-        "input": build_input(text, images),
+        "input": build_input(text, images, file_ids),
         "stream": false,
     });
     if let Some(id) = thread_id {
@@ -160,17 +169,33 @@ impl<'a> ResponsesClient<'a> {
     /// config (monocle-cli#129 / monocle#627) — there is no per-turn
     /// selection otherwise. Omitted from the request body when empty,
     /// matching jarvice's `Optional[list[str]] = None` default.
+    ///
+    /// `files`: non-image local attachments (see `attachment::Attachment`).
+    /// Each is uploaded FIRST, synchronously, to jarvice's real
+    /// file-ingestion endpoint (`POST /api/v1/files/` — multipart, single
+    /// `file` field; `process=true` by default already runs server-side
+    /// ingestion, e.g. `ExcelOrgTableLoader`, within that same call, so no
+    /// separate "process" call is needed), using the same bearer token as
+    /// `/api/responses`. The resulting file ids are then attached to the
+    /// `input` array as `input_file` blocks (see `build_input`).
     pub fn respond(
         &self,
         model: &str,
         text: &str,
         images: &[ImageAttachment],
+        files: &[FileAttachment],
         thread_id: Option<&str>,
         tool_ids: &[String],
     ) -> Result<ResponsesReply> {
-        let body = build_request_body(model, text, images, thread_id, tool_ids);
-
         let bearer = format!("Bearer {}", self.token);
+
+        let mut file_ids: Vec<String> = Vec::with_capacity(files.len());
+        for file in files {
+            file_ids.push(self.upload_file(&bearer, file)?);
+        }
+
+        let body = build_request_body(model, text, images, &file_ids, thread_id, tool_ids);
+
         let resp = self.client.post_json(
             &format!("{}/api/responses", self.jarvice_url),
             &responses_headers(&bearer),
@@ -186,6 +211,45 @@ impl<'a> ResponsesClient<'a> {
         let data: Value = resp.json()?;
         let thread_id = resp.header("x-thread-id").map(str::to_string);
         parse_reply(&data, thread_id)
+    }
+
+    /// Upload one non-image file to jarvice's `POST /api/v1/files/` and
+    /// return its id. Same bearer token as `/api/responses`, plus this
+    /// module's standard origin-attribution header pair (`auth_headers`) —
+    /// this endpoint has no `X-Session-Id`-gated behavior, unlike
+    /// `/api/responses` (see `origin::session_id`'s doc comment), so the
+    /// plain pair is the right convention here rather than
+    /// `responses_headers`.
+    fn upload_file(&self, bearer: &str, file: &FileAttachment) -> Result<String> {
+        let resp = self.client.post_multipart(
+            &format!("{}/api/v1/files/", self.jarvice_url),
+            &auth_headers(bearer),
+            vec![FilePart {
+                field: "file".to_string(),
+                filename: file.filename.clone(),
+                content_type: file.content_type.clone(),
+                data: file.data.clone(),
+            }],
+            &[],
+        )?;
+        if !resp.ok() {
+            return Err(AppError::new(format!(
+                "File upload failed (HTTP {}) for {}: {}",
+                resp.status,
+                file.filename,
+                resp.text()
+            )));
+        }
+        let data: Value = resp.json()?;
+        data.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                AppError::new(format!(
+                    "File upload response for {} missing \"id\": {data}",
+                    file.filename
+                ))
+            })
     }
 }
 
@@ -275,7 +339,7 @@ mod tests {
     fn text_only_input_serializes_as_plain_string() {
         // The common case, and the shape jarvice's own docs lead with — no
         // content-block wrapping when there's nothing to attach.
-        assert_eq!(build_input("hello", &[]), json!("hello"));
+        assert_eq!(build_input("hello", &[], &[]), json!("hello"));
     }
 
     #[test]
@@ -284,7 +348,7 @@ mod tests {
             url: "data:image/png;base64,AAAA".to_string(),
         }];
         assert_eq!(
-            build_input("what is this?", &images),
+            build_input("what is this?", &images, &[]),
             json!([
                 {"type": "input_text", "text": "what is this?"},
                 {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
@@ -298,21 +362,49 @@ mod tests {
             url: "https://example.com/a.png".to_string(),
         }];
         assert_eq!(
-            build_input("", &images),
+            build_input("", &images, &[]),
             json!([{"type": "input_image", "image_url": "https://example.com/a.png"}])
         );
     }
 
     #[test]
+    fn file_input_becomes_input_file_block() {
+        let file_ids = vec!["file-123".to_string()];
+        assert_eq!(
+            build_input("what's in this?", &[], &file_ids),
+            json!([
+                {"type": "input_text", "text": "what's in this?"},
+                {"type": "input_file", "file_id": "file-123"},
+            ])
+        );
+    }
+
+    #[test]
+    fn images_and_files_both_present_preserve_order() {
+        let images = vec![ImageAttachment {
+            url: "data:image/png;base64,AAAA".to_string(),
+        }];
+        let file_ids = vec!["file-123".to_string()];
+        assert_eq!(
+            build_input("compare", &images, &file_ids),
+            json!([
+                {"type": "input_text", "text": "compare"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                {"type": "input_file", "file_id": "file-123"},
+            ])
+        );
+    }
+
+    #[test]
     fn empty_tool_ids_are_omitted_from_the_request_body() {
-        let body = build_request_body("m", "hi", &[], None, &[]);
+        let body = build_request_body("m", "hi", &[], &[], None, &[]);
         assert!(body.get("tools").is_none());
     }
 
     #[test]
     fn tool_ids_are_sent_as_the_tools_field() {
         let tool_ids = vec!["ms365-server-id".to_string()];
-        let body = build_request_body("m", "hi", &[], None, &tool_ids);
+        let body = build_request_body("m", "hi", &[], &[], None, &tool_ids);
         assert_eq!(body["tools"], json!(["ms365-server-id"]));
     }
 
@@ -491,7 +583,7 @@ mod tests {
                 url: "https://example.com/b.png".to_string(),
             },
         ];
-        let input = build_input("compare these", &images);
+        let input = build_input("compare these", &images, &[]);
         let parts = input.as_array().unwrap();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[1]["image_url"], json!("data:image/png;base64,AAAA"));

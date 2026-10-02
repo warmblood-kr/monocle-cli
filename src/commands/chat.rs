@@ -6,10 +6,11 @@ use serde_json::Value;
 use chrono::TimeZone;
 
 use crate::agent::providers::{
-    ChatRequest, ChatResponse, ImageAttachment, LlmProvider, Message, MonocleProvider, ToolCall,
+    ChatRequest, ChatResponse, FileAttachment, ImageAttachment, LlmProvider, Message,
+    MonocleProvider, ToolCall,
 };
 use crate::agent::DEFAULT_MODEL;
-use crate::attachment;
+use crate::attachment::{self, Attachment};
 use crate::auth::{get_access_token, jarvice_url_for, try_access_token, AuthSession};
 use crate::commands::model_list::{fetch_model_ids, handle_model_command};
 use crate::commands::repl::{
@@ -74,12 +75,14 @@ fn call_chat(
     messages: Vec<Message>,
     max_tokens: Option<i64>,
     images: &[ImageAttachment],
+    files: &[FileAttachment],
 ) -> Result<(ChatResponse, Option<Duration>)> {
     let req = ChatRequest {
         model: model.to_string(),
         messages,
         max_tokens,
         images: images.to_vec(),
+        files: files.to_vec(),
         ..Default::default()
     };
     // Acquire the stdout lock once for the whole stream rather than per token —
@@ -103,15 +106,18 @@ fn call_chat(
     Ok((resp, ttfb))
 }
 
+/// One resolved one-shot turn: cleaned text plus its image and non-image file
+/// attachments — the shape shared by `read_one_shot_input` and
+/// `resolve_repl_attachments` below (a plain tuple return trips clippy's
+/// `type_complexity` lint once a third element is added).
+type ResolvedTurn = (String, Vec<ImageAttachment>, Vec<FileAttachment>);
+
 /// Read piped stdin (if not a TTY) and resolve `--file` + inband `file:<path>`
 /// tokens into one one-shot turn — shared by both the plain-completions and
 /// `--responses` paths. Returns `None` on an interactive TTY (nothing piped).
 /// Exits the process on a bad attachment ref or empty input, matching this
 /// command's existing fail-fast one-shot behavior.
-fn read_one_shot_input(
-    stdin_is_tty: bool,
-    files: &[String],
-) -> Result<Option<(String, Vec<ImageAttachment>)>> {
+fn read_one_shot_input(stdin_is_tty: bool, files: &[String]) -> Result<Option<ResolvedTurn>> {
     if stdin_is_tty {
         return Ok(None);
     }
@@ -123,9 +129,11 @@ fn read_one_shot_input(
     refs.extend(inband_refs);
 
     let mut images: Vec<ImageAttachment> = Vec::new();
+    let mut file_attachments: Vec<FileAttachment> = Vec::new();
     for r in &refs {
         match attachment::resolve(r) {
-            Ok(img) => images.push(img),
+            Ok(Attachment::Image(img)) => images.push(img),
+            Ok(Attachment::File(f)) => file_attachments.push(f),
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(1);
@@ -134,14 +142,14 @@ fn read_one_shot_input(
     }
 
     let cleaned_text = cleaned_text.trim().to_string();
-    // Image-only messages are valid — only bail when BOTH the text and the
-    // attachments are empty.
-    if cleaned_text.is_empty() && images.is_empty() {
+    // Image-only/file-only messages are valid — only bail when text AND
+    // every kind of attachment are empty.
+    if cleaned_text.is_empty() && images.is_empty() && file_attachments.is_empty() {
         eprintln!("No input provided via stdin.");
         std::process::exit(1);
     }
 
-    Ok(Some((cleaned_text, images)))
+    Ok(Some((cleaned_text, images, file_attachments)))
 }
 
 /// Resolve a fresh (auto-refreshing) session for this turn, or print the
@@ -166,18 +174,18 @@ fn resolve_turn_session(client: &Client, creds: &Credentials) -> Option<AuthSess
 /// reason to kill the whole session. Returns the cleaned text (`file:` tokens
 /// stripped, same as the one-shot path) alongside the resolved attachments;
 /// zero refs is the common case and just passes `line` through unchanged.
-fn resolve_repl_attachments(
-    line: &str,
-) -> std::result::Result<(String, Vec<ImageAttachment>), String> {
+fn resolve_repl_attachments(line: &str) -> std::result::Result<ResolvedTurn, String> {
     let (cleaned_text, refs) = attachment::extract_inband_refs(line);
     let mut images: Vec<ImageAttachment> = Vec::new();
+    let mut files: Vec<FileAttachment> = Vec::new();
     for r in &refs {
         match attachment::resolve(r) {
-            Ok(img) => images.push(img),
+            Ok(Attachment::Image(img)) => images.push(img),
+            Ok(Attachment::File(f)) => files.push(f),
             Err(e) => return Err(e.to_string()),
         }
     }
-    Ok((cleaned_text.trim().to_string(), images))
+    Ok((cleaned_text.trim().to_string(), images, files))
 }
 
 /// The slash commands the REPL understands. `/model` mirrors `monocle
@@ -388,7 +396,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     }
 
     // Non-interactive: stdin was piped (input + attachments already resolved above).
-    if let Some((text, images)) = one_shot_input {
+    if let Some((text, images, files)) = one_shot_input {
         eprintln!("Using model: {model}");
         eprintln!("Router: {router_url}");
         let provider = MonocleProvider::new(token, router_url.clone());
@@ -398,7 +406,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         }
         messages.push(Message::user(&text));
         // One-shot mode has no `/diag` to show — TTFB is discarded here.
-        let (resp, _ttfb) = call_chat(&provider, &model, messages, max_tokens, &images)?;
+        let (resp, _ttfb) = call_chat(&provider, &model, messages, max_tokens, &images, &files)?;
         if let Some(msg) = dropped_tool_calls_message(&resp.tool_calls, 0, "monocle chat") {
             eprintln!("{msg}");
         }
@@ -461,7 +469,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             return Ok(control);
         }
 
-        let (text, images) = match resolve_repl_attachments(trimmed) {
+        let (text, images, files) = match resolve_repl_attachments(trimmed) {
             Ok(v) => v,
             Err(e) => {
                 // Same per-turn recovery as a `call_chat` error below: print
@@ -513,7 +521,14 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         // `call_chat`'s own `Duration` return is `/diag`'s `Time to first byte:`
         // line — captured inside `call_chat` at its first streamed delta.
         let started = std::time::Instant::now();
-        match call_chat(&provider, &model, convo.clone(), max_tokens, &images) {
+        match call_chat(
+            &provider,
+            &model,
+            convo.clone(),
+            max_tokens,
+            &images,
+            &files,
+        ) {
             Ok((resp, ttfb)) => {
                 diagnostics = Some(TurnDiagnostics::for_chat(
                     model.clone(),
@@ -808,7 +823,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
 
     let one_shot_input = read_one_shot_input(stdin_is_tty, &options.files)?;
 
-    if let Some((text, images)) = one_shot_input {
+    if let Some((text, images, files)) = one_shot_input {
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
@@ -816,6 +831,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
             &model,
             &text,
             &images,
+            &files,
             options.resume.as_deref(),
             &options.tool_ids,
         )?;
@@ -921,7 +937,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
             return Ok(control);
         }
 
-        let (text, images) = match resolve_repl_attachments(trimmed) {
+        let (text, images, files) = match resolve_repl_attachments(trimmed) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -957,6 +973,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
             &model,
             &text,
             &images,
+            &files,
             thread_id.as_deref(),
             &options.tool_ids,
         ) {
@@ -1431,9 +1448,10 @@ mod tests {
 
     #[test]
     fn repl_line_with_no_file_ref_passes_through_unchanged() {
-        let (text, images) = resolve_repl_attachments("hello there").unwrap();
+        let (text, images, files) = resolve_repl_attachments("hello there").unwrap();
         assert_eq!(text, "hello there");
         assert!(images.is_empty());
+        assert!(files.is_empty());
     }
 
     #[test]
@@ -1443,10 +1461,11 @@ mod tests {
         std::fs::write(&path, b"bytes").unwrap();
         let line = format!("what's in file:{} ?", path.to_str().unwrap());
 
-        let (text, images) = resolve_repl_attachments(&line).unwrap();
+        let (text, images, files) = resolve_repl_attachments(&line).unwrap();
         assert!(!text.contains("file:"));
         assert!(text.contains("what's in"));
         assert_eq!(images.len(), 1);
+        assert!(files.is_empty());
     }
 
     #[test]
@@ -1456,9 +1475,10 @@ mod tests {
         std::fs::write(&path, b"bytes").unwrap();
         let line = format!("file:{}", path.to_str().unwrap());
 
-        let (text, images) = resolve_repl_attachments(&line).unwrap();
+        let (text, images, files) = resolve_repl_attachments(&line).unwrap();
         assert!(text.is_empty());
         assert_eq!(images.len(), 1);
+        assert!(files.is_empty());
     }
 
     #[test]
@@ -1468,16 +1488,19 @@ mod tests {
     }
 
     #[test]
-    fn repl_line_with_unsupported_extension_errors_with_typed_message() {
+    fn repl_line_with_unsupported_extension_resolves_as_a_file_attachment() {
+        // The hard-reject this test used to assert is exactly what this
+        // feature removes — see `attachment::tests::non_image_extension_
+        // resolves_as_a_file_attachment` for the underlying resolver test.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notes.heic");
         std::fs::write(&path, b"hello").unwrap();
         let line = format!("file:{}", path.to_str().unwrap());
 
-        let err = resolve_repl_attachments(&line).unwrap_err();
-        assert!(
-            err.starts_with("unsupported type:"),
-            "unexpected message: {err}"
-        );
+        let (text, images, files) = resolve_repl_attachments(&line).unwrap();
+        assert!(text.is_empty());
+        assert!(images.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "notes.heic");
     }
 }

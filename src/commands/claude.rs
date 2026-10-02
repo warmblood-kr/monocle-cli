@@ -2,22 +2,21 @@ use std::process::Command;
 
 use serde_json::json;
 
-use crate::auth::router_url_for;
+use crate::auth::ensure_fresh_token;
 use crate::credentials::Credentials;
+use crate::net::Client;
 use crate::origin::{MONOCLE_ORIGIN, ORIGIN_HEADER_NAME};
 
 /// Launch Claude Code through Monocle: inline settings, conflicting env vars
 /// stripped, base URL injected, usage attributed to the "cli" surface.
 pub fn claude_command(creds: &Credentials, args: &[String]) {
-    let creds = match creds.read() {
-        Some(c) => c,
-        None => {
-            eprintln!("Not logged in. Run `monocle login --tenant <domain>` first.");
+    let router_url = match ensure_fresh_token(&Client::new(), creds) {
+        Ok(session) => session.router_url,
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
-
-    let router_url = router_url_for(&creds);
 
     // Inline settings scoped to this child only — avoids mutating
     // ~/.claude/settings.json. `apiKeyHelper` keeps tokens fresh across long
