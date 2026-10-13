@@ -483,7 +483,7 @@ fn device_poll_response(status: u16, body: impl AsRef<[u8]>) -> Result<PollReply
 }
 
 fn device_expired() -> AppError {
-    AppError::new("Device authorization code expired before approval. Rerun `monocle login --device-code` with the same tenant/environment options. This is not a refresh-token failure.")
+    AppError::new("Device authorization code expired before token retrieval completed. Rerun `monocle login --device-code` with the same tenant/environment options. This is not a refresh-token failure.")
 }
 
 fn validate_device_timing(interval: i64, expires_in: i64) -> Result<()> {
@@ -738,6 +738,29 @@ mod device_deadline_tests {
             device_poll_response(200, r#"{"access_token":"synthetic"}"#).unwrap(),
             PollReply::Success(_)
         ));
+    }
+
+    #[test]
+    fn device_expiry_diagnostic_does_not_infer_approval_timing() {
+        let local = poll_with_clock(
+            2,
+            3,
+            || Duration::from_secs(3),
+            |_| panic!("expired grant must not sleep"),
+            || panic!("expired grant must not poll"),
+        )
+        .err()
+        .unwrap();
+        let server = device_poll_response(400, r#"{"error":"expired_token"}"#)
+            .err()
+            .unwrap();
+        for error in [local, server] {
+            let message = error.to_string();
+            assert!(message.contains("expired before token retrieval completed"));
+            assert!(!message.contains("approval"));
+            assert!(message.contains("same tenant/environment options"));
+            assert!(message.contains("not a refresh-token failure"));
+        }
     }
 
     #[test]
