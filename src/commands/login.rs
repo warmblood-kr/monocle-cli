@@ -266,7 +266,8 @@ fn handle_callback(
     };
 
     // Exchange code for tokens.
-    let resp = match client.post_form(
+    // Authorization codes are single-use; a lost response must not replay one.
+    let resp = match client.post_form_once(
         &oidc.token_endpoint,
         &[],
         &[
@@ -773,5 +774,295 @@ mod device_deadline_tests {
             || panic!("expired grant must not poll")
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod browser_exchange_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread;
+
+    // Each test runs in its own process with a temporary diagnostic HOME;
+    // never mutate process-global HOME while other tests are running.
+    fn isolated_parent(test: &str) -> bool {
+        if std::env::var_os("MONOCLE_BROWSER_TEST_HOME")
+            .is_some_and(|home| Some(home) == std::env::var_os("HOME"))
+        {
+            return false;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                &format!("commands::login::browser_exchange_tests::{test}"),
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("MONOCLE_BROWSER_TEST_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "synthetic child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    // All values are synthetic. No browser, discovery, live account or home store.
+    struct Outcome {
+        browser: Browser,
+        html: String,
+        forms: Vec<String>,
+        saved: bool,
+        unchanged: bool,
+    }
+
+    fn exercise(
+        state: &str,
+        status: u16,
+        body: &'static str,
+        lose_response: bool,
+        fail_save: bool,
+    ) -> Outcome {
+        let home = tempfile::tempdir().unwrap();
+        let store = Credentials::with_home(home.path());
+        if fail_save {
+            std::fs::write(store.dir(), "synthetic obstruction").unwrap();
+        } else {
+            store
+                .write(&build_creds(
+                    Some("synthetic.invalid"),
+                    None,
+                    "previous-synthetic-access".into(),
+                    None,
+                    None,
+                    None,
+                ))
+                .unwrap();
+        }
+        let prior_bytes = std::fs::read(store.path()).ok();
+        let tokens = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/token", tokens.local_addr().unwrap());
+        tokens.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let provider = thread::spawn(move || {
+            let mut forms = Vec::new();
+            while !stop_server.load(Ordering::SeqCst) {
+                let (mut stream, _) = match tokens.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(e) => panic!("synthetic listener failed: {e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST /token "));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut form = vec![0; length];
+                reader.read_exact(&mut form).unwrap();
+                forms.push(String::from_utf8(form).unwrap());
+                if lose_response && forms.len() == 1 {
+                    // Code consumed; response lost/corrupted before valid HTTP headers.
+                    // Invalid HTTP avoids timing-dependent empty-close behavior in hyper.
+                    stream.write_all(b"not an http response\r\n\r\n").unwrap();
+                } else {
+                    let (status, body) = if lose_response {
+                        (400, r#"{"error":"invalid_grant"}"#)
+                    } else {
+                        (status, body)
+                    };
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+            forms
+        });
+        let callback = Server::http("127.0.0.1:0").unwrap();
+        let redirect = format!(
+            "http://{}/oauth/oidc/callback",
+            callback.server_addr().to_ip().unwrap()
+        );
+        let redirect_worker = redirect.clone();
+        let worker_home = home.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            let req = callback
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            handle_callback(
+                &Client::new(),
+                &Credentials::with_home(worker_home),
+                Some("synthetic.invalid"),
+                "synthetic-state",
+                &OIDCConfig {
+                    issuer: "synthetic".into(),
+                    authorization_endpoint: "unused".into(),
+                    token_endpoint: endpoint,
+                    device_authorization_endpoint: None,
+                    router_url: None,
+                },
+                &redirect_worker,
+                "synthetic-verifier",
+                req,
+            )
+            .unwrap()
+        });
+        let html = Client::new()
+            .get(
+                &format!("{redirect}?state={state}&code=synthetic-code"),
+                &[],
+            )
+            .unwrap()
+            .text();
+        let browser = worker.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let forms = provider.join().unwrap();
+        for form in &forms {
+            let params = parse_query(form);
+            let has = |name: &str, value: &str| params.iter().any(|(k, v)| k == name && v == value);
+            assert!(has("grant_type", "authorization_code"));
+            assert!(has("client_id", CLIENT_ID));
+            assert!(has("code", "synthetic-code"));
+            assert!(has("code_verifier", "synthetic-verifier"));
+            assert!(has("redirect_uri", &redirect));
+        }
+        let saved = if fail_save {
+            false
+        } else {
+            let data = store.read().unwrap();
+            let saved = data.access_token == "synthetic-access";
+            if saved {
+                #[cfg(unix)]
+                assert_eq!(store.file_mode(), Some(0o600));
+            }
+            saved
+        };
+        Outcome {
+            browser,
+            html,
+            forms,
+            saved,
+            unchanged: prior_bytes == std::fs::read(store.path()).ok(),
+        }
+    }
+
+    #[test]
+    fn consumed_code_is_not_replayed_after_response_loss() {
+        if isolated_parent("consumed_code_is_not_replayed_after_response_loss") {
+            return;
+        }
+        let out = exercise("synthetic-state", 200, "unused", true, false);
+        assert_eq!(out.forms.len(), 1, "single-use code must not be replayed");
+        assert!(matches!(out.browser, Browser::Fatal(_)));
+        assert!(!out.html.contains("invalid_grant"));
+        assert!(!out.saved);
+        assert!(out.unchanged);
+    }
+
+    #[test]
+    fn valid_callback_exchanges_and_saves() {
+        if isolated_parent("valid_callback_exchanges_and_saves") {
+            return;
+        }
+        let out = exercise(
+            "synthetic-state",
+            200,
+            r#"{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expires_in":3600}"#,
+            false,
+            false,
+        );
+        assert_eq!(out.forms.len(), 1);
+        assert!(matches!(out.browser, Browser::Success));
+        assert!(out.html.contains("Authentication Successful"));
+        assert!(!out.html.contains("synthetic-access"));
+        assert!(out.saved);
+    }
+
+    #[test]
+    fn state_mismatch_never_exchanges_or_saves() {
+        if isolated_parent("state_mismatch_never_exchanges_or_saves") {
+            return;
+        }
+        let out = exercise("wrong", 200, "unused", false, false);
+        assert!(out.forms.is_empty());
+        assert!(matches!(out.browser, Browser::Fatal(_)));
+        assert!(!out.saved);
+        assert!(out.unchanged);
+    }
+
+    #[test]
+    fn rejected_exchange_never_saves_or_retries() {
+        if isolated_parent("rejected_exchange_never_saves_or_retries") {
+            return;
+        }
+        let out = exercise(
+            "synthetic-state",
+            403,
+            r#"{"error":"access_denied"}"#,
+            false,
+            false,
+        );
+        assert_eq!(out.forms.len(), 1);
+        assert!(matches!(out.browser, Browser::Fatal(_)));
+        assert!(out.html.contains("Token exchange failed (HTTP 403)"));
+        assert!(!out.saved);
+        assert!(out.unchanged);
+    }
+
+    #[test]
+    fn malformed_or_missing_token_never_saves() {
+        if isolated_parent("malformed_or_missing_token_never_saves") {
+            return;
+        }
+        for body in ["not JSON", r#"{"refresh_token":"synthetic-refresh"}"#] {
+            let out = exercise("synthetic-state", 200, body, false, false);
+            assert_eq!(out.forms.len(), 1);
+            assert!(matches!(out.browser, Browser::Fatal(_)));
+            assert!(!out.saved);
+            assert!(out.unchanged);
+        }
+    }
+
+    #[test]
+    fn persistence_failure_does_not_report_login_success() {
+        if isolated_parent("persistence_failure_does_not_report_login_success") {
+            return;
+        }
+        let out = exercise(
+            "synthetic-state",
+            200,
+            r#"{"access_token":"synthetic-access"}"#,
+            false,
+            true,
+        );
+        assert_eq!(out.forms.len(), 1);
+        assert!(matches!(out.browser, Browser::Fatal(_)));
+        assert!(!out.html.contains("Authentication Successful"));
     }
 }
