@@ -69,7 +69,7 @@ pub fn refresh_access_token(
 
     let now = now_ms();
     let access_expires = to_iso(now + token.expires_in.unwrap_or(3600) * 1000);
-    let refresh_expires = to_iso(now + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+    let refresh_expires = refresh_expiry_estimate(current, token.refresh_token.as_deref(), now);
 
     // Decode ID token to refresh email / tenant_name when a new one is provided.
     let mut email = current.email.clone();
@@ -114,4 +114,43 @@ pub fn decode_id_token_payload(id_token: &str) -> Result<Value> {
         .map_err(|e| AppError::new(e.to_string()))?;
     let value: Value = serde_json::from_slice(&bytes)?;
     Ok(value)
+}
+
+// A successful access refresh does not renew the lifetime of a reused refresh
+// token. New tokens retain the existing 30-day estimate, never a provider claim.
+fn refresh_expiry_estimate(current: &CredentialsData, returned: Option<&str>, now: i64) -> String {
+    match returned {
+        Some(token) if token != current.refresh_token => {
+            to_iso(now + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000)
+        }
+        _ => current.refresh_token_expires_at.clone(),
+    }
+}
+
+#[cfg(test)]
+mod expiry_estimate_tests {
+    use super::*;
+
+    #[test]
+    fn reused_or_absent_refresh_token_does_not_extend_estimate() {
+        let current: CredentialsData = serde_json::from_value(serde_json::json!({
+            "tenant_domain":"synthetic", "tenant_name":"synthetic", "email":"synthetic",
+            "access_token":"synthetic", "refresh_token":"old", "id_token":"synthetic",
+            "access_token_expires_at":"2000-01-01T00:00:00.000Z",
+            "refresh_token_expires_at":"2000-02-01T00:00:00.000Z"
+        }))
+        .unwrap();
+        assert_eq!(
+            refresh_expiry_estimate(&current, None, 0),
+            current.refresh_token_expires_at
+        );
+        assert_eq!(
+            refresh_expiry_estimate(&current, Some("old"), 0),
+            current.refresh_token_expires_at
+        );
+        assert_eq!(
+            refresh_expiry_estimate(&current, Some("rotated"), 0),
+            to_iso(30 * 24 * 60 * 60 * 1000)
+        );
+    }
 }

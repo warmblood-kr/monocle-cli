@@ -363,7 +363,9 @@ fn device_code_login(
             resp.status
         )));
     }
+    let issued_at = Instant::now();
     let device: DeviceAuthResponse = resp.json()?;
+    validate_device_timing(device.interval.unwrap_or(5), device.expires_in)?;
 
     eprintln!();
     eprintln!("{}", c::bold("To authenticate, visit:"));
@@ -377,6 +379,8 @@ fn device_code_login(
         eprintln!("  {}", c::cyan(complete));
         eprintln!();
     }
+    // Start the provider's lifetime before displaying the instructions.
+    eprintln!("This device code expires in {} seconds. If it expires before approval, rerun `monocle login --device-code` with the same tenant/environment options.", device.expires_in);
     eprintln!("{}", c::dim("Waiting for authorization..."));
 
     let token = poll_for_token(
@@ -385,6 +389,7 @@ fn device_code_login(
         &device.device_code,
         device.interval.unwrap_or(5),
         device.expires_in,
+        issued_at,
     )?;
 
     let creds = build_creds(
@@ -406,77 +411,123 @@ fn poll_for_token(
     device_code: &str,
     interval: i64,
     expires_in: i64,
+    issued_at: Instant,
 ) -> Result<TokenResponse> {
-    let deadline = now_ms() + expires_in * 1000;
-    let mut current_interval = interval;
+    poll_with_clock(
+        interval,
+        expires_in,
+        || issued_at.elapsed(),
+        std::thread::sleep,
+        || {
+            let resp = client.post_form(
+                token_endpoint,
+                &[],
+                &[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", device_code),
+                    ("client_id", CLIENT_ID),
+                ],
+            )?;
 
-    while now_ms() < deadline {
-        std::thread::sleep(Duration::from_secs(current_interval.max(0) as u64));
+            device_poll_response(resp.status, resp.bytes())
+        },
+    )
+}
 
-        let resp = client.post_form(
-            token_endpoint,
-            &[],
-            &[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", device_code),
-                ("client_id", CLIENT_ID),
-            ],
-        )?;
-
-        if resp.ok() {
-            return resp.json();
+fn device_poll_response(status: u16, body: impl AsRef<[u8]>) -> Result<PollReply> {
+    let body = body.as_ref();
+    if (200..300).contains(&status) {
+        let token: TokenResponse = serde_json::from_slice(body)?;
+        if token.access_token.as_deref().is_none_or(str::is_empty) {
+            return Err(AppError::new("No access_token in device token response"));
         }
-
-        let val = resp.json::<Value>().ok();
-        let error = val
-            .as_ref()
-            .and_then(|v| v.get("error"))
-            .and_then(Value::as_str);
-
-        match error {
-            Some("authorization_pending") => continue,
-            Some("slow_down") => {
-                current_interval += 5;
-                continue;
-            }
-            Some("expired_token") => {
-                return Err(AppError::new(
-                    "Device code expired. Please run login again.",
-                ))
-            }
-            Some("access_denied") => {
-                return Err(AppError::new(
-                    "Authorization request was denied by the user.",
-                ))
-            }
-            Some(e) => {
-                let desc = val
-                    .as_ref()
-                    .and_then(|v| v.get("error_description"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                return Err(AppError::new(format!("Token polling failed: {e} - {desc}")));
-            }
-            None => {
-                let raw = resp.text();
-                let snippet: String = raw.chars().take(200).collect();
-                let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-                let snippet = if snippet.is_empty() {
-                    "(empty)".to_string()
-                } else {
-                    snippet
-                };
-                return Err(AppError::new(format!(
-                    "Token polling failed: server returned HTTP {} with non-OAuth response. Body: {snippet}",
-                    resp.status
-                )));
-            }
-        }
+        return Ok(PollReply::Success(token));
     }
 
-    Err(AppError::new(
-        "Device code expired. Please run login again.",
-    ))
+    let val = serde_json::from_slice::<Value>(body).ok();
+    let error = val
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(Value::as_str);
+
+    match error {
+        Some("authorization_pending") => Ok(PollReply::Pending),
+        Some("slow_down") => Ok(PollReply::SlowDown),
+        Some("expired_token") => Err(device_expired()),
+        Some("access_denied") => Err(AppError::new(
+            "Authorization request was denied by the user.",
+        )),
+        Some(e) => {
+            let desc = val
+                .as_ref()
+                .and_then(|v| v.get("error_description"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Err(AppError::new(format!("Token polling failed: {e} - {desc}")))
+        }
+        None => {
+            let raw = String::from_utf8_lossy(body);
+            let snippet: String = raw.chars().take(200).collect();
+            let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+            let snippet = if snippet.is_empty() {
+                "(empty)".to_string()
+            } else {
+                snippet
+            };
+            Err(AppError::new(format!(
+            "Token polling failed: server returned HTTP {} with non-OAuth response. Body: {snippet}",
+            status
+        )))
+        }
+    }
+}
+
+fn device_expired() -> AppError {
+    AppError::new("Device authorization code expired before approval. Rerun `monocle login --device-code` with the same tenant/environment options. This is not a refresh-token failure.")
+}
+
+fn validate_device_timing(interval: i64, expires_in: i64) -> Result<()> {
+    // Bounds avoid overflow/unbounded sleeps on malformed provider responses.
+    if !(1..=86400).contains(&interval) || !(1..=86400).contains(&expires_in) {
+        return Err(AppError::new("Invalid device authorization timing: interval and expires_in must be positive and at most 86400 seconds"));
+    }
+    Ok(())
+}
+
+enum PollReply {
+    Pending,
+    SlowDown,
+    Success(TokenResponse),
+}
+
+// The same loop runs in production and with a synthetic monotonic clock in tests.
+// It has no credentials/store argument: unsuccessful polling cannot persist tokens.
+fn poll_with_clock(
+    interval: i64,
+    expires_in: i64,
+    elapsed: impl Fn() -> Duration,
+    mut sleep: impl FnMut(Duration),
+    mut request: impl FnMut() -> Result<PollReply>,
+) -> Result<TokenResponse> {
+    validate_device_timing(interval, expires_in)?;
+    let lifetime = Duration::from_secs(expires_in as u64);
+    let mut interval = Duration::from_secs(interval as u64);
+    loop {
+        let remaining = lifetime.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return Err(device_expired());
+        }
+        sleep(interval.min(remaining));
+        // A sleep may overshoot. Never start an HTTP poll at/after the deadline.
+        if elapsed() >= lifetime {
+            return Err(device_expired());
+        }
+        match request()? {
+            PollReply::Pending => {}
+            PollReply::SlowDown => interval = interval.saturating_add(Duration::from_secs(5)),
+            PollReply::Success(token) => return Ok(token),
+        }
+    }
 }
 
 fn build_creds(
@@ -546,4 +597,158 @@ fn print_login_success(email: &str, tenant_name: &str, leading_newline: bool) {
         c::bold("monocle setup"),
         c::dim(".)")
     );
+}
+
+#[cfg(test)]
+mod device_deadline_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn success() -> PollReply {
+        PollReply::Success(serde_json::from_str(r#"{"access_token":"synthetic"}"#).unwrap())
+    }
+
+    #[test]
+    fn pending_then_success_uses_provider_interval() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut calls = 0;
+        let token = poll_with_clock(
+            2,
+            10,
+            || elapsed.get(),
+            |d| elapsed.set(elapsed.get() + d),
+            || {
+                calls += 1;
+                Ok(if calls == 1 {
+                    PollReply::Pending
+                } else {
+                    success()
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(elapsed.get(), Duration::from_secs(4));
+        assert_eq!(token.access_token.as_deref(), Some("synthetic"));
+    }
+
+    #[test]
+    fn sleep_crossing_deadline_never_polls() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = poll_with_clock(
+            2,
+            3,
+            || elapsed.get(),
+            |d| elapsed.set(elapsed.get() + d + Duration::from_secs(2)),
+            || panic!("must not request after expiry"),
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("not a refresh-token failure"));
+    }
+
+    #[test]
+    fn slow_down_crossing_deadline_does_not_request_again() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut calls = 0;
+        let result = poll_with_clock(
+            2,
+            8,
+            || elapsed.get(),
+            |d| elapsed.set(elapsed.get() + d),
+            || {
+                calls += 1;
+                Ok(PollReply::SlowDown)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert_eq!(elapsed.get(), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn server_expiry_stops_without_regenerating_grant() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut calls = 0;
+        let result = poll_with_clock(
+            1,
+            8,
+            || elapsed.get(),
+            |d| elapsed.set(elapsed.get() + d),
+            || {
+                calls += 1;
+                device_poll_response(400, r#"{"error":"expired_token"}"#)
+            },
+        );
+        assert_eq!(calls, 1);
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("same tenant/environment"));
+    }
+
+    #[test]
+    fn invalid_timing_never_sleeps_or_requests() {
+        for (interval, lifetime) in [
+            (0, 3),
+            (-1, 3),
+            (2, 0),
+            (2, -1),
+            (i64::MAX, 3),
+            (2, i64::MAX),
+        ] {
+            assert!(poll_with_clock(
+                interval,
+                lifetime,
+                || Duration::ZERO,
+                |_| panic!("invalid timing must not sleep"),
+                || panic!("invalid timing must not poll")
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn device_response_categories_and_missing_token_are_distinct() {
+        assert!(matches!(
+            device_poll_response(400, r#"{"error":"authorization_pending"}"#).unwrap(),
+            PollReply::Pending
+        ));
+        assert!(matches!(
+            device_poll_response(400, r#"{"error":"slow_down"}"#).unwrap(),
+            PollReply::SlowDown
+        ));
+        assert!(device_poll_response(400, r#"{"error":"expired_token"}"#)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("not a refresh-token failure"));
+        assert!(device_poll_response(400, r#"{"error":"access_denied"}"#)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("denied by the user"));
+        for body in [r#"{}"#, r#"{"access_token":""}"#] {
+            assert!(device_poll_response(200, body).is_err());
+        }
+        assert!(matches!(
+            device_poll_response(200, r#"{"access_token":"synthetic"}"#).unwrap(),
+            PollReply::Success(_)
+        ));
+    }
+
+    #[test]
+    fn already_expired_does_not_sleep_or_request() {
+        assert!(poll_with_clock(
+            2,
+            3,
+            || Duration::from_secs(3),
+            |_| panic!("expired grant must not sleep"),
+            || panic!("expired grant must not poll")
+        )
+        .is_err());
+    }
 }

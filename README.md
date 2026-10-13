@@ -31,7 +31,12 @@ monocle login
 
 A browser opens — sign in with your organization account. In headless/SSH
 environments it falls back automatically to device-code login (or force it with
-`monocle login --device-code`).
+`monocle login --device-code`). Device login displays the provider's code lifetime.
+If it expires before approval, rerun the command with the same tenant/environment
+options; this timeout is separate from a cached refresh-token failure. Polling
+uses a monotonic deadline and starts no request after that deadline. Nonpositive
+or greater-than-24-hour polling intervals/lifetimes are rejected as invalid
+provider timing; the CLI never extends a grant or silently requests a new one.
 
 > Prefer to build from source? With a Rust toolchain installed:
 > `cargo install --git https://github.com/warmblood-kr/monocle-cli` (or
@@ -43,7 +48,15 @@ environments it falls back automatically to device-code login (or force it with
 monocle status
 ```
 
-Shows your tenant, user, access/refresh token validity, and whether Claude Code is globally configured to route through Monocle. Read-only — it does not refresh tokens.
+Shows your tenant, user, access-token expiry, the cached refresh-expiry **estimate**,
+and whether Claude Code is globally configured to route through Monocle. Status
+uses the same access-expiry policy as authentication (JWT `exp`, or the stored
+ISO timestamp for opaque tokens). A decoded JWT without `exp` has unknown expiry.
+Status may refresh an access token and write the refreshed credentials; it is
+not an offline/read-only diagnostic. A passed refresh-expiry estimate does not
+prove that the provider rejected the refresh token, and a future estimate does
+not prove provider validity. Reusing a refresh token preserves its cached
+estimate; rotation retains the existing 30-day estimation convention.
 
 ## 📖 Commands
 
@@ -624,7 +637,7 @@ print(resp.choices[0].message.content)
 → Run `monocle login` first.
 
 **Token expired**
-→ `monocle token` auto-refreshes when near expiry. If it's been more than 30 days since your last login, run `monocle login` again.
+→ `monocle token` auto-refreshes when near expiry. A device-code timeout means rerunning the same login command to obtain a new code. A confirmed refresh-token rejection requires login; a cached 30-day expiry estimate alone does not prove rejection.
 
 **"Error: error decoding response body" (or another network/streaming error)**
 → The request/response context (method, URL, underlying error) is appended to
