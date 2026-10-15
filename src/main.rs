@@ -50,10 +50,9 @@ Commands:
     status   Show authentication and configuration status
     claude   Launch Claude Code with Monocle authentication
 
-  Chat & models:
+  Chat & Router:
     chat     Chat with Jarvice Responses (interactive REPL or pipe from stdin)
-    router   Chat with LLM via the OpenAI-compatible Monocle router
-    models   List available models from the Monocle router
+    router   Chat, models, audio, and image commands for the OpenAI-compatible Monocle router
 
   Agent:
     agent    [Experimental] Headless agent loop with tools (read/write/edit + shell)
@@ -112,7 +111,7 @@ enum Commands {
     },
     /// [Experimental] Run as an ACP agent over stdio (editors / desktop / Craft)
     Acp,
-    /// List available models from the Monocle router
+    /// [Deprecated] List available models from the Monocle router; use `monocle router models`
     Models,
     /// Chat with Jarvice Responses (interactive REPL or pipe from stdin)
     Chat {
@@ -146,17 +145,17 @@ enum Commands {
         #[arg(long = "auto-approve")]
         auto_approve: bool,
     },
-    /// Call audio (STT / TTS) endpoints directly for debugging
+    /// [Deprecated] Call Router audio endpoints; use `monocle router audio`
     Audio {
         #[command(subcommand)]
         command: AudioCommands,
     },
-    /// Generate or edit images via chat-proxy (OpenAI compatible)
+    /// [Deprecated] Generate or edit images via Router; use `monocle router image`
     Image {
         #[command(subcommand)]
         command: ImageCommands,
     },
-    /// [Deprecated] Use `monocle chat` / `monocle models` instead
+    /// [Deprecated] Use `monocle chat` / `monocle router models` instead
     #[command(hide = true)]
     Model {
         #[command(subcommand)]
@@ -283,6 +282,18 @@ enum ChatCommand {
 enum RouterCommands {
     /// Chat via OpenAI-compatible `/v1/chat/completions`
     Chat(RouterChatArgs),
+    /// List available models from the Monocle router
+    Models,
+    /// Call Router audio endpoints directly (STT / TTS)
+    Audio {
+        #[command(subcommand)]
+        command: AudioCommands,
+    },
+    /// Generate or edit images via the OpenAI-compatible Router
+    Image {
+        #[command(subcommand)]
+        command: ImageCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -422,7 +433,7 @@ enum ImageCommands {
 
 #[derive(Subcommand)]
 enum ModelCommands {
-    /// [Deprecated] Use `monocle models` instead
+    /// [Deprecated] Use `monocle router models` instead
     List,
     /// [Deprecated] Use `monocle router chat` instead
     Chat(RouterChatArgs),
@@ -455,13 +466,21 @@ fn main() {
             Ok(())
         }
         Commands::Acp => monocle_cli::acp::serve(),
-        Commands::Models => model_list_command(&client, &creds),
+        Commands::Models => {
+            eprintln!(
+                "Warning: `monocle models` is deprecated. Use `monocle router models` instead."
+            );
+            model_list_command(&client, &creds)
+        }
         Commands::Chat { command, args } => match command {
             Some(ChatCommand::List) => chat_list_command(&client, &creds),
             None => chat_command(&client, &creds, args.into()),
         },
         Commands::Router { command } => match command {
             RouterCommands::Chat(args) => chat_command(&client, &creds, args.into()),
+            RouterCommands::Models => model_list_command(&client, &creds),
+            RouterCommands::Audio { command } => run_audio(&client, &creds, command),
+            RouterCommands::Image { command } => run_image(&client, &creds, command),
         },
         Commands::Agent {
             prompt,
@@ -482,23 +501,31 @@ fn main() {
                 auto_approve,
             },
         ),
-        Commands::Audio { command } => run_audio(&client, &creds, command),
-        Commands::Image { command } => run_image(&client, &creds, command),
+        Commands::Audio { command } => {
+            eprintln!(
+                "Warning: `monocle audio` is deprecated. Use `monocle router audio` instead."
+            );
+            run_audio(&client, &creds, command)
+        }
+        Commands::Image { command } => {
+            eprintln!(
+                "Warning: `monocle image` is deprecated. Use `monocle router image` instead."
+            );
+            run_image(&client, &creds, command)
+        }
         Commands::Upgrade { check } => upgrade_command(&client, check),
-        Commands::Model { command } => {
-            match command {
-                ModelCommands::List => {
-                    eprintln!("Warning: `monocle model list` is deprecated. Use `monocle models` instead.");
-                    model_list_command(&client, &creds)
-                }
-                ModelCommands::Chat(args) => {
-                    eprintln!(
+        Commands::Model { command } => match command {
+            ModelCommands::List => {
+                eprintln!("Warning: `monocle model list` is deprecated. Use `monocle router models` instead.");
+                model_list_command(&client, &creds)
+            }
+            ModelCommands::Chat(args) => {
+                eprintln!(
                     "Warning: `monocle model chat` is deprecated. Use `monocle router chat` instead."
                     );
-                    chat_command(&client, &creds, args.into())
-                }
+                chat_command(&client, &creds, args.into())
             }
-        }
+        },
     };
 
     if let Err(e) = result {
@@ -709,5 +736,70 @@ mod tests {
             }
             _ => panic!("expected Router chat command"),
         }
+    }
+
+    #[test]
+    fn router_models_audio_and_image_parse() {
+        assert!(matches!(
+            Cli::parse_from(["monocle", "router", "models"]).command,
+            Commands::Router {
+                command: RouterCommands::Models
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from(["monocle", "router", "audio", "transcribe"]).command,
+            Commands::Router {
+                command: RouterCommands::Audio {
+                    command: AudioCommands::Transcribe { .. }
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from([
+                "monocle",
+                "router",
+                "image",
+                "generate",
+                "--model",
+                "gpt-image-1",
+                "-o",
+                "out.png"
+            ])
+            .command,
+            Commands::Router {
+                command: RouterCommands::Image {
+                    command: ImageCommands::Generate { .. }
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn root_router_commands_remain_compatible() {
+        assert!(matches!(
+            Cli::parse_from(["monocle", "models"]).command,
+            Commands::Models
+        ));
+        assert!(matches!(
+            Cli::parse_from(["monocle", "audio", "transcribe"]).command,
+            Commands::Audio {
+                command: AudioCommands::Transcribe { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from([
+                "monocle",
+                "image",
+                "generate",
+                "--model",
+                "gpt-image-1",
+                "-o",
+                "out.png"
+            ])
+            .command,
+            Commands::Image {
+                command: ImageCommands::Generate { .. }
+            }
+        ));
     }
 }
