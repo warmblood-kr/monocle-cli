@@ -51,7 +51,9 @@ monocle status
 | `monocle status` | 로그인, 토큰, Claude Code 구성 상태 확인 |
 | `monocle token` | 현재 액세스 토큰 출력 (만료 임박 시 자동 갱신) |
 | `monocle models` | 사용 가능한 모델 목록 (modality 포함) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | 모델과 채팅 (REPL 또는 stdin) |
+| `monocle chat [--model <id>] [--resume <id>] [--tool-ids <id,...>]` | Jarvice Responses로 채팅 (서버가 대화 기록 관리) |
+| `monocle chat list` | Jarvice 채팅 스레드 목록 보기 |
+| `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | OpenAI 호환 Monocle Router로 채팅 |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI 호환 음성 인식 |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast 음성 인식 |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI 호환 음성 합성 |
@@ -61,6 +63,11 @@ monocle status
 | `monocle unset` | 전역 `claude` 라우팅 제거 |
 
 ## 💬 모델과 채팅하기
+
+`monocle chat`은 기본으로 Jarvice의 서버 관리형 Responses API를 사용해요.
+이전의 OpenAI 호환 Router 채팅 동작을 쓰려면 `monocle router chat`을
+사용하세요. 기존 스크립트 호환을 위해 `monocle chat --responses`도 계속
+지원해요. `monocle chat list`는 Jarvice 웹에서 만든 스레드도 포함해 목록을 보여줘요.
 
 사용 가능한 모델 보기:
 
@@ -80,7 +87,7 @@ gpt-4o-mini-tts           GPT-4o mini TTS       tts       openai      -
 인터랙티브 REPL:
 
 ```console
-$ monocle chat --model claude-sonnet-4-6
+$ monocle router chat --model claude-sonnet-4-6
 Monocle Chat (model: claude-sonnet-4-6)
 Router: https://api.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
@@ -96,7 +103,7 @@ Bye.
 stdin 파이프로 one-shot:
 
 ```console
-$ echo "OAuth 2.0을 한 문장으로 요약해줘." | monocle chat
+$ echo "OAuth 2.0을 한 문장으로 요약해줘." | monocle router chat
 Using model: claude-sonnet-4-6
 Router: https://api.monocle-ai.com
 OAuth 2.0은 사용자가 비밀번호를 공유하지 않고도 애플리케이션이 다른 서비스의 자원에 접근할 수 있게 해주는 인증 프레임워크예요.
@@ -105,11 +112,11 @@ OAuth 2.0은 사용자가 비밀번호를 공유하지 않고도 애플리케이
 파일에서 시스템 프롬프트를 불러와서:
 
 ```bash
-monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
+monocle router chat --system-prompt-file ./persona.md --model claude-opus-4-7
 ```
 
 > [!NOTE]
-> `monocle model chat` / `monocle model list`는 그대로 동작하지만 deprecated 상태이고 다음 릴리즈에서 제거될 예정이에요.
+> `monocle model chat` / `monocle model list`는 deprecated 상태예요. `monocle model chat`은 이전 Router 동작을 유지하므로 `monocle router chat`으로 옮기세요.
 
 ## 🔊 오디오 (STT / TTS)
 

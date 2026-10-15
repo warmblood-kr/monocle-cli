@@ -51,7 +51,8 @@ Commands:
     claude   Launch Claude Code with Monocle authentication
 
   Chat & models:
-    chat     Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
+    chat     Chat with Jarvice Responses (interactive REPL or pipe from stdin)
+    router   Chat with LLM via the OpenAI-compatible Monocle router
     models   List available models from the Monocle router
 
   Agent:
@@ -113,12 +114,17 @@ enum Commands {
     Acp,
     /// List available models from the Monocle router
     Models,
-    /// Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
+    /// Chat with Jarvice Responses (interactive REPL or pipe from stdin)
     Chat {
         #[command(subcommand)]
         command: Option<ChatCommand>,
         #[command(flatten)]
         args: ChatArgs,
+    },
+    /// Use the OpenAI-compatible Monocle router
+    Router {
+        #[command(subcommand)]
+        command: RouterCommands,
     },
     /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
     Agent {
@@ -182,26 +188,22 @@ struct ChatArgs {
     /// (piped stdin) only — see also inband `file:<path>` tokens in the text.
     #[arg(long = "file")]
     file: Vec<String>,
-    /// Experimental: talk to jarvice's `/api/responses` instead of the plain
-    /// `/v1/chat/completions` — the server owns the conversation thread, so
-    /// this CLI doesn't accumulate history itself. jarvice-only (not reachable
-    /// through chat-proxy); no custom `--system-prompt` support (see
-    /// `responses_api` module docs).
-    #[arg(long)]
-    responses: bool,
-    /// With `--responses`, continue this existing server-side thread id
+    /// Compatibility flag; Jarvice Responses is now the default for `monocle chat`.
+    #[arg(long = "responses")]
+    _responses_compat: bool,
+    /// Continue this existing server-side thread id
     /// instead of starting a new one. When entering the interactive REPL,
     /// its prior history is replayed to stderr before the prompt. (See also
     /// `monocle chat list` to discover thread ids.)
     #[arg(long)]
     resume: Option<String>,
-    /// With `--responses`, MCP/connected-app server ids to activate for this
+    /// MCP/connected-app server ids to activate for this
     /// turn (comma-separated). Without this, a turn only gets tools from the
     /// model's own static config — there is no other way to select which MCP
-    /// servers are on for a given `--responses` call.
+    /// servers are on for a given call.
     #[arg(long = "tool-ids", value_delimiter = ',')]
     tool_ids: Vec<String>,
-    /// With `--responses`, assert from the server's `tools_used` that a
+    /// Assert from the server's `tools_used` that a
     /// server-executed tool actually RAN, as a scriptable exit code. Pass a
     /// tool name to require THAT tool (`--verify-tool-firing=web_search`);
     /// bare, it only requires that at least one tool ran. Exit codes: 0 = the
@@ -222,7 +224,8 @@ impl From<ChatArgs> for ChatOptions {
             system_prompt_file: a.system_prompt_file,
             max_tokens: a.max_tokens,
             files: a.file,
-            responses: a.responses,
+            // Responses is the default. Keep parsing --responses as a compatibility alias.
+            responses: true,
             resume: a.resume,
             tool_ids: a.tool_ids,
             verify_tool_firing: a.verify_tool_firing.map(|v| match v {
@@ -233,12 +236,53 @@ impl From<ChatArgs> for ChatOptions {
     }
 }
 
+#[derive(Args)]
+struct RouterChatArgs {
+    /// Model ID to use
+    #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
+    model: String,
+    /// System prompt text
+    #[arg(long = "system-prompt")]
+    system_prompt: Option<String>,
+    /// Load system prompt from file
+    #[arg(long = "system-prompt-file")]
+    system_prompt_file: Option<String>,
+    /// Maximum output tokens (omitted by default → model/router uses its own)
+    #[arg(long = "max-tokens")]
+    max_tokens: Option<String>,
+    /// Attach a file/image (repeatable); local path or http(s) URL. One-shot only.
+    #[arg(long = "file")]
+    file: Vec<String>,
+}
+
+impl From<RouterChatArgs> for ChatOptions {
+    fn from(a: RouterChatArgs) -> Self {
+        ChatOptions {
+            model: Some(a.model),
+            system_prompt: a.system_prompt,
+            system_prompt_file: a.system_prompt_file,
+            max_tokens: a.max_tokens,
+            files: a.file,
+            responses: false,
+            resume: None,
+            tool_ids: Vec::new(),
+            verify_tool_firing: None,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ChatCommand {
     /// List existing jarvice chat threads (id/title/last-updated) — including
     /// threads created from jarvice's own web UI, since both share the same
-    /// storage. Always lists jarvice's threads; doesn't take `--responses`.
+    /// storage. Always lists jarvice's threads.
     List,
+}
+
+#[derive(Subcommand)]
+enum RouterCommands {
+    /// Chat via OpenAI-compatible `/v1/chat/completions`
+    Chat(RouterChatArgs),
 }
 
 #[derive(Subcommand)]
@@ -380,8 +424,8 @@ enum ImageCommands {
 enum ModelCommands {
     /// [Deprecated] Use `monocle models` instead
     List,
-    /// [Deprecated] Use `monocle chat` instead
-    Chat(ChatArgs),
+    /// [Deprecated] Use `monocle router chat` instead
+    Chat(RouterChatArgs),
 }
 
 fn main() {
@@ -416,6 +460,9 @@ fn main() {
             Some(ChatCommand::List) => chat_list_command(&client, &creds),
             None => chat_command(&client, &creds, args.into()),
         },
+        Commands::Router { command } => match command {
+            RouterCommands::Chat(args) => chat_command(&client, &creds, args.into()),
+        },
         Commands::Agent {
             prompt,
             workdir,
@@ -446,7 +493,7 @@ fn main() {
                 }
                 ModelCommands::Chat(args) => {
                     eprintln!(
-                        "Warning: `monocle model chat` is deprecated. Use `monocle chat` instead."
+                    "Warning: `monocle model chat` is deprecated. Use `monocle router chat` instead."
                     );
                     chat_command(&client, &creds, args.into())
                 }
@@ -631,6 +678,36 @@ mod tests {
                 assert_eq!(args.resume.as_deref(), Some("abc-123"));
             }
             _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_uses_responses_by_default_and_keeps_flag_compatible() {
+        let cli = Cli::parse_from(["monocle", "chat"]);
+        match cli.command {
+            Commands::Chat { args, .. } => assert!(ChatOptions::from(args).responses),
+            _ => panic!("expected Chat command"),
+        }
+
+        let cli = Cli::parse_from(["monocle", "chat", "--responses"]);
+        match cli.command {
+            Commands::Chat { args, .. } => assert!(ChatOptions::from(args).responses),
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn router_chat_selects_openai_compatible_path() {
+        let cli = Cli::parse_from(["monocle", "router", "chat", "--model", "gpt-4o"]);
+        match cli.command {
+            Commands::Router {
+                command: RouterCommands::Chat(args),
+            } => {
+                let options = ChatOptions::from(args);
+                assert_eq!(options.model.as_deref(), Some("gpt-4o"));
+                assert!(!options.responses);
+            }
+            _ => panic!("expected Router chat command"),
         }
     }
 }

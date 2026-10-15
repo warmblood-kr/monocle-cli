@@ -33,16 +33,15 @@ pub struct ChatOptions {
     pub max_tokens: Option<String>,
     /// `--file <PATH|URL>` values (repeatable), one-shot only.
     pub files: Vec<String>,
-    /// `--responses`: talk to jarvice's `/api/responses` (server-managed
-    /// thread) instead of the plain `/v1/chat/completions` path.
+    /// Route this invocation through jarvice's server-managed Responses API.
     pub responses: bool,
-    /// `--resume <ID>`: continue an existing `--responses` thread.
+    /// `--resume <ID>`: continue an existing server-managed thread.
     pub resume: Option<String>,
-    /// `--tool-ids <id,...>`: with `--responses`, MCP/connected-app server
+    /// `--tool-ids <id,...>`: MCP/connected-app server
     /// ids to activate for this turn (jarvice's `ResponseRequest.tools`).
     pub tool_ids: Vec<String>,
-    /// `--verify-tool-firing[=<tool>]`: with `--responses`, assert from the
-    /// server's `tools_used` that a tool actually ran, as an exit code.
+    /// `--verify-tool-firing[=<tool>]`: assert from the server's `tools_used`
+    /// that a tool actually ran, as an exit code.
     /// `None` = flag absent. One-shot only.
     pub verify_tool_firing: Option<ToolFiringExpectation>,
 }
@@ -295,7 +294,7 @@ fn dispatch_chat_command(
 
 pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
     if options.verify_tool_firing.is_some() && !options.responses {
-        eprintln!("--verify-tool-firing requires --responses (server-executed tools are only observable there)");
+        eprintln!("--verify-tool-firing requires Jarvice Responses (server-executed tools are only observable there)");
         std::process::exit(1);
     }
     if options.responses {
@@ -305,7 +304,7 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
     }
 }
 
-/// The default path: a stateless `/v1/chat/completions` call per turn, with
+/// The Router path: a stateless `/v1/chat/completions` call per turn, with
 /// this REPL accumulating the growing conversation itself (see `convo` below)
 /// and resending it in full each turn.
 fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
@@ -782,7 +781,7 @@ fn tool_firing_verification(
     }
 }
 
-/// `--responses`: jarvice's `/api/responses` (see `responses_api` module
+/// Jarvice's `/api/responses` (see `responses_api` module
 /// docs). The server owns the conversation thread — this REPL only tracks
 /// the `thread_id` to pass on the next turn, never a local message history.
 ///
@@ -797,22 +796,22 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         .to_string();
 
     if options.max_tokens.is_some() {
-        eprintln!("⚠ --max-tokens is ignored with --responses (jarvice's Responses API has no such field)");
+        eprintln!("⚠ --max-tokens is ignored with Jarvice Responses (the API has no such field)");
     }
     if options.system_prompt.is_some() || options.system_prompt_file.is_some() {
-        eprintln!("⚠ --system-prompt/--system-prompt-file is ignored with --responses (the endpoint has no generic system-prompt field, only a voice-mode speech_system_context)");
+        eprintln!("⚠ --system-prompt/--system-prompt-file is ignored with Jarvice Responses (the endpoint has no generic system-prompt field, only a voice-mode speech_system_context)");
     }
 
     let stdin_is_tty = std::io::stdin().is_terminal();
     if !options.files.is_empty() && stdin_is_tty {
         eprintln!(
-            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle chat --responses --file photo.png"
+            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle chat --file photo.png"
         );
         std::process::exit(1);
     }
     if options.verify_tool_firing.is_some() && stdin_is_tty {
         eprintln!(
-            "--verify-tool-firing requires piped input. Pipe a tool-triggering prompt, e.g.:\n  echo \"search the web for today's date\" | monocle chat --responses --verify-tool-firing"
+            "--verify-tool-firing requires piped input. Pipe a tool-triggering prompt, e.g.:\n  echo \"search the web for today's date\" | monocle chat --verify-tool-firing"
         );
         std::process::exit(1);
     }
