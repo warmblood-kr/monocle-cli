@@ -49,12 +49,15 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 
 | Command | Description |
 |---------|-------------|
-| `monocle login [--tenant <domain>] [--device-code]` | Sign in |
+| `monocle login [--tenant <domain>] [--env <prod\|stg\|local>] [--device-code]` | Sign in to the selected profile/environment slot |
+| `monocle --profile <name> [--env <env>] <command>` | Select a saved profile and, when specified, its separate environment credential slot |
+| `monocle profile list` / `show [name]` / `use <name>` | List connections, inspect profile/environment, or set the default profile |
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle models` | List available models (with modality) |
 | `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--tool-ids <id,...>` (with `--responses`) activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (with `--responses`, one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine) |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
+| `monocle handoff [<thread-id>] [--yes]` | Confirm and pass one existing hosted Chat thread to Claude Code; non-interactive use requires a thread ID and `--yes` |
 | `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
 | `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
 | `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
@@ -67,6 +70,10 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle upgrade [--check]` | Update monocle to the latest release (`--check` only reports current vs latest) |
 | `monocle agent [prompt] [--workdir <dir>] [--model <id>] [--max-steps <n>] [--session <name>] [--auto-approve]` | **Experimental.** Headless agent loop with tools (read/write/edit + shell) |
 | `monocle acp` | **Experimental.** Run as an [ACP](https://agentclientprotocol.com) agent over stdio (for editors / desktop / Craft) |
+
+Profile selection is consistent across authenticated commands. `--profile` takes precedence over `MONOCLE_PROFILE`, then the saved default, then `default`. Each profile remembers its environment; `--env` selects a separate credential slot without replacing another environment's session. The default profile continues to use the existing `~/.monocle/credentials.json` when it matches the saved or inferred environment.
+
+`monocle handoff` reads one authorized hosted Chat thread using the selected profile, confirms the tenant and message count, and gives Claude Code a temporary private transcript. The transcript is removed when Claude Code exits. The command does not change the hosted conversation.
 
 ## 💬 Chat with models
 

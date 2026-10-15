@@ -97,3 +97,34 @@ fn reads_credentials_written_by_typescript_cli() {
     // Existing users must not have to re-auth.
     assert_eq!(creds.read().unwrap(), sample());
 }
+
+#[test]
+fn profile_environment_slots_never_overwrite_each_other_or_legacy_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = Credentials::with_home(dir.path());
+    legacy.write(&sample()).unwrap();
+
+    let prod = Credentials::for_profile(dir.path(), "warmblood", "prod", false);
+    let stg = Credentials::for_profile(dir.path(), "warmblood", "stg", false);
+    let mut prod_data = sample();
+    prod_data.access_token = "prod-token".into();
+    let mut stg_data = sample();
+    stg_data.access_token = "stg-token".into();
+    prod.write(&prod_data).unwrap();
+    stg.write(&stg_data).unwrap();
+
+    assert_ne!(prod.path(), stg.path());
+    assert_eq!(prod.read().unwrap().access_token, "prod-token");
+    assert_eq!(stg.read().unwrap().access_token, "stg-token");
+    assert_eq!(legacy.read().unwrap(), sample());
+}
+
+#[test]
+fn default_profile_can_continue_using_legacy_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = Credentials::with_home(dir.path());
+    let selected = Credentials::for_profile(dir.path(), "default", "prod", true);
+    assert_eq!(selected.path(), legacy.path());
+    selected.write(&sample()).unwrap();
+    assert_eq!(legacy.read(), Some(sample()));
+}

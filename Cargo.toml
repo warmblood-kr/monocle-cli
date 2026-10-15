@@ -53,15 +53,14 @@ semver = "1"
 self-replace = "1"
 flate2 = "1"
 tar = "0.4"
+# Private temporary transcript files for the read-only Chat handoff.
+tempfile = "3"
 
 # `zip` is only needed to unpack the windows `.zip` asset — gate it to windows so
 # the unix build (which uses tar.gz) doesn't pull it in. Trim default features to
 # the deflate codec used by the release zips.
 [target.'cfg(windows)'.dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 strip = true

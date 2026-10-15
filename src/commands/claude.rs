@@ -24,7 +24,7 @@ pub fn claude_command(creds: &Credentials, args: &[String]) {
     // costs (a user `--model` flag still wins, since the CLI flag outranks the
     // settings field).
     let inline_settings = json!({
-        "apiKeyHelper": "monocle token",
+        "apiKeyHelper": creds.token_helper(),
         "model": "sonnet[1m]",
     })
     .to_string();

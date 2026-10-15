@@ -250,6 +250,7 @@ fn handle_diag_toggle(
             *always_on = value;
             if let Err(e) = cfg.write(&ConfigData {
                 diag_always_on: value,
+                ..ConfigData::default()
             }) {
                 eprintln!("Warning: failed to save diagnostics preference: {e}");
             }
@@ -587,9 +588,19 @@ fn resolve_jarvice(client: &Client, creds: &Credentials) -> Result<(AuthSession,
 /// (id/title/last-updated) and exit. Always jarvice's thread storage — there
 /// is nothing else to list in the plain completions mode, so this never takes
 /// a `--responses` flag.
-pub fn chat_list_command(client: &Client, creds: &Credentials) -> Result<()> {
+pub fn chat_list_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &crate::profiles::Selection,
+) -> Result<()> {
     let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
     let threads = crate::jarvice_chats::list_threads(client, &jarvice_url, &bearer)?;
+    eprintln!(
+        "Profile: {} ({}) — tenant {}",
+        selection.profile,
+        selection.environment,
+        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+    );
     print_threads_table(&threads);
     Ok(())
 }
