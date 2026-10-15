@@ -6,7 +6,7 @@ Status: implementation design for epic #1071 and stories #1072/#1073, targeting 
 
 A **profile** is a named saved connection and credential slot, for example `warmblood` or `warmblood-stg`. Its **environment** is the Monocle deployment it targets: `prod`, `stg`, or `local`. Profile names and environment values are separate; `--env stg` remains an environment selector and is not a profile alias. Each profile stores its own environment and credentials.
 
-Epic #1071 lives in `warmblood-kr/monocle`; this implementation belongs in the linked TypeScript `warmblood-kr/monocle-cli` repo. Its linked issue #340 describes the Rust CLI's single-file overwrite hazard. This TypeScript change will not claim to fix that Rust implementation or create a duplicate security issue. It will maintain the existing TS credential file contract, isolate named profiles, and retain restrictive permissions.
+Epic #1071 lives in `warmblood-kr/monocle`; this implementation belongs in the linked TypeScript `warmblood-kr/monocle-cli` repo. The TypeScript repository evidence is `package.json` (`@warmblood/monocle-cli`, Node >=18, Commander) plus `src/cli.ts` and `src/commands/*`; linked issue #340 instead cites Rust paths and the Rust CLI's single-file overwrite hazard. This TypeScript change will not claim to fix that Rust implementation or create a duplicate security issue. It will maintain the existing TS credential file contract, isolate named profiles, and retain restrictive permissions.
 
 ## Selection and precedence
 
@@ -40,6 +40,19 @@ The default profile keeps using `~/.monocle/credentials.json`, with the existing
 
 There is no destructive migration. The legacy file is the `default` profile. First use leaves it in place. Named login writes only that profile. No automatic relocation, aliasing, or fallback from named profiles to legacy credentials occurs. This avoids invalidating deployed `monocle token` helpers and honors #340's backward-compatibility constraint without claiming its Rust-side migration is complete.
 
+## First-party CLI roadmap boundary
+
+The current package already supports OIDC login, token/status/setup/Claude Code helpers, and direct Monocle router model listing and chat (`model list` and `model chat`). Profiles and hosted Chat history handoff are the center-first slice in #1071. The current direct router wrapper remains available for compatibility while the product surface is organized as a first-party application client.
+
+Keep subsequent product work in separate candidate epics/stories, in this order:
+
+1. **Router command organization:** place the legacy direct API wrapper under `monocle router` and retain existing commands as backward-compatible aliases. This is a CLI structure change; it does not add router capabilities by itself.
+2. **Chat history, MCP, and custom models:** build on the hosted Chat API and define supported MCP and custom model workflows with their own authorization and compatibility reviews.
+3. **Scheduled tasks, file drive, and Craft:** scope each integration independently after its APIs, tenant boundaries, and user consent flows are known.
+4. **Admin:** security-evaluation work only until safe authorization boundaries and least-privilege operations are proven; do not include administrative capabilities in the current epic.
+
+These are recommendations for later issue creation and are not implementation requirements or a scope expansion for #1071. No issues for the later candidates are created by this PR.
+
 ## Command coverage
 
 The global selector is available before any subcommand, and auth-bearing commands also accept it after the command for shell convenience: `login`, `token`, `status`, `setup`, `model list`, `model chat`, `claude`, and `handoff`. Add `profile list` and `profile show [name]` for discovery and environment confirmation. `profile use NAME` sets the default. `unset` remains global because it removes global Claude Code routing; it does not read or delete credentials.
@@ -63,3 +76,7 @@ Claude Code runs in the current working directory, with the same profile-scoped 
 ## Minimum delivery and deferred work
 
 Deliver named profile/environment config and path isolation, flag/environment/default precedence, default-profile compatibility, global and local command selection including token/Claude Code, profile list/show, status display, selected-chat list/detail/confirm, temporary read-only transcript handoff, docs, and tests. Defer profile deletion/rename, persistent transcript exports, hosted Chat mutation, and any migration of the separate Rust CLI in #340. No staging or production deployment is included.
+
+## Release and validation path
+
+This repository publishes the npm package `@warmblood/monocle-cli`; `.github/workflows/publish.yml` runs lint, tests, build, and an npm dry run on a GitHub Release, then publishes through the `npm-production` environment. The package has no staging deployment target. Review and CI on the PR, followed by local/CI tests and an npm package dry run, are the available pre-release validation channels. A package install from a preview artifact could be used for manual validation if configured, but this PR does not publish a package or deploy anywhere. A later release requires the normal release decision and must not be treated as a staging rollout.
