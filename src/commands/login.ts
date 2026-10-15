@@ -4,6 +4,7 @@ import { Credentials, CredentialsData } from '../credentials';
 import { generateCodeVerifier, generateCodeChallenge, generateState, discoverOIDC, resolveStarkDomain, STARK_DOMAINS, OIDCDeps } from '../oidc';
 import { decodeIdTokenPayload } from '../refresh';
 import { c } from '../colors';
+import { Profiles, MonocleEnvironment, parseMonocleEnvironment } from '../profiles';
 
 const CLIENT_ID = 'monocle-cli';
 const SCOPES = 'openid profile email';
@@ -12,12 +13,16 @@ const BROWSER_CALLBACK_TIMEOUT_MS = 90_000;
 
 export interface LoginOptions {
   tenantDomain?: string;
-  env?: string;
+  env?: MonocleEnvironment;
   deviceCode?: boolean;
+  profile?: string;
+  force?: boolean;
 }
 
 export interface LoginDeps {
   credentials?: Credentials;
+  profiles?: Profiles;
+  recordProfileEnvironment?: boolean;
   fetch?: (url: string, init?: any) => Promise<{ ok: boolean; status: number; json: () => Promise<any> }>;
   openBrowser?: (url: string) => Promise<void>;
   createServer?: (handler: (req: http.IncomingMessage, res: http.ServerResponse) => void) => {
@@ -68,33 +73,56 @@ function detectHeadless(options: LoginOptions): boolean {
 }
 
 export async function loginCommand(options: LoginOptions, deps?: LoginDeps): Promise<void> {
+  const credentials = deps?.credentials ?? new Credentials({ profile: options.profile });
+  const profiles = deps?.profiles ?? new Profiles();
+  const profileName = credentials.getProfileName?.() ?? options.profile ?? 'default';
+  const existing = credentials.read();
+  if (options.env && existing && !options.force) {
+    const requestedEnvironment = parseMonocleEnvironment(options.env);
+    const storedEnvironment = profiles.getEnvironment(profileName, existing.tenant_domain);
+    if (requestedEnvironment !== storedEnvironment) {
+      throw new Error(
+        `Profile "${profileName}" currently contains a ${storedEnvironment} login. ` +
+        `Use a separate profile for ${requestedEnvironment}, or pass --force to replace this profile's credentials.`,
+      );
+    }
+  }
+  const loginDeps: LoginDeps = {
+    ...deps,
+    credentials,
+    profiles,
+    recordProfileEnvironment: !deps?.credentials || Boolean(deps?.profiles),
+  };
   if (detectHeadless(options)) {
-    return deviceCodeLogin(options, deps);
+    return deviceCodeLogin(options, loginDeps);
   }
 
   // Ambiguous environment: try browser flow, fall back to device code if:
   //   - openBrowser exec fails (command not found, non-zero exit)
   //   - callback not received within BROWSER_CALLBACK_TIMEOUT_MS
   try {
-    return await browserCodeLogin(options, deps);
+    return await browserCodeLogin(options, loginDeps);
   } catch (err) {
     if (err instanceof BrowserFlowUnavailableError) {
       process.stderr.write(`\nBrowser flow unavailable: ${err.message}\nFalling back to device code...\n\n`);
-      return deviceCodeLogin(options, deps);
+      return deviceCodeLogin(options, loginDeps);
     }
     throw err;
   }
 }
 
 async function browserCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise<void> {
-  const credentials = deps?.credentials ?? new Credentials();
+  const credentials = deps?.credentials ?? new Credentials({ profile: options.profile });
+  const profiles = deps?.profiles ?? new Profiles();
   const fetchFn = deps?.fetch ?? globalThis.fetch;
   const openBrowser = deps?.openBrowser ?? defaultOpenBrowser;
   const createServerFn = deps?.createServer ?? ((handler: any) => http.createServer(handler) as any);
   const timeoutMs = deps?.browserCallbackTimeoutMs ?? BROWSER_CALLBACK_TIMEOUT_MS;
 
   // Step 1: OIDC Discovery
-  const env = options.env ?? 'prod';
+  const profileName = credentials.getProfileName?.() ?? options.profile ?? 'default';
+  const fallbackEnv = profiles.getEnvironment(profileName, credentials.read()?.tenant_domain);
+  const env = options.env ? parseMonocleEnvironment(options.env) : fallbackEnv;
   const starkDomain = options.tenantDomain
     ? resolveStarkDomain(options.tenantDomain)
     : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
@@ -219,6 +247,7 @@ async function browserCodeLogin(options: LoginOptions, deps?: LoginDeps): Promis
           };
 
           credentials.write(creds);
+          if (deps?.recordProfileEnvironment ?? true) profiles.setEnvironment(profileName, env);
 
           // Step 10: Send success response and close server
           res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -393,11 +422,14 @@ export async function pollForToken(
 }
 
 async function deviceCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise<void> {
-  const credentials = deps?.credentials ?? new Credentials();
+  const credentials = deps?.credentials ?? new Credentials({ profile: options.profile });
+  const profiles = deps?.profiles ?? new Profiles();
   const fetchFn = deps?.fetch ?? globalThis.fetch;
 
   // Step 1: OIDC Discovery
-  const env = options.env ?? 'prod';
+  const profileName = credentials.getProfileName?.() ?? options.profile ?? 'default';
+  const fallbackEnv = profiles.getEnvironment(profileName, credentials.read()?.tenant_domain);
+  const env = options.env ? parseMonocleEnvironment(options.env) : fallbackEnv;
   const starkDomain = options.tenantDomain
     ? resolveStarkDomain(options.tenantDomain)
     : STARK_DOMAINS[env] ?? STARK_DOMAINS.prod;
@@ -481,6 +513,7 @@ async function deviceCodeLogin(options: LoginOptions, deps?: LoginDeps): Promise
   };
 
   credentials.write(creds);
+  if (deps?.recordProfileEnvironment ?? true) profiles.setEnvironment(profileName, env);
   process.stderr.write(`\n${c.green('✓')} Logged in as ${c.bold(email)} ${c.dim(`(${tenantName})`)}\n`);
   process.stderr.write(`\n${c.dim('Launch Claude Code through Monocle with:')} ${c.bold('monocle claude')}\n`);
   process.stderr.write(`${c.dim('(To route plain')} ${c.bold('claude')} ${c.dim('globally through Monocle, run')} ${c.bold('monocle setup')}${c.dim('.)')}\n`);

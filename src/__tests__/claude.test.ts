@@ -109,7 +109,7 @@ describe('claudeCommand', () => {
     const callArgs = spawnFn.mock.calls[0][1] as string[];
     expect(callArgs[0]).toBe('--settings');
     const parsed = JSON.parse(callArgs[1]);
-    expect(parsed.apiKeyHelper).toBe('monocle token');
+    expect(parsed.apiKeyHelper).toBe('monocle token --profile default');
     expect(callArgs.slice(2)).toEqual(['--model', 'opus']);
   });
 

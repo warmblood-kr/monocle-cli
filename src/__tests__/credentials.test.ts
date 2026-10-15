@@ -65,6 +65,29 @@ describe('Credentials', () => {
     expect(mockModes[filePath]).toBe(0o600);
   });
 
+  it('stores named profile credentials separately from the legacy default file', () => {
+    const defaultCredentials = createCredentials();
+    const namedCredentials = new Credentials({
+      homedir: () => '/fakehome',
+      profile: 'client-b',
+      existsSync: (p: string) => p in mockFs,
+      readFileSync: (p: string) => mockFs[p],
+      writeFileSync: (p: string, data: string) => { mockFs[p] = data; },
+      mkdirSync: () => undefined,
+      chmodSync: (p: string, mode: number) => { mockModes[p] = mode; },
+      unlinkSync: (p: string) => { delete mockFs[p]; },
+      statSync: (p: string) => ({ mode: (mockModes[p] ?? 0o644) | 0o100000 }) as any,
+    });
+    defaultCredentials.write(sampleCredentials);
+    namedCredentials.write({ ...sampleCredentials, tenant_domain: 'other.stark.com' });
+
+    expect(defaultCredentials.getCredentialsPath()).toBe('/fakehome/.monocle/credentials.json');
+    expect(namedCredentials.getCredentialsPath()).toBe('/fakehome/.monocle/profiles/client-b/credentials.json');
+    expect(defaultCredentials.read()?.tenant_domain).toBe('test.stark.com');
+    expect(namedCredentials.read()?.tenant_domain).toBe('other.stark.com');
+    expect(mockModes[namedCredentials.getCredentialsPath()]).toBe(0o600);
+  });
+
   it('returns null and warns on JSON parse failure', () => {
     const creds = createCredentials();
     const filePath = creds.getCredentialsPath();

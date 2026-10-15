@@ -18,8 +18,8 @@ afterEach(() => {
   process.env = { ...originalEnv };
 });
 
-function createMockCredentials() {
-  let stored: CredentialsData | null = null;
+function createMockCredentials(initial: CredentialsData | null = null) {
+  let stored: CredentialsData | null = initial;
   return {
     instance: {
       read: () => stored,
@@ -63,6 +63,20 @@ function createMockFetch() {
 }
 
 describe('loginCommand', () => {
+  it('refuses to overwrite a production profile with staging credentials unless forced', async () => {
+    const production: CredentialsData = {
+      tenant_domain: 'warmblood.monocle-ai.com', tenant_name: 'Warmblood', email: 'user@example.com',
+      access_token: 'prod-access', refresh_token: 'prod-refresh', id_token: 'prod-id',
+      access_token_expires_at: '2026-12-01T00:00:00.000Z', refresh_token_expires_at: '2026-12-30T00:00:00.000Z',
+    };
+    const { instance, getStored } = createMockCredentials(production);
+    const fetch = vi.fn();
+    await expect(loginCommand({ env: 'stg' }, { credentials: instance, fetch: fetch as any }))
+      .rejects.toThrow(/currently contains a prod login/);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(getStored()).toEqual(production);
+  });
+
   it('completes full OIDC flow via mock server', async () => {
     const { instance, getStored } = createMockCredentials();
     const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);

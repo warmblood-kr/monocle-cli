@@ -3,12 +3,13 @@ import { Credentials } from '../credentials';
 
 export interface ClaudeDeps {
   credentials?: Credentials;
+  profile?: string;
   env?: Record<string, string | undefined>;
   spawn?: typeof child_process.spawn;
 }
 
 export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<void> {
-  const credentials = deps?.credentials ?? new Credentials();
+  const credentials = deps?.credentials ?? new Credentials({ profile: deps?.profile });
   const parentEnv = deps?.env ?? process.env;
   const spawnFn = deps?.spawn ?? child_process.spawn;
 
@@ -31,7 +32,7 @@ export async function claudeCommand(args: string[], deps?: ClaudeDeps): Promise<
   // Inline settings scoped to this child only — avoids mutating ~/.claude/settings.json.
   // `apiKeyHelper` keeps tokens fresh across long sessions by re-invoking `monocle token`.
   const inlineSettings = JSON.stringify({
-    apiKeyHelper: 'monocle token',
+    apiKeyHelper: `monocle token --profile ${credentials.getProfileName?.() ?? 'default'}`,
   });
 
   // Build child env — strip conflicting vars, inject base URL.

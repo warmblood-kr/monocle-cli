@@ -41,7 +41,7 @@ describe('setupCommand', () => {
     });
 
     const settings = JSON.parse(written);
-    expect(settings.apiKeyHelper).toBe('monocle token');
+    expect(settings.apiKeyHelper).toBe('monocle token --profile default');
     expect(settings.env.ANTHROPIC_BASE_URL).toBe('https://api.monocle-ai.com');
     stderrSpy.mockRestore();
   });
@@ -66,7 +66,7 @@ describe('setupCommand', () => {
     const settings = JSON.parse(written);
     expect(settings.existingKey).toBe('value');
     expect(settings.env.SOME_VAR).toBe('keep_me');
-    expect(settings.apiKeyHelper).toBe('monocle token');
+    expect(settings.apiKeyHelper).toBe('monocle token --profile default');
     expect(settings.env.ANTHROPIC_BASE_URL).toBe('https://api.monocle-ai.com');
     stderrSpy.mockRestore();
   });
@@ -105,7 +105,7 @@ describe('setupCommand', () => {
     });
 
     const settings = JSON.parse(written);
-    expect(settings.apiKeyHelper).toBe('monocle token');
+    expect(settings.apiKeyHelper).toBe('monocle token --profile default');
     stderrSpy.mockRestore();
   });
 

@@ -36,7 +36,7 @@ To route plain `claude` (including IDE integrations and every other terminal) th
 monocle setup
 ```
 
-This writes `apiKeyHelper: "monocle token"` into `~/.claude/settings.json`. Claude Code then calls `monocle token` to fetch a fresh access token per request.
+This writes a profile-scoped `apiKeyHelper` into `~/.claude/settings.json`. Claude Code then calls `monocle token --profile <name>` to fetch a fresh access token for the selected profile per request, even if the parent shell's `MONOCLE_PROFILE` changes.
 
 Undo at any time:
 

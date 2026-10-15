@@ -37,6 +37,21 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
+| `monocle profile list` / `profile show [name]` / `profile use <name>` | List, inspect, or choose profiles |
+| `monocle handoff [chat-id] [--yes]` | Select one hosted Chat conversation and hand it to Claude Code |
+
+Select a saved Monocle login with `--profile` or `MONOCLE_PROFILE`. A command-line value takes precedence over the environment variable, then `~/.monocle/config.json`'s default, then `default`:
+
+```bash
+monocle --profile work status
+monocle login --tenant acme.monocle-ai.com --profile work --env prod
+monocle model list --profile work
+MONOCLE_PROFILE=work monocle model chat
+monocle profile use work
+monocle profile show work
+```
+
+`--profile` names a saved connection; its environment is `prod`, `stg`, or `local`. `login --env` chooses the OIDC environment for that login and updates the selected profile's environment. Without `--env`, login reuses the selected profile's saved environment. A login that would replace an existing profile's different environment is rejected; use another profile to keep both sessions, or pass `--force` to intentionally replace the selected profile. The `default` profile continues to use `~/.monocle/credentials.json`; named profiles use `~/.monocle/profiles/<name>/credentials.json`. Credentials are stored separately from `~/.monocle/config.json` and are written with private file permissions. Commands fail if the selected profile is not logged in instead of borrowing another profile's credentials.
 
 ## 💬 Chat with models
 
@@ -67,6 +82,8 @@ Hello! How can I help you today?
 > /quit
 Bye.
 ```
+
+`monocle handoff` lists saved hosted Monocle Chat conversations for the selected profile. Choose one conversation, review its title and message count, and confirm before opening Claude Code. To use it in a script, provide a chat ID and `--yes`. The CLI reads only the selected conversation and passes a temporary, private transcript file to Claude Code; it does not edit or save the server chat. Non-text attachments are marked as omitted from the transcript.
 
 One-shot via stdin:
 

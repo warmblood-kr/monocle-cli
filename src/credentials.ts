@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { Profiles, profileCredentialsPath } from './profiles';
 
 export interface CredentialsData {
   tenant_domain: string;
@@ -16,9 +17,11 @@ export interface CredentialsData {
 
 export interface CredentialsDeps {
   homedir?: () => string;
+  profile?: string;
+  env?: Record<string, string | undefined>;
   readFileSync?: (path: string, encoding: BufferEncoding) => string;
   writeFileSync?: (path: string, data: string, options?: fs.WriteFileOptions) => void;
-  mkdirSync?: (path: string, options?: { recursive?: boolean }) => string | undefined;
+  mkdirSync?: (path: string, options?: { recursive?: boolean; mode?: number }) => string | undefined;
   chmodSync?: (path: string, mode: fs.Mode) => void;
   unlinkSync?: (path: string) => void;
   existsSync?: (path: string) => boolean;
@@ -27,6 +30,8 @@ export interface CredentialsDeps {
 
 const defaultDeps: Required<CredentialsDeps> = {
   homedir: () => os.homedir(),
+  profile: undefined as any,
+  env: process.env,
   readFileSync: fs.readFileSync as any,
   writeFileSync: fs.writeFileSync as any,
   mkdirSync: fs.mkdirSync as any,
@@ -38,17 +43,23 @@ const defaultDeps: Required<CredentialsDeps> = {
 
 export class Credentials {
   private deps: Required<CredentialsDeps>;
+  private profile: string;
 
   constructor(deps?: CredentialsDeps) {
-    this.deps = { ...defaultDeps, ...deps };
+    this.deps = { ...defaultDeps, ...deps } as Required<CredentialsDeps>;
+    this.profile = new Profiles({ homedir: this.deps.homedir, env: this.deps.env }).resolve(deps?.profile);
   }
 
   getCredentialsPath(): string {
-    return path.join(this.deps.homedir(), '.monocle', 'credentials.json');
+    return profileCredentialsPath(this.profile, this.deps.homedir());
   }
 
   getCredentialsDir(): string {
-    return path.join(this.deps.homedir(), '.monocle');
+    return path.dirname(this.getCredentialsPath());
+  }
+
+  getProfileName(): string {
+    return this.profile;
   }
 
   read(): CredentialsData | null {
@@ -69,7 +80,8 @@ export class Credentials {
     const dir = this.getCredentialsDir();
     const filePath = this.getCredentialsPath();
 
-    this.deps.mkdirSync(dir, { recursive: true });
+    this.deps.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    this.deps.chmodSync(dir, 0o700);
     this.deps.writeFileSync(filePath, JSON.stringify(data, null, 2), { mode: 0o600 });
     this.deps.chmodSync(filePath, 0o600);
   }

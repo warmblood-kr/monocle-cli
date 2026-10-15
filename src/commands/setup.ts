@@ -45,7 +45,7 @@ export async function setupCommand(deps?: SetupDeps): Promise<void> {
   }
 
   // Step 3: Set apiKeyHelper
-  settings.apiKeyHelper = 'monocle token';
+  settings.apiKeyHelper = `monocle token --profile ${credentials.getProfileName?.() ?? 'default'}`;
 
   // Step 4: Set ANTHROPIC_BASE_URL in env
   if (!settings.env) {
@@ -69,7 +69,7 @@ export async function setupCommand(deps?: SetupDeps): Promise<void> {
 
   // Step 6: Success message
   process.stderr.write(`${c.green('✓')} Claude Code configured to use Monocle authentication\n`);
-  process.stderr.write(`  ${c.dim('apiKeyHelper:')}       monocle token\n`);
+  process.stderr.write(`  ${c.dim('apiKeyHelper:')}       ${settings.apiKeyHelper}\n`);
   process.stderr.write(`  ${c.dim('ANTHROPIC_BASE_URL:')} ${routerUrl}\n`);
 
   // Step 7: Warn about conflicting env vars

@@ -2,9 +2,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { Credentials } from '../credentials';
+import { Profiles } from '../profiles';
 
 export interface StatusDeps {
   credentials?: Credentials;
+  profiles?: Profiles;
   homedir?: () => string;
   readFileSync?: (path: string, encoding: BufferEncoding) => string;
   existsSync?: (path: string) => boolean;
@@ -13,6 +15,7 @@ export interface StatusDeps {
 
 export async function statusCommand(deps?: StatusDeps): Promise<void> {
   const credentials = deps?.credentials ?? new Credentials();
+  const profiles = deps?.profiles ?? new Profiles();
   const homedir = deps?.homedir ?? (() => os.homedir());
   const readFileSyncFn = deps?.readFileSync ?? ((p: string, e: BufferEncoding) => fs.readFileSync(p, e));
   const existsSyncFn = deps?.existsSync ?? fs.existsSync;
@@ -20,6 +23,9 @@ export async function statusCommand(deps?: StatusDeps): Promise<void> {
 
   // Step 1: Read credentials
   const creds = credentials.read();
+  const profileName = credentials.getProfileName?.() ?? profiles.resolve();
+  process.stderr.write(`Profile: ${profileName}\n`);
+  process.stderr.write(`Environment: ${profiles.getEnvironment(profileName, creds?.tenant_domain)}\n`);
   if (!creds) {
     process.stderr.write('Not logged in.\n');
     return;
@@ -57,7 +63,7 @@ export async function statusCommand(deps?: StatusDeps): Promise<void> {
     if (existsSyncFn(settingsPath)) {
       const content = readFileSyncFn(settingsPath, 'utf-8');
       const settings = JSON.parse(content);
-      claudeConfigured = settings.apiKeyHelper === 'monocle token';
+      claudeConfigured = /^monocle token(?: --profile [A-Za-z0-9._-]+)?$/.test(settings.apiKeyHelper ?? '');
     }
   } catch {
     // ignore
