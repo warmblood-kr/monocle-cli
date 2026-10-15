@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::error::{AppError, Result};
 use crate::net::Client;
@@ -42,7 +43,22 @@ pub struct MessageNode {
     #[serde(rename = "parentId")]
     pub parent_id: Option<String>,
     pub role: String,
+    #[serde(deserialize_with = "deserialize_message_content")]
     pub content: String,
+    /// Server-side file/image attachment metadata. Handoff never fetches or
+    /// includes the attachment payload; it emits a marker when files exist.
+    #[serde(default)]
+    pub files: Vec<Value>,
+}
+
+fn deserialize_message_content<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::String(content) => Ok(content),
+        _ => Ok("[Non-text message content omitted]".to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -81,9 +97,8 @@ pub fn list_threads(client: &Client, jarvice_url: &str, bearer: &str) -> Result<
     )?;
     if !resp.ok() {
         return Err(AppError::new(format!(
-            "API error {}: {}",
-            resp.status,
-            resp.text()
+            "Hosted Chat API returned HTTP {}.",
+            resp.status
         )));
     }
     resp.json()
@@ -102,9 +117,8 @@ pub fn get_thread(
     )?;
     if !resp.ok() {
         return Err(AppError::new(format!(
-            "API error {}: {}",
-            resp.status,
-            resp.text()
+            "Hosted Chat API returned HTTP {}.",
+            resp.status
         )));
     }
     let parsed: ChatDetailResponse = resp.json()?;
@@ -125,8 +139,12 @@ pub fn linearize<'a>(
     current_id: &str,
 ) -> Vec<&'a MessageNode> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut cursor = Some(current_id.to_string());
     while let Some(id) = cursor {
+        if !seen.insert(id.clone()) {
+            break;
+        }
         match messages.get(&id) {
             Some(node) => {
                 cursor = node.parent_id.clone();
@@ -149,6 +167,7 @@ mod tests {
             parent_id: parent.map(str::to_string),
             role: role.to_string(),
             content: content.to_string(),
+            files: Vec::new(),
         }
     }
 
@@ -187,5 +206,13 @@ mod tests {
     fn linearize_empty_when_current_id_missing() {
         let messages: HashMap<String, MessageNode> = HashMap::new();
         assert!(linearize(&messages, "does-not-exist").is_empty());
+    }
+
+    #[test]
+    fn linearize_stops_on_a_malformed_parent_cycle() {
+        let mut messages = HashMap::new();
+        messages.insert("a".to_string(), node("a", Some("b"), "user", "one"));
+        messages.insert("b".to_string(), node("b", Some("a"), "assistant", "two"));
+        assert_eq!(linearize(&messages, "a").len(), 2);
     }
 }

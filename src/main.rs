@@ -13,6 +13,7 @@ use monocle_cli::commands::chat::{
     chat_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
+use monocle_cli::commands::handoff::handoff_command;
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::login::login_command;
@@ -22,10 +23,12 @@ use monocle_cli::commands::status::status_command;
 use monocle_cli::commands::token::token_command;
 use monocle_cli::commands::unset::unset_command;
 use monocle_cli::commands::upgrade::upgrade_command;
+use monocle_cli::config::Config;
 use monocle_cli::credentials::Credentials;
 use monocle_cli::diag;
 use monocle_cli::error::Result;
 use monocle_cli::net::Client;
+use monocle_cli::profiles::{self, Selection};
 use monocle_cli::util;
 
 // clap 4 has no native way to group subcommands under section headings, so the
@@ -49,9 +52,11 @@ Commands:
     unset    Remove Monocle configuration from Claude Code
     status   Show authentication and configuration status
     claude   Launch Claude Code with Monocle authentication
+    profile  List, inspect, and select saved profiles
 
   Chat & models:
     chat     Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
+    handoff  Pass one hosted Monocle Chat thread to Claude Code
     models   List available models from the Monocle router
 
   Agent:
@@ -77,6 +82,12 @@ Commands:
     after_help = ROOT_HELP_COMMANDS
 )]
 struct Cli {
+    /// Select a saved Monocle connection
+    #[arg(long, global = true)]
+    profile: Option<String>,
+    /// Select a saved environment slot (prod, stg, local)
+    #[arg(long, global = true)]
+    env: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -88,9 +99,6 @@ enum Commands {
         /// Stark tenant domain (e.g., example.monocle-ai.com)
         #[arg(long)]
         tenant: Option<String>,
-        /// Environment: prod, stg, local (default: prod)
-        #[arg(long, default_value = "prod")]
-        env: String,
         /// Use Device Authorization Grant (for headless/SSH environments)
         #[arg(long = "device-code")]
         device_code: bool,
@@ -103,6 +111,19 @@ enum Commands {
     Unset,
     /// Show authentication and configuration status
     Status,
+    /// Manage saved Monocle profiles
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
+    /// Hand one hosted Monocle Chat thread to Claude Code
+    Handoff {
+        /// Existing hosted Chat thread ID (omit to choose from the list)
+        id: Option<String>,
+        /// Confirm handoff in non-interactive use
+        #[arg(long)]
+        yes: bool,
+    },
     /// Launch Claude Code with Monocle authentication (clears conflicting env vars)
     #[command(disable_help_flag = true)]
     Claude {
@@ -162,6 +183,16 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommands {
+    /// List saved profiles and their environments
+    List,
+    /// Show one profile and its login state
+    Show { name: Option<String> },
+    /// Set the default profile
+    Use { name: String },
 }
 
 #[derive(Args)]
@@ -231,6 +262,60 @@ impl From<ChatArgs> for ChatOptions {
             }),
         }
     }
+}
+
+fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
+    let data = profiles::list_profiles(config)?;
+    let selected = data.default_profile.as_deref().unwrap_or("default");
+    let mut names = data
+        .profiles
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    names.insert("default".to_string());
+    if let Some(default) = data.default_profile.as_ref() {
+        names.insert(default.clone());
+    }
+    for name in names {
+        let selection = profiles::resolve_from_data(&data, home, Some(&name), None, None)?;
+        let store = selection.store(home);
+        let state = if store.read().is_some() {
+            "logged in"
+        } else {
+            "not logged in"
+        };
+        let marker = if name == selected { "*" } else { " " };
+        println!("{marker} {name}  {}  ({state})", selection.environment);
+    }
+    Ok(())
+}
+
+fn profile_show_command(
+    config: &Config,
+    home: &std::path::Path,
+    name: Option<&str>,
+    current: &Selection,
+) -> Result<()> {
+    let data = profiles::list_profiles(config)?;
+    let profile = name.unwrap_or(&current.profile);
+    if profile != "default" && !data.profiles.contains_key(profile) {
+        return Err(monocle_cli::error::AppError::new(format!(
+            "Unknown profile '{profile}'. Log in with --profile {profile} first."
+        )));
+    }
+    let selection = profiles::resolve_from_data(&data, home, Some(profile), None, None)?;
+    let store = selection.store(home);
+    println!("Profile: {}", selection.profile);
+    println!("Environment: {}", selection.environment);
+    match store.read() {
+        Some(creds) => {
+            println!("Tenant: {}", creds.tenant_domain);
+            println!("User: {}", creds.email);
+            println!("Status: logged in");
+        }
+        None => println!("Status: not logged in"),
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -387,15 +472,48 @@ enum ModelCommands {
 fn main() {
     let cli = Cli::parse();
     let client = Client::new();
-    let creds = Credentials::new();
     let home = util::home_dir();
+    let config = Config::new();
+    let selection =
+        match profiles::resolve(&config, &home, cli.profile.as_deref(), cli.env.as_deref()) {
+            Ok(selection) => selection,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
+    if !matches!(&cli.command, Commands::Login { .. }) && selection.profile != "default" {
+        match config.read_strict() {
+            Ok(data) if data.profiles.contains_key(&selection.profile) => {}
+            Ok(_) => {
+                eprintln!(
+                    "Error: Unknown profile '{}'. Log in with --profile {} first.",
+                    selection.profile, selection.profile
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let creds = selection.store(&home);
 
     let result: Result<()> = match cli.command {
         Commands::Login {
             tenant,
-            env,
             device_code,
-        } => login_command(&client, &creds, tenant, env, device_code),
+        } => login_command(
+            &client,
+            &creds,
+            tenant,
+            selection.environment.clone(),
+            device_code,
+        )
+        .and_then(|_| {
+            profiles::save_environment(&config, &selection.profile, &selection.environment)
+        }),
         Commands::Token => {
             token_command(&client, &creds);
             Ok(())
@@ -403,17 +521,27 @@ fn main() {
         Commands::Setup => setup_command(&creds, &home),
         Commands::Unset => unset_command(&home),
         Commands::Status => {
-            status_command(&creds, &home);
+            status_command(&creds, &home, &selection);
             Ok(())
+        }
+        Commands::Profile { command } => match command {
+            ProfileCommands::List => profile_list_command(&config, &home),
+            ProfileCommands::Show { name } => {
+                profile_show_command(&config, &home, name.as_deref(), &selection)
+            }
+            ProfileCommands::Use { name } => profiles::use_profile(&config, &name),
+        },
+        Commands::Handoff { id, yes } => {
+            handoff_command(&client, &creds, &selection, id.as_deref(), yes)
         }
         Commands::Claude { args } => {
             claude_command(&creds, &args);
             Ok(())
         }
-        Commands::Acp => monocle_cli::acp::serve(),
+        Commands::Acp => monocle_cli::acp::serve_with_credentials(creds.clone()),
         Commands::Models => model_list_command(&client, &creds),
         Commands::Chat { command, args } => match command {
-            Some(ChatCommand::List) => chat_list_command(&client, &creds),
+            Some(ChatCommand::List) => chat_list_command(&client, &creds, &selection),
             None => chat_command(&client, &creds, args.into()),
         },
         Commands::Agent {
