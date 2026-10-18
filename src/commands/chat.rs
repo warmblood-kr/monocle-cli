@@ -579,7 +579,10 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
 /// `chat_list_command`, since both need the same auth + jarvice-host
 /// resolution. Deliberately `jarvice_url_for`, NOT `session.router_url`
 /// (chat-proxy) — see `responses_api` module docs for why.
-fn resolve_jarvice(client: &Client, creds: &Credentials) -> Result<(AuthSession, String, String)> {
+pub(crate) fn resolve_jarvice(
+    client: &Client,
+    creds: &Credentials,
+) -> Result<(AuthSession, String, String)> {
     let session = get_access_token(client, creds);
     let stored = creds.read().ok_or_else(|| {
         crate::error::AppError::new("Not logged in. Run `monocle login --tenant <domain>` first.")

@@ -15,6 +15,10 @@ use monocle_cli::commands::chat::{
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
+use monocle_cli::commands::knowledge::{
+    knowledge_create_command, knowledge_delete_command, knowledge_list_command,
+    knowledge_upload_command,
+};
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
@@ -56,6 +60,7 @@ Commands:
 
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
+    knowledge  Manage knowledge collections (create, upload files, list, delete)
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -133,6 +138,11 @@ enum Commands {
         command: Option<ChatCommand>,
         #[command(flatten)]
         args: ChatArgs,
+    },
+    /// Manage knowledge collections (create, upload files, list, delete)
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
     },
     /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
     Agent {
@@ -362,6 +372,35 @@ enum ChatCommand {
         id: String,
         #[arg(long, value_enum, default_value = "text")]
         format: ContentFormat,
+    },
+}
+
+#[derive(Subcommand)]
+enum KnowledgeCommand {
+    /// Create an empty collection; prints its id to stdout
+    Create {
+        /// Collection name (must not already exist)
+        name: String,
+    },
+    /// Upload and index files (pdf, docx, md, txt) into a collection. A directory
+    /// contributes its supported top-level files; files already in the collection
+    /// (same name) are skipped; a failed file is reported and the rest continue
+    Upload {
+        /// Collection name or id (see `monocle knowledge list`)
+        collection: String,
+        /// Files and/or directories to upload
+        #[arg(required = true, value_name = "FILE_OR_DIR")]
+        paths: Vec<String>,
+    },
+    /// List collections, or the files of one collection
+    List {
+        /// Collection name or id; omit to list all collections
+        collection: Option<String>,
+    },
+    /// Delete a collection and all of its files
+    Delete {
+        /// Collection name or id
+        collection: String,
     },
 }
 
@@ -684,6 +723,20 @@ fn main() {
                 chat_content_command(&client, &creds, &selection, &id, format)
             }
             None => chat_command(&client, &creds, args.into()),
+        },
+        Commands::Knowledge { command } => match command {
+            KnowledgeCommand::Create { name } => {
+                knowledge_create_command(&client, &creds, &selection, &name)
+            }
+            KnowledgeCommand::Upload { collection, paths } => {
+                knowledge_upload_command(&client, &creds, &selection, &collection, &paths)
+            }
+            KnowledgeCommand::List { collection } => {
+                knowledge_list_command(&client, &creds, &selection, collection.as_deref())
+            }
+            KnowledgeCommand::Delete { collection } => {
+                knowledge_delete_command(&client, &creds, &selection, &collection)
+            }
         },
         Commands::Agent {
             prompt,
