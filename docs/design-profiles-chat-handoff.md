@@ -37,6 +37,8 @@ Every API call uses the selected credentials' bearer token and tenant/router ori
 
 ## Read-only hosted Chat handoff
 
+Removed before release; replaced by `monocle chat content <id>` (see proposal §3.2).
+
 The primary source is existing server-side Monocle Chat history, not the local `monocle chat` process. This repository already has `src/jarvice_chats.rs` for authenticated `GET /api/v1/chats/` and `GET /api/v1/chats/{id}`; the list and detail requests use the selected session's tenant. The implementation reuses that client and active ancestry (`currentId`/`parentId`) extraction. Requests are reads only. The user selects exactly one authorized thread; there is no automatic bulk import and no write, replay, archive, or edit request.
 
 `monocle handoff` lists thread metadata, fetches the chosen thread, then shows profile, environment, tenant, title, time and message count for confirmation. Interactive mode prompts for one selection and confirmation. Non-interactive mode requires an explicit thread id and confirmation flag. Only the active message chain is passed. Text is marked as untrusted context; non-text attachments are identified as omitted. Enforce a 1 MiB transcript bound and fail without truncation.

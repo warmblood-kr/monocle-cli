@@ -54,16 +54,16 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle profile list` / `show [name]` / `use <name>` | List connections, inspect profile/environment, or set the default profile |
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
-| `monocle models` | List available models (with modality) |
 | `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--tool-ids <id,...>` (with `--responses`) activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (with `--responses`, one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine) |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
-| `monocle handoff [<thread-id>] [--yes]` | Confirm and pass one existing hosted Chat thread to Claude Code; non-interactive use requires a thread ID and `--yes` |
-| `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
-| `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
-| `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
-| `monocle audio speech-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML TTS |
-| `monocle image generate [prompt] --model <id> -o <path> [--size <WxH>] [--n <n>] [--quality <q>]` | OpenAI-compatible image generation (prompt arg or stdin) |
-| `monocle image edit <image> [prompt] --model <id> -o <path> [--mask <path>] [--size <WxH>] [--n <n>] [--quality <q>]` | OpenAI-compatible image edit (gpt-image models only; prompt arg or stdin) |
+| `monocle router models` | List available models from the router (with modality) |
+| `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat via the router's plain `/v1/chat/completions` (REPL or stdin); no Responses-API options |
+| `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
+| `monocle router audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast transcription |
+| `monocle router audio speak [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI-compatible TTS (text arg or stdin) |
+| `monocle router audio speak-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML TTS |
+| `monocle router image generate [prompt] --model <id> -o <path> [--size <WxH>] [--n <n>] [--quality <q>]` | OpenAI-compatible image generation (prompt arg or stdin) |
+| `monocle router image edit <image> [prompt] --model <id> -o <path> [--mask <path>] [--size <WxH>] [--n <n>] [--quality <q>]` | OpenAI-compatible image edit (gpt-image models only; prompt arg or stdin) |
 | `monocle claude [...args]` | Launch Claude Code through Monocle (args pass through) |
 | `monocle setup` | Globally route plain `claude` through Monocle (opt-in) |
 | `monocle unset` | Remove the global `claude` routing |
@@ -77,14 +77,26 @@ Upgrading from a release without profiles needs no re-login: on first run the ex
 
 Known limits: the first-run migration rewrites `config.json` without a lock, so a config change made by another `monocle` process at that same moment can be lost (first run only). If the default profile's saved environment has no credentials of its own but the existing session is for another environment, the default profile uses that session — this also applies to plain `monocle login`, which then signs in to the existing session's environment; pass `--env` to choose explicitly.
 
-`monocle handoff` reads one authorized hosted Chat thread using the selected profile, confirms the tenant and message count, and gives Claude Code a temporary private transcript. The transcript is removed when Claude Code exits. The command does not change the hosted conversation.
+### Deprecated aliases
+
+These root forms still work and print a one-line warning on stderr (stdout is unchanged). They will be removed in 2.0.
+
+| Deprecated | Use instead |
+|------------|-------------|
+| `monocle models` | `monocle router models` |
+| `monocle audio transcribe[-azure]` | `monocle router audio transcribe[-azure]` |
+| `monocle audio speech[-azure]` | `monocle router audio speak[-azure]` |
+| `monocle image <generate\|edit>` | `monocle router image <generate\|edit>` |
+| `monocle model chat` | `monocle router chat` |
+
+`monocle model list` has been removed; use `monocle router models`.
 
 ## 💬 Chat with models
 
 List what your tenant has:
 
 ```console
-$ monocle models
+$ monocle router models
 MODEL ID                  NAME                  MODALITY  OWNER       CONTEXT
 ────────────────────────  ────────────────────  ────────  ──────────  ───────
 claude-sonnet-4-6         Claude Sonnet 4.6     chat      anthropic   200k
@@ -182,7 +194,7 @@ monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
 > output limit — pass `--max-tokens <n>` only to cap it.
 
 > [!NOTE]
-> `monocle model chat` / `monocle model list` still work but are deprecated and will be removed in a future release.
+> `monocle model chat` is a deprecated alias for `monocle router chat` (see [Deprecated aliases](#deprecated-aliases)); `monocle model list` has been removed.
 
 ### 📎 Attaching files/images
 
@@ -373,26 +385,26 @@ Notes:
 
 ## 🔊 Audio (STT / TTS)
 
-`monocle audio …` calls the audio endpoints directly so you can iterate on parameters and isolate API-level issues without going through a frontend. The OpenAI-compatible and Azure variants are separate subcommands because their parameter schemas don't overlap.
+`monocle router audio …` calls the audio endpoints directly so you can iterate on parameters and isolate API-level issues without going through a frontend. The OpenAI-compatible and Azure variants are separate subcommands because their parameter schemas don't overlap.
 
 ### Transcribe
 
 OpenAI-compatible (`/v1/audio/transcriptions`):
 
 ```bash
-monocle audio transcribe meeting.wav --model gpt-4o-mini-transcribe --language en
+monocle router audio transcribe meeting.wav --model gpt-4o-mini-transcribe --language en
 ```
 
 Pipe audio from another tool:
 
 ```bash
-ffmpeg -i talk.m4a -f wav - | monocle audio transcribe --filename talk.wav --model gpt-4o-mini-transcribe
+ffmpeg -i talk.m4a -f wav - | monocle router audio transcribe --filename talk.wav --model gpt-4o-mini-transcribe
 ```
 
 Azure Fast (`/v1/speechtotext/transcriptions:transcribe`) — for diarization and longer file uploads:
 
 ```bash
-monocle audio transcribe-azure meeting.wav \
+monocle router audio transcribe-azure meeting.wav \
   --locale en-US --locale ko-KR \
   --diarization \
   --profanity Masked
@@ -401,21 +413,21 @@ monocle audio transcribe-azure meeting.wav \
 Need an Azure parameter we haven't exposed yet? Use the escape hatch:
 
 ```bash
-monocle audio transcribe-azure meeting.wav --definition '{"locales":["ja-JP"],"customSetting":true}'
+monocle router audio transcribe-azure meeting.wav --definition '{"locales":["ja-JP"],"customSetting":true}'
 ```
 
-### Speech
+### Speak
 
 OpenAI-compatible (`/v1/audio/speech`):
 
 ```bash
-monocle audio speech "Hello from Monocle" --voice nova --format mp3 -o hello.mp3
+monocle router audio speak "Hello from Monocle" --voice nova --format mp3 -o hello.mp3
 ```
 
 Pipe text in and audio out:
 
 ```bash
-echo "the quick brown fox" | monocle audio speech --voice alloy > sample.mp3
+echo "the quick brown fox" | monocle router audio speak --voice alloy > sample.mp3
 ```
 
 Azure SSML (`/v1/azure/texttospeech/cognitiveservices/v1`) — body must be SSML (start with `<speak …>`), so it's safer to keep it in a file than to escape it on the shell:
@@ -427,7 +439,7 @@ cat > /tmp/jenny.ssml <<'EOF'
 </speak>
 EOF
 
-monocle audio speech-azure \
+monocle router audio speak-azure \
   --format audio-24khz-48kbitrate-mono-mp3 \
   -o jenny.mp3 \
   < /tmp/jenny.ssml
@@ -437,20 +449,20 @@ On failure each command prints the HTTP status and response body to stderr and e
 
 ## 🖼️ Image (generate / edit)
 
-`monocle image …` calls chat-proxy's OpenAI-compatible image endpoints directly, the same way `monocle audio …` does for STT/TTS. There is no separate "upload a file, then reference it by id" step — an edit sends the image bytes straight in the request, matching chat-proxy's own `/v1/images/edits` contract.
+`monocle router image …` calls chat-proxy's OpenAI-compatible image endpoints directly, the same way `monocle router audio …` does for STT/TTS. There is no separate "upload a file, then reference it by id" step — an edit sends the image bytes straight in the request, matching chat-proxy's own `/v1/images/edits` contract.
 
 ### Generate
 
 `/v1/images/generations`:
 
 ```bash
-monocle image generate "a red bicycle on a white background" --model gpt-image-1 -o bike.png
+monocle router image generate "a red bicycle on a white background" --model gpt-image-1 -o bike.png
 ```
 
 Pipe a prompt in from another tool:
 
 ```bash
-echo "a watercolor mountain landscape" | monocle image generate --model gpt-image-1 -o landscape.png
+echo "a watercolor mountain landscape" | monocle router image generate --model gpt-image-1 -o landscape.png
 ```
 
 `--n <n>` greater than 1 writes additional files with `-1`, `-2`, ... spliced before the extension (`bike.png`, `bike-1.png`, ...).
@@ -460,13 +472,13 @@ echo "a watercolor mountain landscape" | monocle image generate --model gpt-imag
 `/v1/images/edits` — **gpt-image models only** (Gemini image editing is a separate, non-OpenAI-shaped surface not covered by this subcommand):
 
 ```bash
-monocle image edit mockup.png "add a second monitor on the desk" --model gpt-image-1 -o mockup-edited.png
+monocle router image edit mockup.png "add a second monitor on the desk" --model gpt-image-1 -o mockup-edited.png
 ```
 
 With a mask (same image format as `image`: png/jpg/webp):
 
 ```bash
-monocle image edit mockup.png "replace the sky" --model gpt-image-1 --mask sky-mask.png -o mockup-edited.png
+monocle router image edit mockup.png "replace the sky" --model gpt-image-1 --mask sky-mask.png -o mockup-edited.png
 ```
 
 ## ⬆️ Upgrading

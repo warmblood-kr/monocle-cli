@@ -45,8 +45,8 @@ pub struct MessageNode {
     pub role: String,
     #[serde(deserialize_with = "deserialize_message_content")]
     pub content: String,
-    /// Server-side file/image attachment metadata. Handoff never fetches or
-    /// includes the attachment payload; it emits a marker when files exist.
+    /// Server-side file/image attachment metadata. Never fetched; callers emit
+    /// an omission marker when files exist.
     #[serde(default)]
     pub files: Vec<Value>,
 }

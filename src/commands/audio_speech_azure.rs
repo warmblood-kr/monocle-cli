@@ -38,7 +38,7 @@ pub fn audio_speech_azure_command(
         return Err(AppError::new(
             "Azure TTS requires SSML. Body must start with `<speak …>`. \
              Tip: keep SSML in a file and pipe it in to avoid shell-escaping issues:\n\
-             \x20 monocle audio speech-azure -o out.mp3 < my.ssml",
+             \x20 monocle router audio speak-azure -o out.mp3 < my.ssml",
         ));
     }
 
