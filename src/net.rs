@@ -108,6 +108,17 @@ impl Client {
         send("GET", url, req)
     }
 
+    /// DELETE (no body). Goes through the shared `send()`, so — like every call
+    /// here — a connection failure before any response is retried once; deleting
+    /// is idempotent, so a replay is harmless.
+    pub fn delete(&self, url: &str, headers: &[(&str, &str)]) -> Result<Resp> {
+        let mut req = self.inner.delete(url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        send("DELETE", url, req)
+    }
+
     /// GET a large file download (e.g. the `monocle upgrade` release binary).
     ///
     /// This deliberately does NOT route through the shared `send()`: a multi-MB

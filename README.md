@@ -57,6 +57,10 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle chat [--model <id>] [--file <path\|url>]... [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Chat with Monocle hosted Chat (REPL or stdin): the server owns the thread, so it shows up in the web UI; attach files/images with `--file` (one-shot only); `--resume <id>` continues a thread; `--tool-ids <id,...>` activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine). For the direct router (streaming, system prompt, token stats) use `monocle router chat` |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
 | `monocle chat content <chat-id> [--format text\|json]` | Print one hosted Chat thread's active message path to stdout (text only, attachments omitted, control characters stripped, untrusted content, 1 MiB cap) |
+| `monocle knowledge create <name>` | Create an empty knowledge collection (name must be new); prints its id |
+| `monocle knowledge upload <collection> <file-or-dir>...` | Upload and index pdf/docx/md/txt files into a collection (a directory contributes its top-level supported files). A failed file is reported and the rest continue (exit `1`); files already in the collection (same name) are skipped, so re-runs are safe. Prints `file-id<TAB>name` per stored file |
+| `monocle knowledge list [<collection>]` | List collections (id, name, file count), or one collection's files |
+| `monocle knowledge delete <collection>` | Delete a collection **and its files** (kept if any file can't be deleted, so you can retry) |
 | `monocle router models` | List available models from the router (with modality) |
 | `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat via the router's plain `/v1/chat/completions` (REPL or stdin); no Responses-API options |
 | `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
@@ -269,6 +273,20 @@ for m in gpt-4o claude-sonnet-4-6 gemini-2-flash; do
   echo "count the people in this image" | monocle chat --file crowd.jpg --model "$m"
 done
 ```
+
+### 📚 Knowledge collections
+
+Create and fill the same knowledge collections the web UI's Knowledge page shows, e.g. to set up repeatable retrieval test fixtures:
+
+```bash
+monocle knowledge create my-fixtures                 # prints the new collection id
+monocle knowledge upload my-fixtures ./docs a.pdf    # dirs and/or files; pdf, docx, md, txt
+monocle knowledge list                               # id, name, file count
+monocle knowledge list my-fixtures                   # the collection's files
+monocle knowledge delete my-fixtures                 # collection and its files
+```
+
+`<collection>` is an exact name or id; a name shared by several collections is an error that lists their ids. Uploads index each file on the server before the next one starts, so large PDFs take a while. Data goes to stdout and progress to stderr, so output pipes cleanly. Commands act on the selected `--profile`/`--env` tenant.
 
 ### 🧵 Hosted Chat: server-managed threads
 
