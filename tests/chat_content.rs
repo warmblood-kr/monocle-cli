@@ -154,3 +154,28 @@ fn chat_list_still_works() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("c1"));
 }
+
+#[test]
+fn invalid_chat_ids_are_rejected_before_any_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let stub = common::stub(move |_, _, _, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        (200, FIXTURE.into())
+    });
+    let home = logged_in_home(&stub);
+    for bad in ["../users/me", "%2e%2e/users/me", "c1?x=1", "c1#frag"] {
+        let out = run(home.path(), &["chat", "content", bad]);
+        assert_eq!(out.status.code(), Some(1), "{bad}");
+        assert!(out.stdout.is_empty(), "{bad}");
+        let err = stderr(&out);
+        assert!(
+            err.contains("Error: Invalid chat thread ID."),
+            "{bad}: {err}"
+        );
+        assert!(!err.contains(bad), "raw id echoed: {err}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "stub received requests");
+}

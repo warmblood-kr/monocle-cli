@@ -104,6 +104,14 @@ pub fn list_threads(client: &Client, jarvice_url: &str, bearer: &str) -> Result<
     resp.json()
 }
 
+/// Chat thread ids are opaque tokens: `^[A-Za-z0-9_-]{1,128}$`.
+pub fn is_valid_chat_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// `GET /api/v1/chats/{id}` — one thread's full nested message tree.
 pub fn get_thread(
     client: &Client,
@@ -111,6 +119,11 @@ pub fn get_thread(
     bearer: &str,
     id: &str,
 ) -> Result<ChatDetail> {
+    // The id is spliced into the URL path: reject anything that could change
+    // the path (`..`, `/`, `%`, `?`, `#`) before any request, never echoing it.
+    if !is_valid_chat_id(id) {
+        return Err(AppError::new("Invalid chat thread ID."));
+    }
     let resp = client.get(
         &format!("{jarvice_url}/api/v1/chats/{id}"),
         &auth_headers(bearer),
@@ -193,7 +206,10 @@ pub fn render_text(title: &str, messages: &[&MessageNode]) -> String {
         } else {
             "Assistant"
         };
-        output.push_str(&format!("\n## {role}\n\n{}\n", message.content));
+        output.push_str(&format!(
+            "\n## {role}\n\n{}\n",
+            visible_body(&message.content)
+        ));
         if !message.files.is_empty() {
             output.push_str("\n[Non-text attachment omitted]\n");
         }
@@ -209,7 +225,7 @@ pub fn render_json(id: &str, title: &str, messages: &[&MessageNode]) -> String {
         .map(|m| {
             serde_json::json!({
                 "role": m.role,
-                "content": m.content,
+                "content": visible_body(&m.content),
                 "attachments_omitted": m.files.len(),
             })
         })
@@ -233,6 +249,14 @@ pub fn ensure_content_limit(content: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Like [`visible_text`] but keeps `\n` and `\t`: strips ESC and the other
+/// C0/C1 controls so untrusted content can't drive the terminal.
+fn visible_body(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
 }
 
 fn visible_text(text: &str) -> String {
@@ -364,6 +388,37 @@ mod tests {
             .map(|m| m["attachments_omitted"].as_u64().unwrap())
             .collect();
         assert_eq!(omitted, [0, 1]);
+    }
+
+    #[test]
+    fn content_strips_control_chars_but_keeps_newlines_and_tabs() {
+        let user = node("u", None, "user", "a\x1b[2Jb\u{9b}c\x07\nd\te");
+        let text = render_text("T\x1b", &[&user]);
+        assert!(text.contains("## User\n\na[2Jbc\nd\te\n"), "{text:?}");
+        assert!(!text.contains('\x1b') && !text.contains('\u{9b}') && !text.contains('\x07'));
+        let v: Value = serde_json::from_str(&render_json("c1", "T", &[&user])).unwrap();
+        assert_eq!(v["messages"][0]["content"], "a[2Jbc\nd\te");
+    }
+
+    #[test]
+    fn chat_id_validation() {
+        for ok in ["c1", "A-b_9", &"x".repeat(128)] {
+            assert!(is_valid_chat_id(ok), "{ok}");
+        }
+        let long = "x".repeat(129);
+        for bad in [
+            "",
+            "../users/me",
+            "%2e%2e/users/me",
+            "c1?x=1",
+            "c1#frag",
+            "a/b",
+            "c 1",
+            "é",
+            &long,
+        ] {
+            assert!(!is_valid_chat_id(bad), "{bad}");
+        }
     }
 
     #[test]

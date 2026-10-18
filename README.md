@@ -56,7 +56,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--tool-ids <id,...>` (with `--responses`) activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (with `--responses`, one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine) |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
-| `monocle chat content <chat-id> [--format text\|json]` | Print one hosted Chat thread's active message path to stdout (text only, attachments omitted, untrusted content, 1 MiB cap) |
+| `monocle chat content <chat-id> [--format text\|json]` | Print one hosted Chat thread's active message path to stdout (text only, attachments omitted, control characters stripped, untrusted content, 1 MiB cap) |
 | `monocle router models` | List available models from the router (with modality) |
 | `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat via the router's plain `/v1/chat/completions` (REPL or stdin); no Responses-API options |
 | `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
@@ -293,7 +293,9 @@ monocle chat list
 
 Print one thread's active message path to stdout with `content` — text only,
 attachments omitted, marked as untrusted reference material, and failing
-(not truncating) above 1 MiB. Hand it to a coding agent to continue the work:
+(not truncating) above 1 MiB. Terminal control characters (ESC and other
+C0/C1 controls except newline and tab) are stripped, and the thread ID must
+match `[A-Za-z0-9_-]{1,128}`. Hand it to a coding agent to continue the work:
 
 ```bash
 monocle chat content <id> --format json   # or the default Markdown-style text
