@@ -137,7 +137,7 @@ pub fn create_knowledge(
     bearer: &str,
     name: &str,
 ) -> Result<Knowledge> {
-    let resp = client.post_json(
+    let resp = client.post_json_once(
         &format!("{jarvice_url}/api/v1/knowledge/create"),
         &auth_headers(bearer),
         &json!({ "name": name, "description": "" }),
@@ -222,7 +222,7 @@ pub fn upload_file(
         content_type: file.content_type.into(),
         data: std::fs::read(&file.path)?,
     };
-    let resp = client.post_multipart(
+    let resp = client.post_multipart_once(
         &format!("{jarvice_url}/api/v1/files/"),
         &auth_headers(bearer),
         vec![part],
@@ -251,7 +251,7 @@ pub fn add_file(
     knowledge_id: &str,
     file_id: &str,
 ) -> Result<()> {
-    let resp = client.post_json(
+    let resp = client.post_json_once(
         &format!(
             "{jarvice_url}/api/v1/knowledge/{}/file/add",
             checked_id(knowledge_id)?

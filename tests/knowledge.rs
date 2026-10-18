@@ -397,3 +397,58 @@ fn collect_files_filters_by_extension_case_insensitively() {
     assert_eq!(names, ["B.PDF", "a.docx", "c.Md", "d.txt"]);
     assert_eq!(got[0].content_type, "application/pdf");
 }
+
+// ── no automatic retry for non-idempotent POSTs ──────────────────────────────
+
+/// A server that accepts connections and drops them without answering (the
+/// "response lost" transport failure). Returns its base URL and the accept count.
+fn dropping_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = accepts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (url, accepts)
+}
+
+#[test]
+fn create_and_upload_make_a_single_attempt_on_transport_failure() {
+    use monocle_cli::jarvice_knowledge::{add_file, create_knowledge, upload_file, UploadFile};
+    use monocle_cli::net::Client;
+    use std::sync::atomic::Ordering;
+
+    let docs = tempfile::tempdir().unwrap();
+    write(docs.path(), "a.md");
+    let file = UploadFile {
+        path: docs.path().join("a.md"),
+        content_type: "text/markdown",
+    };
+
+    let (url, accepts) = dropping_server();
+    let client = Client::new();
+    assert!(create_knowledge(&client, &url, "Bearer t", "kb").is_err());
+    assert_eq!(accepts.load(Ordering::SeqCst), 1, "create was retried");
+    assert!(upload_file(&client, &url, "Bearer t", "a.md", &file).is_err());
+    assert_eq!(accepts.load(Ordering::SeqCst), 2, "upload was retried");
+    assert!(add_file(&client, &url, "Bearer t", "kb1", "f1").is_err());
+    assert_eq!(accepts.load(Ordering::SeqCst), 3, "file/add was retried");
+}
+
+#[test]
+fn shared_post_still_retries_once() {
+    // Guards the contrast: the single attempts above are the opt-out, not a
+    // change to the default policy other commands rely on.
+    use monocle_cli::net::Client;
+    use std::sync::atomic::Ordering;
+
+    let (url, accepts) = dropping_server();
+    let body = serde_json::json!({});
+    assert!(Client::new().post_json(&url, &[], &body).is_err());
+    assert_eq!(accepts.load(Ordering::SeqCst), 2);
+}

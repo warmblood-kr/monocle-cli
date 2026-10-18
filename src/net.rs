@@ -182,6 +182,28 @@ impl Client {
         files: Vec<FilePart>,
         text_fields: &[(&str, &str)],
     ) -> Result<Resp> {
+        self.post_multipart_opt(url, headers, files, text_fields, true)
+    }
+
+    /// [`post_multipart`](Self::post_multipart) making exactly one attempt.
+    pub fn post_multipart_once(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        files: Vec<FilePart>,
+        text_fields: &[(&str, &str)],
+    ) -> Result<Resp> {
+        self.post_multipart_opt(url, headers, files, text_fields, false)
+    }
+
+    fn post_multipart_opt(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        files: Vec<FilePart>,
+        text_fields: &[(&str, &str)],
+        retry: bool,
+    ) -> Result<Resp> {
         let mut form = reqwest::blocking::multipart::Form::new();
         for file in files {
             let part = reqwest::blocking::multipart::Part::bytes(file.data)
@@ -197,7 +219,23 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send("POST", url, req)
+        send_opt("POST", url, req, retry)
+    }
+
+    /// [`post_json`](Self::post_json) making exactly one attempt — no transport
+    /// retry. For non-idempotent writes (a replay after a lost response would
+    /// duplicate the effect).
+    pub fn post_json_once(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Resp> {
+        let mut req = self.inner.post(url).json(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        send_opt("POST", url, req, false)
     }
 
     /// POST a raw body with an explicit `Content-Type` (Azure SSML).
@@ -293,11 +331,28 @@ fn send_with_retry(
 }
 
 fn send(method: &str, url: &str, req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
+    send_opt(method, url, req, true)
+}
+
+/// [`send`] with the transport retry switchable: `retry = false` makes exactly
+/// one attempt (for non-idempotent writes where a lost response after
+/// server-side success must not be replayed).
+fn send_opt(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+    retry: bool,
+) -> Result<Resp> {
     // Total request timeout — non-streaming only (see `Client::new`). Streaming
     // (`post_json_stream`) builds and sends its own request without this, so a
     // long generation is never cut short.
     let req = req.timeout(std::time::Duration::from_secs(120));
-    let resp = send_with_retry(method, url, req).map_err(|e| {
+    let sent = if retry {
+        send_with_retry(method, url, req)
+    } else {
+        req.send()
+    };
+    let resp = sent.map_err(|e| {
         let msg = e.to_string();
         crate::diag::log_network_error(method, url, &msg);
         AppError(msg)
