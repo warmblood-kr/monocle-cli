@@ -426,6 +426,20 @@ mod tests {
         assert!(selection.legacy_path);
     }
 
+    // A backup left by an earlier or concurrent run is never overwritten.
+    #[test]
+    fn migration_never_overwrites_existing_backup() {
+        let home = tempfile::tempdir().unwrap();
+        write_legacy(home.path(), "warmblood.monocle-ai.com");
+        let config = Config::with_home(home.path());
+        std::fs::write(config.path(), br#"{"diag_always_on":true}"#).unwrap();
+        let backup = config.dir().join("config.json.pre-profiles");
+        std::fs::write(&backup, b"original").unwrap();
+        migrate_legacy(&config, home.path()).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"original");
+        assert_eq!(config.read_strict().unwrap().config_version, CONFIG_VERSION);
+    }
+
     #[test]
     fn fresh_install_writes_nothing() {
         let home = tempfile::tempdir().unwrap();
