@@ -51,7 +51,7 @@ monocle status
 | `monocle status` | 로그인, 토큰, Claude Code 구성 상태 확인 |
 | `monocle token` | 현재 액세스 토큰 출력 (만료 임박 시 자동 갱신) |
 | `monocle router models` | 라우터에서 사용 가능한 모델 목록 (modality 포함) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | 모델과 채팅 (REPL 또는 stdin) |
+| `monocle chat [--model <id>] [--file <path\|url>]... [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Monocle hosted Chat과 채팅 (REPL 또는 stdin). 스레드는 서버가 가지므로 웹 UI에도 보여요. 라우터 직접 호출(스트리밍, 시스템 프롬프트, 토큰 통계)은 `monocle router chat`을 쓰세요 |
 | `monocle chat content <chat-id> [--format text\|json]` | hosted Chat 스레드 하나의 활성 메시지 경로를 stdout으로 출력 (텍스트만, 첨부는 생략, 제어 문자 제거, 신뢰할 수 없는 콘텐츠로 표시, 1 MiB 상한) |
 | `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI 호환 음성 인식 |
 | `monocle router audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast 음성 인식 |
@@ -74,6 +74,12 @@ monocle status
 | `monocle model chat` | `monocle router chat` |
 
 `monocle model list`는 제거됐어요. `monocle router models`를 쓰세요.
+
+### 1.7에서 1.8로 업그레이드
+
+| 바뀐 점 | 할 일 |
+|---------|-------|
+| `echo q \| monocle chat`이 이제 hosted 스레드를 만들어요(웹 UI에 보임, 스트리밍/토큰 통계 없음) | 예전 라우터 직접 호출 동작은 `monocle router chat`을 쓰세요. `chat`에 준 `--system-prompt*`/`--max-tokens`는 경고와 함께 무시되고, `--responses`는 아무 동작도 하지 않아요 |
 
 ### 1.6에서 1.7로 업그레이드
 
@@ -104,10 +110,12 @@ gpt-4o-mini-tts           GPT-4o mini TTS       tts       openai      -
 5 model(s) available.
 ```
 
+아래 예시는 라우터의 `/v1/chat/completions`를 직접 부르는 `monocle router chat`이에요(실시간 스트리밍, 시스템 프롬프트, 토큰 통계). 그냥 `monocle chat`은 hosted Chat이에요.
+
 인터랙티브 REPL:
 
 ```console
-$ monocle chat --model claude-sonnet-4-6
+$ monocle router chat --model claude-sonnet-4-6
 Monocle Chat (model: claude-sonnet-4-6)
 Router: https://api.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
@@ -123,7 +131,7 @@ Bye.
 stdin 파이프로 one-shot:
 
 ```console
-$ echo "OAuth 2.0을 한 문장으로 요약해줘." | monocle chat
+$ echo "OAuth 2.0을 한 문장으로 요약해줘." | monocle router chat
 Using model: claude-sonnet-4-6
 Router: https://api.monocle-ai.com
 OAuth 2.0은 사용자가 비밀번호를 공유하지 않고도 애플리케이션이 다른 서비스의 자원에 접근할 수 있게 해주는 인증 프레임워크예요.
@@ -132,7 +140,7 @@ OAuth 2.0은 사용자가 비밀번호를 공유하지 않고도 애플리케이
 파일에서 시스템 프롬프트를 불러와서:
 
 ```bash
-monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
+monocle router chat --system-prompt-file ./persona.md --model claude-opus-4-7
 ```
 
 hosted Chat 스레드 하나를 코딩 에이전트에게 넘겨 이어서 작업하게 하려면 `chat content`를 써요. 텍스트만 출력하고 첨부는 생략하며, 터미널 제어 문자(줄바꿈·탭을 뺀 ESC 등 C0/C1 제어 문자)는 제거해요. 1 MiB를 넘으면 잘라내지 않고 실패하고, 스레드 ID는 `[A-Za-z0-9_-]{1,128}` 형식이어야 해요:

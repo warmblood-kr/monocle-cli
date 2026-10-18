@@ -54,7 +54,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle profile list` / `show [name]` / `use <name>` | List connections, inspect profile/environment, or set the default profile |
 | `monocle status` | Show login, token, and Claude Code configuration status |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
-| `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]... [--responses] [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Chat with a model (REPL or stdin); attach files/images with `--file` (one-shot only); `--responses` uses jarvice's server-managed-thread API instead; `--tool-ids <id,...>` (with `--responses`) activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (with `--responses`, one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine) |
+| `monocle chat [--model <id>] [--file <path\|url>]... [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]]` | Chat with Monocle hosted Chat (REPL or stdin): the server owns the thread, so it shows up in the web UI; attach files/images with `--file` (one-shot only); `--resume <id>` continues a thread; `--tool-ids <id,...>` activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine). For the direct router (streaming, system prompt, token stats) use `monocle router chat` |
 | `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
 | `monocle chat content <chat-id> [--format text\|json]` | Print one hosted Chat thread's active message path to stdout (text only, attachments omitted, control characters stripped, untrusted content, 1 MiB cap) |
 | `monocle router models` | List available models from the router (with modality) |
@@ -92,6 +92,12 @@ These root forms still work and print a one-line warning on stderr (stdout is un
 
 `monocle model list` has been removed; use `monocle router models`.
 
+### Upgrading from 1.7 to 1.8
+
+| Change | What to do |
+|--------|------------|
+| `echo q \| monocle chat` now creates a hosted thread (web UI, no streaming/token stats) | For the old direct-router behaviour use `monocle router chat`. `--system-prompt*`/`--max-tokens` on `chat` are ignored with a warning; `--responses` is a no-op |
+
 ### Upgrading from 1.6 to 1.7
 
 | Change | What to do |
@@ -121,10 +127,15 @@ gpt-4o-mini-tts           GPT-4o mini TTS       tts       openai      -
 5 model(s) available.
 ```
 
+The examples below use `monocle router chat`, which talks to the router's
+plain `/v1/chat/completions` directly (live streaming, system prompts, token
+stats). Plain `monocle chat` is hosted Chat — see
+[Hosted Chat](#-hosted-chat-server-managed-threads) below.
+
 Interactive REPL:
 
 ```console
-$ monocle chat --model claude-sonnet-4-6
+$ monocle router chat --model claude-sonnet-4-6
 Monocle Chat (model: claude-sonnet-4-6)
 Router: https://api.monocle-ai.com
 Type your message. Press Ctrl+D to exit.
@@ -172,9 +183,9 @@ Tokens: 120 prompt + 45 completion = 165 total
 
 `Time to first byte` is how long the response took to *start* streaming; `Latency (total)`
 is how long the full reply took to finish. `Served model` and `Tokens` are only shown when
-the backend reports them (always true for `monocle chat`'s default path; `--responses`,
+the backend reports them (always true for `monocle router chat`; hosted `monocle chat`,
 below, reports neither today, so those lines are simply omitted rather than printed as
-empty); `--responses` also makes a single blocking call with no incremental deltas, so
+empty); hosted `monocle chat` also makes a single blocking call with no incremental deltas, so
 `Time to first byte` has nothing to measure there and is omitted too. Before the first
 turn, `/diag` just prints a hint to send a message first.
 
@@ -189,7 +200,7 @@ session starts) — handy if you've scrolled past it.
 One-shot via stdin:
 
 ```console
-$ echo "Summarize OAuth 2.0 in one sentence." | monocle chat
+$ echo "Summarize OAuth 2.0 in one sentence." | monocle router chat
 Using model: claude-sonnet-4-6
 Router: https://api.monocle-ai.com
 OAuth 2.0 is an authorization framework that lets applications access a user's resources on another service without sharing the user's password.
@@ -198,7 +209,7 @@ OAuth 2.0 is an authorization framework that lets applications access a user's r
 With a system prompt from a file:
 
 ```bash
-monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
+monocle router chat --system-prompt-file ./persona.md --model claude-opus-4-7
 ```
 
 > [!NOTE]
@@ -258,16 +269,17 @@ for m in gpt-4o claude-sonnet-4-6 gemini-2-flash; do
 done
 ```
 
-### 🧵 `--responses`: server-managed threads (experimental)
+### 🧵 Hosted Chat: server-managed threads
 
-`monocle chat --responses` talks to jarvice's custom **Responses API**
-(`/api/responses`) instead of the plain `/v1/chat/completions` path. It's not
+Since 1.8, plain `monocle chat` talks to jarvice's custom **Responses API**
+(`/api/responses`) instead of the plain `/v1/chat/completions` path (that is
+now `monocle router chat`). `--responses` is still accepted as a no-op until 2.0. It's not
 OpenAI's Responses API — it's monocle's own endpoint, named for the similar
 idea: the **server** persists the conversation thread, so the CLI sends only
 the new turn instead of resending the whole exchange.
 
 ```bash
-monocle chat --responses --model claude-sonnet-4-6
+monocle chat --model claude-sonnet-4-6
 ```
 
 ```console
@@ -288,7 +300,7 @@ Continue a specific thread later (one-shot or REPL) with `--resume <id>`
 (the id a previous run printed to stderr as `Thread: ...`):
 
 ```bash
-echo "and in Python?" | monocle chat --responses --resume 3fa3b2c1-...
+echo "and in Python?" | monocle chat --resume 3fa3b2c1-...
 ```
 
 `/diag` also works in this REPL, but the Responses API doesn't echo back a served
@@ -325,9 +337,11 @@ Notes:
   CLI, from your logged-in tenant domain). It's unrelated to `--model`
   routing and can't be redirected.
 - **No streaming yet** — the reply is fetched non-streaming and printed once
-  it's fully generated, unlike the plain chat path's live token stream.
+  it's fully generated, unlike `monocle router chat`'s live token stream.
 - **`--system-prompt`/`--system-prompt-file`/`--max-tokens` are ignored** — the
-  endpoint has no equivalent fields (a warning is printed if you pass them).
+  endpoint has no equivalent fields. Each one you pass prints
+  ``Warning: <flag> ignored; use `monocle router chat` to keep the old behaviour``
+  to stderr, and the request still goes to hosted Chat.
 - **Tool calls aren't executed client-side** — this mode doesn't run a tool
   loop itself; if the model requests a tool this CLI can't run locally, a
   warning is printed to stderr — naming it when its shape parses, or noting
@@ -352,7 +366,7 @@ Notes:
 
   ```bash
   echo "오늘 받은 메일 있나요?" \
-    | monocle chat --responses --tool-ids mcp:ms365 --verify-tool-firing
+    | monocle chat --tool-ids mcp:ms365 --verify-tool-firing
   ```
 - **`--verify-tool-firing[=<tool>]`** — one-shot only; asserts that a
   server-executed tool **actually ran**, as a scriptable exit code. Useful
@@ -361,11 +375,11 @@ Notes:
   ```bash
   # 이 툴이 돌았는지 (권장)
   echo "search the web for today's date" \
-    | monocle chat --responses --verify-tool-firing=web_search
+    | monocle chat --verify-tool-firing=web_search
   echo "exit: $?"
 
   # 아무 툴이나 하나라도 돌았는지 (약한 형태)
-  echo "search the web for today's date" | monocle chat --responses --verify-tool-firing
+  echo "search the web for today's date" | monocle chat --verify-tool-firing
   ```
 
   **Name the tool you expect.** Bare, this only asks "did *any* tool run", so a

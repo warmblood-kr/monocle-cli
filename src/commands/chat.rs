@@ -33,8 +33,9 @@ pub struct ChatOptions {
     pub max_tokens: Option<String>,
     /// `--file <PATH|URL>` values (repeatable), one-shot only.
     pub files: Vec<String>,
-    /// `--responses`: talk to jarvice's `/api/responses` (server-managed
-    /// thread) instead of the plain `/v1/chat/completions` path.
+    /// Hosted Chat: jarvice's `/api/responses` (server-managed thread).
+    /// Always true for `monocle chat` (1.8); false for `monocle router chat`
+    /// (plain `/v1/chat/completions`).
     pub responses: bool,
     /// `--resume <ID>`: continue an existing `--responses` thread.
     pub resume: Option<String>,
@@ -336,7 +337,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     // stdin), never the interactive REPL.
     if !options.files.is_empty() && stdin_is_tty {
         eprintln!(
-            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle chat --file photo.png"
+            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle router chat --file photo.png"
         );
         std::process::exit(1);
     }
@@ -819,13 +820,18 @@ fn tool_firing_verification(
     }
 }
 
-/// `--responses`: jarvice's `/api/responses` (see `responses_api` module
+/// The stderr line for a router-only flag given to hosted `monocle chat`.
+fn router_flag_hint(flag: &str) -> String {
+    format!("Warning: {flag} ignored; use `monocle router chat` to keep the old behaviour")
+}
+
+/// Hosted Chat (plain `monocle chat`): jarvice's `/api/responses` (see `responses_api` module
 /// docs). The server owns the conversation thread — this REPL only tracks
 /// the `thread_id` to pass on the next turn, never a local message history.
 ///
 /// jarvice-only (not reachable through chat-proxy's `router_url`); no custom
 /// `--system-prompt`/`--max-tokens` support (the endpoint has no such
-/// fields) — both are warned-and-ignored rather than silently dropped.
+/// fields) — each is warned-and-ignored rather than silently dropped.
 fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
     let mut model = options
         .model
@@ -833,23 +839,28 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         .unwrap_or(DEFAULT_MODEL)
         .to_string();
 
-    if options.max_tokens.is_some() {
-        eprintln!("⚠ --max-tokens is ignored with --responses (jarvice's Responses API has no such field)");
-    }
-    if options.system_prompt.is_some() || options.system_prompt_file.is_some() {
-        eprintln!("⚠ --system-prompt/--system-prompt-file is ignored with --responses (the endpoint has no generic system-prompt field, only a voice-mode speech_system_context)");
+    // Router-only flags: hosted Chat has no such fields (only a voice-mode
+    // speech_system_context), and there is no router fallback (scope 1b).
+    for (flag, given) in [
+        ("--system-prompt", options.system_prompt.is_some()),
+        ("--system-prompt-file", options.system_prompt_file.is_some()),
+        ("--max-tokens", options.max_tokens.is_some()),
+    ] {
+        if given {
+            eprintln!("{}", router_flag_hint(flag));
+        }
     }
 
     let stdin_is_tty = std::io::stdin().is_terminal();
     if !options.files.is_empty() && stdin_is_tty {
         eprintln!(
-            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle chat --responses --file photo.png"
+            "--file requires piped input. Pipe your instruction, e.g.:\n  echo \"describe this image\" | monocle chat --file photo.png"
         );
         std::process::exit(1);
     }
     if options.verify_tool_firing.is_some() && stdin_is_tty {
         eprintln!(
-            "--verify-tool-firing requires piped input. Pipe a tool-triggering prompt, e.g.:\n  echo \"search the web for today's date\" | monocle chat --responses --verify-tool-firing"
+            "--verify-tool-firing requires piped input. Pipe a tool-triggering prompt, e.g.:\n  echo \"search the web for today's date\" | monocle chat --verify-tool-firing"
         );
         std::process::exit(1);
     }
