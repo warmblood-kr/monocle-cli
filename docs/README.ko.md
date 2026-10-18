@@ -75,6 +75,18 @@ monocle status
 
 `monocle model list`는 제거됐어요. `monocle router models`를 쓰세요.
 
+### 1.6에서 1.7로 업그레이드
+
+| 바뀐 점 | 할 일 |
+|--------|------|
+| 프로필 도입: 첫 실행 때 기존 로그인이 `default` 프로필이 돼요(설정은 `~/.monocle/config.json.pre-profiles`로 백업) | 없음 — 재로그인 불필요, `monocle token` / `apiKeyHelper` 그대로 동작 |
+| `models`, `audio`, `image`, `model chat`이 `monocle router` 아래로 이동 | 옛 형태도 stderr 경고와 함께 동작해요. 2.0 전에 새 형태로 바꾸세요 |
+| `audio speech[-azure]` 이름 변경 | `monocle router audio speak[-azure]`를 쓰세요 |
+| `monocle model list` 제거 | `monocle router models`를 쓰세요 |
+| `monocle model chat --responses`는 이제 오류(exit 2) | `monocle chat --responses`를 쓰세요 |
+| 새 명령 `monocle chat content <id> [--format text\|json]`, chat id 엄격 검증, 출력의 제어 문자 제거 | — |
+| `zip` 의존성 업그레이드(RUSTSEC-2026-0367/0368/0369, Windows `upgrade`만 해당) | — |
+
 ## 💬 모델과 채팅하기
 
 사용 가능한 모델 보기:
