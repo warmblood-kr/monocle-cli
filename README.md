@@ -92,6 +92,18 @@ These root forms still work and print a one-line warning on stderr (stdout is un
 
 `monocle model list` has been removed; use `monocle router models`.
 
+### Upgrading from 1.6 to 1.7
+
+| Change | What to do |
+|--------|------------|
+| Profiles arrive; your existing login becomes the `default` profile on first run (config backed up to `~/.monocle/config.json.pre-profiles`) | Nothing — no re-login, `monocle token` / `apiKeyHelper` keep working |
+| `models`, `audio`, `image`, `model chat` move under `monocle router` | Old forms still work with a stderr warning; switch to the new form before 2.0 |
+| `audio speech[-azure]` is renamed | Use `monocle router audio speak[-azure]` |
+| `monocle model list` is removed | Use `monocle router models` |
+| `monocle model chat --responses` is now an error (exit 2) | Use `monocle chat --responses` |
+| New `monocle chat content <id> [--format text\|json]`; chat ids are validated strictly and control characters are stripped from output | — |
+| `zip` dependency upgraded (RUSTSEC-2026-0367/0368/0369, Windows `upgrade` only) | — |
+
 ## 💬 Chat with models
 
 List what your tenant has:
