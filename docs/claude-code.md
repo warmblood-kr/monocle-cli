@@ -36,7 +36,16 @@ To route plain `claude` (including IDE integrations and every other terminal) th
 monocle setup
 ```
 
-This writes `apiKeyHelper: "monocle token"` into `~/.claude/settings.json`. Claude Code then calls `monocle token` to fetch a fresh access token per request.
+With a profile selected, this writes a profile- and environment-pinned `apiKeyHelper` command into `~/.claude/settings.json`. Claude Code then calls that `monocle token` command to fetch a fresh access token for the same connection on each request. Without profile selection, the legacy `monocle token` helper remains in use.
+
+Select a connection consistently for status, setup, and Claude Code:
+
+```bash
+monocle profile list
+monocle --profile warmblood-stg status
+monocle --profile warmblood-stg setup
+monocle --profile warmblood-stg claude
+```
 
 Undo at any time:
 

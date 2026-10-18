@@ -18,6 +18,7 @@ pub mod jarvice_chats;
 pub mod net;
 pub mod oidc;
 pub mod origin;
+pub mod profiles;
 pub mod refresh;
 pub mod responses_api;
 pub mod util;

@@ -43,27 +43,14 @@ cargo fmt               # 포매팅
 
 ## 인증 · 자격증명
 
-> ⚠️ **자격증명 슬롯은 하나뿐이다 — 환경 전환은 현재 세션을 조용히 파괴한다.**
->
-> `monocle login`은 `--env <prod|stg|local>`(기본 `prod`)을 받지만, 저장 경로는
-> **환경과 무관하게 `~/.monocle/credentials.json` 하나**다. 환경별 파일이 없다.
-> 로그인은 기존 세션 확인도, 확인 절차도 없이 그대로 덮어쓴다
-> (`src/commands/login.rs`의 `store.write(&creds)`).
->
-> 즉 **프로덕션 세션이 살아있는 상태에서 `monocle login --env stg`를 실행하면 그
-> 세션은 경고 없이 사라진다.** 되돌리려면 재인증해야 한다.
->
-> **잃는 것이 액세스 토큰만이 아니다.** 프로덕션 리프레시 토큰은 수명이 길어 —
-> 관측 시점 기준 **2026-08-22까지 유효** — 그동안 무인(unattended) 프로덕션
-> 호출을 가능하게 한다. 덮어쓰면 그 능력이 통째로 사라지고, 재인증에는 사람이
-> 붙어야 한다. (날짜는 해당 시점의 실제 세션에서 관측한 값이며 계약이 아니다.)
->
-> **환경을 바꾸기 전에 백업할 것:**
-> ```bash
-> cp ~/.monocle/credentials.json ~/.monocle/credentials.json.prod   # 전환 전
-> cp ~/.monocle/credentials.json.prod ~/.monocle/credentials.json   # 복구
-> ```
-> (백업본도 토큰이므로 `chmod 600`을 유지하고 레포에 넣지 말 것.)
+프로필과 환경은 별도로 저장한다. 프로필 선택은 `--profile` → `MONOCLE_PROFILE` →
+설정의 `default_profile` → `default` 순서다. 환경 선택은 `--env` → 프로필에 저장된
+환경 → 기존 기본 자격증명에서 추론 → `prod` 순서이며, 각 프로필/환경 조합은 별도
+자격증명 파일을 사용한다. 기본 프로필의 기존 `~/.monocle/credentials.json`은 추론한
+현재 환경에 계속 사용하므로 재인증이나 파일 이동이 필요 없다. 프로필별 파일은
+`~/.monocle/profiles/<profile>/credentials.<env>.json`에 저장하고 디렉터리는 `0700`,
+파일은 `0600` 권한을 사용한다. Claude Code의 토큰 helper는 선택된 프로필과 환경을
+고정한다.
 >
 > **스테이징은 로그인에 성공해도 동작하지 않을 수 있다.** 스테이징 액세스
 > 토큰에는 `email` 클레임이 없어서(stark#1061) jarvice REST가 401을 낼 수 있다.

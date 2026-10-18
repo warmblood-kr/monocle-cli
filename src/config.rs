@@ -5,6 +5,7 @@
 //! `diag.rs`'s log file: a missing or unparseable file just means defaults,
 //! never a hard error.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -20,6 +21,22 @@ pub struct ConfigData {
     /// instead of only on demand via `/diag`.
     #[serde(default)]
     pub diag_always_on: bool,
+    /// Default connection selected by `monocle profile use`.
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    /// Per-profile non-secret connection settings.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ProfileData>,
+    /// Schema marker. `0` (absent) = pre-profiles config; see
+    /// `profiles::migrate_legacy`.
+    #[serde(default)]
+    pub config_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProfileData {
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 pub struct Config {
@@ -72,12 +89,29 @@ impl Config {
         }
     }
 
+    /// Strict read for connection selection. Falling back to a default after
+    /// malformed profile config could silently route credentials to the wrong
+    /// tenant, so profile resolution must surface parse errors.
+    pub fn read_strict(&self) -> Result<ConfigData> {
+        let path = self.path();
+        if !path.exists() {
+            return Ok(ConfigData::default());
+        }
+        let contents = fs::read_to_string(&path)
+            .map_err(|e| crate::error::AppError::new(format!("Failed to read config: {e}")))?;
+        serde_json::from_str::<ConfigData>(&contents)
+            .map_err(|e| crate::error::AppError::new(format!("Invalid config: {e}")))
+    }
+
     pub fn write(&self, data: &ConfigData) -> Result<()> {
         let dir = self.dir();
         let path = self.path();
         fs::create_dir_all(&dir)?;
         let json = serde_json::to_string_pretty(data)?;
-        fs::write(&path, json)?;
+        // Temp file + rename so concurrent runs never see a half-written file.
+        let tmp = dir.join(format!("config.json.tmp.{}", std::process::id()));
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, &path)?;
         Ok(())
     }
 }
@@ -100,12 +134,14 @@ mod tests {
         let cfg = Config::with_home(dir.path());
         cfg.write(&ConfigData {
             diag_always_on: true,
+            ..ConfigData::default()
         })
         .unwrap();
         assert_eq!(
             cfg.read(),
             ConfigData {
-                diag_always_on: true
+                diag_always_on: true,
+                ..ConfigData::default()
             }
         );
     }
@@ -117,5 +153,6 @@ mod tests {
         fs::create_dir_all(cfg.dir()).unwrap();
         fs::write(cfg.path(), b"not json").unwrap();
         assert_eq!(cfg.read(), ConfigData::default());
+        assert!(cfg.read_strict().is_err());
     }
 }

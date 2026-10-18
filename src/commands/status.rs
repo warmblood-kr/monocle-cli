@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::auth::ensure_fresh_token;
 use crate::credentials::Credentials;
 use crate::net::Client;
+use crate::profiles::Selection;
 use crate::util::{now_ms, parse_iso_ms};
 
 fn format_remaining(ms: i64) -> String {
@@ -22,11 +23,16 @@ fn format_remaining(ms: i64) -> String {
     }
 }
 
-pub fn status_command(store: &Credentials, home: &Path) {
+pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
+    eprintln!("Profile: {}", selection.profile);
+    eprintln!("Environment: {}", selection.environment);
     let mut creds = match store.read() {
         Some(c) => c,
         None => {
-            eprintln!("Not logged in. Run `monocle login --tenant <domain>` first.");
+            eprintln!(
+                "Not logged in for profile '{}' ({}). Run `monocle --profile {} login --env {}` first.",
+                selection.profile, selection.environment, selection.profile, selection.environment
+            );
             return;
         }
     };
@@ -74,7 +80,11 @@ pub fn status_command(store: &Credentials, home: &Path) {
     let claude_configured = std::fs::read_to_string(&settings_path)
         .ok()
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .map(|s| s.get("apiKeyHelper").and_then(Value::as_str) == Some("monocle token"))
+        .and_then(|s| {
+            s.get("apiKeyHelper")?
+                .as_str()
+                .map(|h| store.accepts_token_helper(h))
+        })
         .unwrap_or(false);
 
     eprintln!(

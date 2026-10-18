@@ -120,15 +120,17 @@ struct MonocleAgent {
     /// can serve `fs/read_text_file` + `fs/write_text_file`, which gates whether
     /// tool file I/O is routed through the client (editor-mediated) or local disk.
     client_caps: RefCell<acp::ClientCapabilities>,
+    credentials: Credentials,
 }
 
 impl MonocleAgent {
-    fn new(updates: mpsc::UnboundedSender<ClientCall>) -> Self {
+    fn new(updates: mpsc::UnboundedSender<ClientCall>, credentials: Credentials) -> Self {
         Self {
             updates,
             sessions: RefCell::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             client_caps: RefCell::new(acp::ClientCapabilities::default()),
+            credentials,
         }
     }
 
@@ -155,7 +157,7 @@ impl MonocleAgent {
             }
             Management::Status => {
                 let (model, cwd) = self.session_config(key);
-                let login = login_view(&Credentials::new());
+                let login = login_view(&self.credentials);
                 status_text(login.as_ref(), &model, DEFAULT_MAX_STEPS, &cwd, Some(key))
             }
             Management::Diag => {
@@ -286,6 +288,7 @@ impl Agent for MonocleAgent {
 
         let updates = self.updates.clone();
         let sid = args.session_id.clone();
+        let credentials = self.credentials.clone();
 
         // Route tool file I/O through the client only when it advertises BOTH fs
         // read AND write. It's all-or-nothing on purpose: `edit_file`'s read+write
@@ -325,7 +328,7 @@ impl Agent for MonocleAgent {
                 sid,
                 cancel: cancel.clone(),
             };
-            let session = match try_access_token(&Client::new(), &Credentials::new()) {
+            let session = match try_access_token(&Client::new(), &credentials) {
                 Ok(s) => s,
                 Err(e) => return (convo, Err(e), None),
             };
@@ -946,21 +949,25 @@ fn prompt_text(blocks: &[acp::ContentBlock]) -> String {
 /// closes the connection. Sets up a current-thread runtime + `LocalSet` because
 /// the crate's futures are `!Send`.
 pub fn serve() -> Result<()> {
+    serve_with_credentials(Credentials::new())
+}
+
+pub fn serve_with_credentials(credentials: Credentials) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .map_err(|e| AppError::new(e.to_string()))?;
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, run_stdio());
+    local.block_on(&rt, run_stdio(credentials));
     Ok(())
 }
 
 /// Set up stdio as the transport and drive the ACP agent over it. stdio is ACP's
 /// standard (and today only) transport — the client spawns us and talks over
 /// stdin/stdout.
-async fn run_stdio() {
+async fn run_stdio(credentials: Credentials) {
     let outgoing = tokio::io::stdout().compat_write();
     let incoming = tokio::io::stdin().compat();
-    serve_over(incoming, outgoing).await;
+    serve_over(incoming, outgoing, credentials).await;
 }
 
 /// Drive the ACP agent over an arbitrary transport: raw byte streams carrying
@@ -968,13 +975,13 @@ async fn run_stdio() {
 /// socket / WebSocket channel is just another caller with different streams — the
 /// JSON-RPC message layer is identical, so a new transport is additive, not a
 /// rewrite (two-way door, per the interop design principle in CLAUDE.md).
-async fn serve_over<I, O>(incoming: I, outgoing: O)
+async fn serve_over<I, O>(incoming: I, outgoing: O, credentials: Credentials)
 where
     I: futures_io::AsyncRead + Unpin + 'static,
     O: futures_io::AsyncWrite + Unpin + 'static,
 {
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
-    let agent = std::rc::Rc::new(MonocleAgent::new(tx));
+    let agent = std::rc::Rc::new(MonocleAgent::new(tx, credentials));
     // Hold a second handle so we can cancel in-flight sessions on shutdown (Fix #6).
     let shutdown = std::rc::Rc::clone(&agent);
 
@@ -1571,7 +1578,7 @@ mod tests {
         // Drive the real `new_session` and drain the updates channel to confirm it
         // enqueues an AvailableCommandsUpdate naming help/status/config/diag.
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientCall>();
-        let agent = MonocleAgent::new(tx);
+        let agent = MonocleAgent::new(tx, Credentials::new());
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("runtime");
@@ -1613,7 +1620,7 @@ mod tests {
     #[test]
     fn management_response_diag_shows_nothing_yet_before_first_turn() {
         let (tx, _rx) = mpsc::unbounded_channel::<ClientCall>();
-        let agent = MonocleAgent::new(tx);
+        let agent = MonocleAgent::new(tx, Credentials::new());
         let key = new_session_key(&agent);
 
         let out = agent.management_response(&key, Management::Diag);
@@ -1628,7 +1635,7 @@ mod tests {
     #[test]
     fn management_response_diag_shows_stored_diagnostics() {
         let (tx, _rx) = mpsc::unbounded_channel::<ClientCall>();
-        let agent = MonocleAgent::new(tx);
+        let agent = MonocleAgent::new(tx, Credentials::new());
         let key = new_session_key(&agent);
 
         {

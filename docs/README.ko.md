@@ -50,22 +50,49 @@ monocle status
 | `monocle login [--tenant <domain>] [--device-code]` | 로그인 |
 | `monocle status` | 로그인, 토큰, Claude Code 구성 상태 확인 |
 | `monocle token` | 현재 액세스 토큰 출력 (만료 임박 시 자동 갱신) |
-| `monocle models` | 사용 가능한 모델 목록 (modality 포함) |
+| `monocle router models` | 라우터에서 사용 가능한 모델 목록 (modality 포함) |
 | `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | 모델과 채팅 (REPL 또는 stdin) |
-| `monocle audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI 호환 음성 인식 |
-| `monocle audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast 음성 인식 |
-| `monocle audio speech [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI 호환 음성 합성 |
-| `monocle audio speech-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML 음성 합성 |
+| `monocle chat content <chat-id> [--format text\|json]` | hosted Chat 스레드 하나의 활성 메시지 경로를 stdout으로 출력 (텍스트만, 첨부는 생략, 제어 문자 제거, 신뢰할 수 없는 콘텐츠로 표시, 1 MiB 상한) |
+| `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI 호환 음성 인식 |
+| `monocle router audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast 음성 인식 |
+| `monocle router audio speak [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI 호환 음성 합성 |
+| `monocle router audio speak-azure [ssml] -o <path> [--format <fmt>]` | Azure SSML 음성 합성 |
 | `monocle claude [...args]` | Claude Code를 Monocle에 연결해서 실행 (인자 그대로 전달) |
 | `monocle setup` | 일반 `claude`도 전역으로 Monocle을 거치게 설정 (opt-in) |
 | `monocle unset` | 전역 `claude` 라우팅 제거 |
+
+### Deprecated alias
+
+아래 루트 명령은 계속 동작하지만 stderr에 경고 한 줄을 출력해요(stdout은 그대로예요). 2.0에서 제거될 예정이에요.
+
+| Deprecated | 대신 쓸 명령 |
+|------------|-------------|
+| `monocle models` | `monocle router models` |
+| `monocle audio transcribe[-azure]` | `monocle router audio transcribe[-azure]` |
+| `monocle audio speech[-azure]` | `monocle router audio speak[-azure]` |
+| `monocle image <generate\|edit>` | `monocle router image <generate\|edit>` |
+| `monocle model chat` | `monocle router chat` |
+
+`monocle model list`는 제거됐어요. `monocle router models`를 쓰세요.
+
+### 1.6에서 1.7로 업그레이드
+
+| 바뀐 점 | 할 일 |
+|--------|------|
+| 프로필 도입: 첫 실행 때 기존 로그인이 `default` 프로필이 돼요(설정은 `~/.monocle/config.json.pre-profiles`로 백업) | 없음 — 재로그인 불필요, `monocle token` / `apiKeyHelper` 그대로 동작 |
+| `models`, `audio`, `image`, `model chat`이 `monocle router` 아래로 이동 | 옛 형태도 stderr 경고와 함께 동작해요. 2.0 전에 새 형태로 바꾸세요 |
+| `audio speech[-azure]` 이름 변경 | `monocle router audio speak[-azure]`를 쓰세요 |
+| `monocle model list` 제거 | `monocle router models`를 쓰세요 |
+| `monocle model chat --responses`는 이제 오류(exit 2) | `monocle chat --responses`를 쓰세요 |
+| 새 명령 `monocle chat content <id> [--format text\|json]`, chat id 엄격 검증, 출력의 제어 문자 제거 | — |
+| `zip` 의존성 업그레이드(RUSTSEC-2026-0367/0368/0369, Windows `upgrade`만 해당) | — |
 
 ## 💬 모델과 채팅하기
 
 사용 가능한 모델 보기:
 
 ```console
-$ monocle models
+$ monocle router models
 MODEL ID                  NAME                  MODALITY  OWNER       CONTEXT
 ────────────────────────  ────────────────────  ────────  ──────────  ───────
 claude-sonnet-4-6         Claude Sonnet 4.6     chat      anthropic   200k
@@ -108,31 +135,37 @@ OAuth 2.0은 사용자가 비밀번호를 공유하지 않고도 애플리케이
 monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
 ```
 
+hosted Chat 스레드 하나를 코딩 에이전트에게 넘겨 이어서 작업하게 하려면 `chat content`를 써요. 텍스트만 출력하고 첨부는 생략하며, 터미널 제어 문자(줄바꿈·탭을 뺀 ESC 등 C0/C1 제어 문자)는 제거해요. 1 MiB를 넘으면 잘라내지 않고 실패하고, 스레드 ID는 `[A-Za-z0-9_-]{1,128}` 형식이어야 해요:
+
+```bash
+claude "Run \`monocle chat content <id>\` and continue that work"
+```
+
 > [!NOTE]
-> `monocle model chat` / `monocle model list`는 그대로 동작하지만 deprecated 상태이고 다음 릴리즈에서 제거될 예정이에요.
+> `monocle model chat`은 `monocle router chat`의 deprecated alias예요([Deprecated alias](#deprecated-alias) 참고). `monocle model list`는 제거됐어요.
 
 ## 🔊 오디오 (STT / TTS)
 
-`monocle audio …`는 오디오 엔드포인트를 직접 호출해서 파라미터를 바꿔가며 시험하거나 API 레이어의 문제를 격리해서 보기 위한 명령이에요. 프론트엔드를 거치지 않아요. OpenAI 호환과 Azure는 파라미터 스키마가 겹치지 않아서 서브커맨드를 분리했어요.
+`monocle router audio …`는 오디오 엔드포인트를 직접 호출해서 파라미터를 바꿔가며 시험하거나 API 레이어의 문제를 격리해서 보기 위한 명령이에요. 프론트엔드를 거치지 않아요. OpenAI 호환과 Azure는 파라미터 스키마가 겹치지 않아서 서브커맨드를 분리했어요.
 
 ### Transcribe
 
 OpenAI 호환 (`/v1/audio/transcriptions`):
 
 ```bash
-monocle audio transcribe meeting.wav --model gpt-4o-mini-transcribe --language ko
+monocle router audio transcribe meeting.wav --model gpt-4o-mini-transcribe --language ko
 ```
 
 다른 도구에서 파이프로 받기:
 
 ```bash
-ffmpeg -i talk.m4a -f wav - | monocle audio transcribe --filename talk.wav --model gpt-4o-mini-transcribe
+ffmpeg -i talk.m4a -f wav - | monocle router audio transcribe --filename talk.wav --model gpt-4o-mini-transcribe
 ```
 
 Azure Fast (`/v1/speechtotext/transcriptions:transcribe`) — diarization과 긴 파일 업로드 지원:
 
 ```bash
-monocle audio transcribe-azure meeting.wav \
+monocle router audio transcribe-azure meeting.wav \
   --locale ko-KR --locale en-US \
   --diarization \
   --profanity Masked
@@ -141,21 +174,21 @@ monocle audio transcribe-azure meeting.wav \
 플래그로 노출 안 된 Azure 파라미터를 쓰려면:
 
 ```bash
-monocle audio transcribe-azure meeting.wav --definition '{"locales":["ja-JP"],"customSetting":true}'
+monocle router audio transcribe-azure meeting.wav --definition '{"locales":["ja-JP"],"customSetting":true}'
 ```
 
-### Speech
+### Speak
 
 OpenAI 호환 (`/v1/audio/speech`):
 
 ```bash
-monocle audio speech "안녕하세요 Monocle입니다" --voice nova --format mp3 -o hello.mp3
+monocle router audio speak "안녕하세요 Monocle입니다" --voice nova --format mp3 -o hello.mp3
 ```
 
 stdin으로 텍스트, stdout으로 오디오:
 
 ```bash
-echo "더 빠른 갈색 여우" | monocle audio speech --voice alloy > sample.mp3
+echo "더 빠른 갈색 여우" | monocle router audio speak --voice alloy > sample.mp3
 ```
 
 Azure SSML (`/v1/azure/texttospeech/cognitiveservices/v1`) — body는 반드시 `<speak …>`로 시작하는 SSML이어야 해요. 쉘에서 escape 하다 보면 실수하기 쉬우니 파일에 두고 파이프하는 게 안전합니다:
@@ -167,7 +200,7 @@ cat > /tmp/jenny.ssml <<'EOF'
 </speak>
 EOF
 
-monocle audio speech-azure \
+monocle router audio speak-azure \
   --format audio-24khz-48kbitrate-mono-mp3 \
   -o jenny.mp3 \
   < /tmp/jenny.ssml

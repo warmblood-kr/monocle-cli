@@ -248,8 +248,13 @@ fn handle_diag_toggle(
         "/diag on" | "/diag off" => {
             let value = trimmed == "/diag on";
             *always_on = value;
-            if let Err(e) = cfg.write(&ConfigData {
-                diag_always_on: value,
+            // Read-modify-write so profiles survive; a corrupt file is left
+            // alone rather than overwritten.
+            if let Err(e) = cfg.read_strict().and_then(|data| {
+                cfg.write(&ConfigData {
+                    diag_always_on: value,
+                    ..data
+                })
             }) {
                 eprintln!("Warning: failed to save diagnostics preference: {e}");
             }
@@ -587,10 +592,42 @@ fn resolve_jarvice(client: &Client, creds: &Credentials) -> Result<(AuthSession,
 /// (id/title/last-updated) and exit. Always jarvice's thread storage — there
 /// is nothing else to list in the plain completions mode, so this never takes
 /// a `--responses` flag.
-pub fn chat_list_command(client: &Client, creds: &Credentials) -> Result<()> {
+pub fn chat_list_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &crate::profiles::Selection,
+) -> Result<()> {
     let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
     let threads = crate::jarvice_chats::list_threads(client, &jarvice_url, &bearer)?;
+    eprintln!(
+        "Profile: {} ({}) — tenant {}",
+        selection.profile,
+        selection.environment,
+        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+    );
     print_threads_table(&threads);
+    Ok(())
+}
+
+/// `monocle chat content <id>` — print one hosted thread's active message
+/// path to stdout (profile banner on stderr, like `chat list`). Nothing
+/// reaches stdout on error.
+pub fn chat_content_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &crate::profiles::Selection,
+    id: &str,
+    format: crate::jarvice_chats::ContentFormat,
+) -> Result<()> {
+    let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
+    eprintln!(
+        "Profile: {} ({}) — tenant {}",
+        selection.profile,
+        selection.environment,
+        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+    );
+    let output = crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format)?;
+    print!("{output}");
     Ok(())
 }
 
@@ -1388,6 +1425,34 @@ mod tests {
         ));
         assert!(!always_on);
         assert!(!cfg.read().diag_always_on);
+    }
+
+    // Blocker (d): `/diag on|off` must not wipe profiles/default_profile.
+    #[test]
+    fn diag_toggle_preserves_profiles() {
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
+        use crate::config::ConfigData;
+        let mut data = ConfigData {
+            default_profile: Some("work".into()),
+            config_version: 1,
+            ..ConfigData::default()
+        };
+        data.profiles.insert("work".into(), Default::default());
+        cfg.write(&data).unwrap();
+
+        dispatch_chat_command("/diag on", &mut model, &diagnostics, &mut always_on, &cfg);
+        let saved = cfg.read_strict().unwrap();
+        assert!(saved.diag_always_on);
+        assert_eq!(
+            saved,
+            ConfigData {
+                diag_always_on: true,
+                ..data
+            }
+        );
     }
 
     #[test]

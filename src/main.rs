@@ -10,7 +10,7 @@ use monocle_cli::commands::audio_transcribe_azure::{
     audio_transcribe_azure_command, AudioTranscribeAzureOptions,
 };
 use monocle_cli::commands::chat::{
-    chat_command, chat_list_command, ChatOptions, ToolFiringExpectation,
+    chat_command, chat_content_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
@@ -22,10 +22,13 @@ use monocle_cli::commands::status::status_command;
 use monocle_cli::commands::token::token_command;
 use monocle_cli::commands::unset::unset_command;
 use monocle_cli::commands::upgrade::upgrade_command;
+use monocle_cli::config::Config;
 use monocle_cli::credentials::Credentials;
 use monocle_cli::diag;
 use monocle_cli::error::Result;
+use monocle_cli::jarvice_chats::ContentFormat;
 use monocle_cli::net::Client;
+use monocle_cli::profiles::{self, Selection};
 use monocle_cli::util;
 
 // clap 4 has no native way to group subcommands under section headings, so the
@@ -49,20 +52,17 @@ Commands:
     unset    Remove Monocle configuration from Claude Code
     status   Show authentication and configuration status
     claude   Launch Claude Code with Monocle authentication
+    profile  List, inspect, and select saved profiles
 
-  Chat & models:
+  Chat:
     chat     Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
-    models   List available models from the Monocle router
+
+  Router (direct API):
+    router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
 
   Agent:
     agent    [Experimental] Headless agent loop with tools (read/write/edit + shell)
     acp      [Experimental] Run as an ACP agent over stdio (editors / desktop / Craft)
-
-  Audio:
-    audio    Call audio (STT / TTS) endpoints directly for debugging
-
-  Image:
-    image    Generate or edit images via chat-proxy (OpenAI compatible)
 
   Maintenance:
     upgrade  Update monocle to the latest release
@@ -77,6 +77,12 @@ Commands:
     after_help = ROOT_HELP_COMMANDS
 )]
 struct Cli {
+    /// Select a saved Monocle connection
+    #[arg(long, global = true)]
+    profile: Option<String>,
+    /// Select a saved environment slot (prod, stg, local)
+    #[arg(long, global = true)]
+    env: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -88,9 +94,6 @@ enum Commands {
         /// Stark tenant domain (e.g., example.monocle-ai.com)
         #[arg(long)]
         tenant: Option<String>,
-        /// Environment: prod, stg, local (default: prod)
-        #[arg(long, default_value = "prod")]
-        env: String,
         /// Use Device Authorization Grant (for headless/SSH environments)
         #[arg(long = "device-code")]
         device_code: bool,
@@ -103,6 +106,11 @@ enum Commands {
     Unset,
     /// Show authentication and configuration status
     Status,
+    /// Manage saved Monocle profiles
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
     /// Launch Claude Code with Monocle authentication (clears conflicting env vars)
     #[command(disable_help_flag = true)]
     Claude {
@@ -111,8 +119,14 @@ enum Commands {
     },
     /// [Experimental] Run as an ACP agent over stdio (editors / desktop / Craft)
     Acp,
-    /// List available models from the Monocle router
+    /// [Deprecated] Use `monocle router models` instead
+    #[command(hide = true)]
     Models,
+    /// Call the OpenAI-compatible Monocle router directly (debugging, evals, scripting)
+    Router {
+        #[command(subcommand)]
+        command: RouterCommands,
+    },
     /// Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
     Chat {
         #[command(subcommand)]
@@ -140,17 +154,19 @@ enum Commands {
         #[arg(long = "auto-approve")]
         auto_approve: bool,
     },
-    /// Call audio (STT / TTS) endpoints directly for debugging
+    /// [Deprecated] Use `monocle router audio` instead
+    #[command(hide = true)]
     Audio {
         #[command(subcommand)]
         command: AudioCommands,
     },
-    /// Generate or edit images via chat-proxy (OpenAI compatible)
+    /// [Deprecated] Use `monocle router image` instead
+    #[command(hide = true)]
     Image {
         #[command(subcommand)]
         command: ImageCommands,
     },
-    /// [Deprecated] Use `monocle chat` / `monocle models` instead
+    /// [Deprecated] Use `monocle router chat` instead
     #[command(hide = true)]
     Model {
         #[command(subcommand)]
@@ -162,6 +178,16 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommands {
+    /// List saved profiles and their environments
+    List,
+    /// Show one profile and its login state
+    Show { name: Option<String> },
+    /// Set the default profile
+    Use { name: String },
 }
 
 #[derive(Args)]
@@ -233,100 +259,227 @@ impl From<ChatArgs> for ChatOptions {
     }
 }
 
+/// `monocle router chat` flags: plain `/v1/chat/completions` only (no
+/// Responses-API options).
+#[derive(Args)]
+struct RouterChatArgs {
+    /// Model ID to use
+    #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
+    model: String,
+    /// System prompt text
+    #[arg(long = "system-prompt")]
+    system_prompt: Option<String>,
+    /// Load system prompt from file
+    #[arg(long = "system-prompt-file")]
+    system_prompt_file: Option<String>,
+    /// Maximum output tokens (omitted by default → model/router uses its own)
+    #[arg(long = "max-tokens")]
+    max_tokens: Option<String>,
+    /// Attach a file/image (repeatable); local path or http(s) URL. One-shot
+    /// (piped stdin) only — see also inband `file:<path>` tokens in the text.
+    #[arg(long = "file")]
+    file: Vec<String>,
+}
+
+impl From<RouterChatArgs> for ChatOptions {
+    fn from(a: RouterChatArgs) -> Self {
+        ChatOptions {
+            model: Some(a.model),
+            system_prompt: a.system_prompt,
+            system_prompt_file: a.system_prompt_file,
+            max_tokens: a.max_tokens,
+            files: a.file,
+            responses: false,
+            resume: None,
+            tool_ids: Vec::new(),
+            verify_tool_firing: None,
+        }
+    }
+}
+
+fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
+    let data = profiles::list_profiles(config)?;
+    let selected = data.default_profile.as_deref().unwrap_or("default");
+    let mut names = data
+        .profiles
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    names.insert("default".to_string());
+    if let Some(default) = data.default_profile.as_ref() {
+        names.insert(default.clone());
+    }
+    for name in names {
+        let selection = profiles::resolve_from_data(&data, home, Some(&name), None, None)?;
+        let store = selection.store(home);
+        let state = if store.read().is_some() {
+            "logged in"
+        } else {
+            "not logged in"
+        };
+        let marker = if name == selected { "*" } else { " " };
+        println!("{marker} {name}  {}  ({state})", selection.environment);
+    }
+    Ok(())
+}
+
+fn profile_show_command(
+    config: &Config,
+    home: &std::path::Path,
+    name: Option<&str>,
+    current: &Selection,
+) -> Result<()> {
+    let data = profiles::list_profiles(config)?;
+    let profile = name.unwrap_or(&current.profile);
+    if profile != "default" && !data.profiles.contains_key(profile) {
+        return Err(monocle_cli::error::AppError::new(format!(
+            "Unknown profile '{profile}'. Log in with --profile {profile} first."
+        )));
+    }
+    let selection = profiles::resolve_from_data(&data, home, Some(profile), None, None)?;
+    let store = selection.store(home);
+    println!("Profile: {}", selection.profile);
+    println!("Environment: {}", selection.environment);
+    match store.read() {
+        Some(creds) => {
+            println!("Tenant: {}", creds.tenant_domain);
+            println!("User: {}", creds.email);
+            println!("Status: logged in");
+        }
+        None => println!("Status: not logged in"),
+    }
+    Ok(())
+}
+
 #[derive(Subcommand)]
 enum ChatCommand {
     /// List existing jarvice chat threads (id/title/last-updated) — including
     /// threads created from jarvice's own web UI, since both share the same
     /// storage. Always lists jarvice's threads; doesn't take `--responses`.
     List,
+    /// Print one hosted Chat thread's active message path to stdout (text only; untrusted content)
+    Content {
+        /// Hosted Chat thread ID (see `monocle chat list`)
+        #[arg(value_name = "CHAT_ID")]
+        id: String,
+        #[arg(long, value_enum, default_value = "text")]
+        format: ContentFormat,
+    },
+}
+
+#[derive(Args)]
+struct TranscribeArgs {
+    file: Option<String>,
+    /// Model ID (e.g., gpt-4o-mini-transcribe, whisper-1)
+    #[arg(long)]
+    model: Option<String>,
+    /// ISO-639-1 language hint
+    #[arg(long)]
+    language: Option<String>,
+    /// Optional prompt to guide the transcription
+    #[arg(long)]
+    prompt: Option<String>,
+    /// json | text | srt | verbose_json | vtt
+    #[arg(long = "response-format")]
+    response_format: Option<String>,
+    /// Sampling temperature (0-1)
+    #[arg(long)]
+    temperature: Option<String>,
+    /// Filename to send (required when piping stdin without extension)
+    #[arg(long)]
+    filename: Option<String>,
+    /// Override MIME type (e.g., audio/wav)
+    #[arg(long = "content-type")]
+    content_type: Option<String>,
+}
+
+#[derive(Args)]
+struct TranscribeAzureArgs {
+    file: Option<String>,
+    /// Locale (e.g., en-US, ko-KR) — repeatable
+    #[arg(long = "locale")]
+    locale: Vec<String>,
+    /// Enable speaker diarization
+    #[arg(long)]
+    diarization: bool,
+    /// None | Removed | Masked | Tags
+    #[arg(long)]
+    profanity: Option<String>,
+    /// Comma-separated channel indices (e.g., "0,1")
+    #[arg(long)]
+    channels: Option<String>,
+    /// Raw definition JSON (escape hatch; overrides individual flags)
+    #[arg(long)]
+    definition: Option<String>,
+    /// Filename to send (required when piping stdin without extension)
+    #[arg(long)]
+    filename: Option<String>,
+    /// Override MIME type (e.g., audio/wav)
+    #[arg(long = "content-type")]
+    content_type: Option<String>,
+}
+
+#[derive(Args)]
+struct SpeakArgs {
+    text: Option<String>,
+    /// Model ID (e.g., gpt-4o-mini-tts)
+    #[arg(long)]
+    model: Option<String>,
+    /// Voice ID (e.g., alloy, echo, fable, onyx, nova, shimmer)
+    #[arg(long)]
+    voice: Option<String>,
+    /// Output format (mp3 | opus | aac | flac | wav | pcm)
+    #[arg(long)]
+    format: Option<String>,
+    /// Speech speed (0.25-4.0)
+    #[arg(long)]
+    speed: Option<String>,
+    /// Style/delivery instructions (model-dependent)
+    #[arg(long)]
+    instructions: Option<String>,
+    /// Write audio to this path instead of stdout
+    #[arg(short = 'o', long)]
+    output: Option<String>,
+}
+
+#[derive(Args)]
+struct SpeakAzureArgs {
+    ssml: Option<String>,
+    /// X-Microsoft-OutputFormat (e.g., audio-24khz-48kbitrate-mono-mp3)
+    #[arg(long)]
+    format: Option<String>,
+    /// Write audio to this path instead of stdout
+    #[arg(short = 'o', long)]
+    output: Option<String>,
 }
 
 #[derive(Subcommand)]
-enum AudioCommands {
+enum RouterAudioCommands {
+    /// Synthesize speech via /v1/audio/speech (OpenAI compatible)
+    Speak(SpeakArgs),
+    /// Synthesize speech via Azure /v1/azure/texttospeech/cognitiveservices/v1 (SSML body)
+    #[command(name = "speak-azure")]
+    SpeakAzure(SpeakAzureArgs),
     /// Transcribe audio via /v1/audio/transcriptions (OpenAI compatible)
-    Transcribe {
-        file: Option<String>,
-        /// Model ID (e.g., gpt-4o-mini-transcribe, whisper-1)
-        #[arg(long)]
-        model: Option<String>,
-        /// ISO-639-1 language hint
-        #[arg(long)]
-        language: Option<String>,
-        /// Optional prompt to guide the transcription
-        #[arg(long)]
-        prompt: Option<String>,
-        /// json | text | srt | verbose_json | vtt
-        #[arg(long = "response-format")]
-        response_format: Option<String>,
-        /// Sampling temperature (0-1)
-        #[arg(long)]
-        temperature: Option<String>,
-        /// Filename to send (required when piping stdin without extension)
-        #[arg(long)]
-        filename: Option<String>,
-        /// Override MIME type (e.g., audio/wav)
-        #[arg(long = "content-type")]
-        content_type: Option<String>,
-    },
+    Transcribe(TranscribeArgs),
     /// Transcribe via Azure Fast endpoint /v1/speechtotext/transcriptions:transcribe
     #[command(name = "transcribe-azure")]
-    TranscribeAzure {
-        file: Option<String>,
-        /// Locale (e.g., en-US, ko-KR) — repeatable
-        #[arg(long = "locale")]
-        locale: Vec<String>,
-        /// Enable speaker diarization
-        #[arg(long)]
-        diarization: bool,
-        /// None | Removed | Masked | Tags
-        #[arg(long)]
-        profanity: Option<String>,
-        /// Comma-separated channel indices (e.g., "0,1")
-        #[arg(long)]
-        channels: Option<String>,
-        /// Raw definition JSON (escape hatch; overrides individual flags)
-        #[arg(long)]
-        definition: Option<String>,
-        /// Filename to send (required when piping stdin without extension)
-        #[arg(long)]
-        filename: Option<String>,
-        /// Override MIME type (e.g., audio/wav)
-        #[arg(long = "content-type")]
-        content_type: Option<String>,
-    },
+    TranscribeAzure(TranscribeAzureArgs),
+}
+
+/// Legacy `monocle audio …` names (deprecated; see `legacy_alias`).
+#[derive(Subcommand)]
+enum AudioCommands {
+    /// Transcribe audio via /v1/audio/transcriptions (OpenAI compatible)
+    Transcribe(TranscribeArgs),
+    /// Transcribe via Azure Fast endpoint /v1/speechtotext/transcriptions:transcribe
+    #[command(name = "transcribe-azure")]
+    TranscribeAzure(TranscribeAzureArgs),
     /// Synthesize speech via /v1/audio/speech (OpenAI compatible)
-    Speech {
-        text: Option<String>,
-        /// Model ID (e.g., gpt-4o-mini-tts)
-        #[arg(long)]
-        model: Option<String>,
-        /// Voice ID (e.g., alloy, echo, fable, onyx, nova, shimmer)
-        #[arg(long)]
-        voice: Option<String>,
-        /// Output format (mp3 | opus | aac | flac | wav | pcm)
-        #[arg(long)]
-        format: Option<String>,
-        /// Speech speed (0.25-4.0)
-        #[arg(long)]
-        speed: Option<String>,
-        /// Style/delivery instructions (model-dependent)
-        #[arg(long)]
-        instructions: Option<String>,
-        /// Write audio to this path instead of stdout
-        #[arg(short = 'o', long)]
-        output: Option<String>,
-    },
+    Speech(SpeakArgs),
     /// Synthesize speech via Azure /v1/azure/texttospeech/cognitiveservices/v1 (SSML body)
     #[command(name = "speech-azure")]
-    SpeechAzure {
-        ssml: Option<String>,
-        /// X-Microsoft-OutputFormat (e.g., audio-24khz-48kbitrate-mono-mp3)
-        #[arg(long)]
-        format: Option<String>,
-        /// Write audio to this path instead of stdout
-        #[arg(short = 'o', long)]
-        output: Option<String>,
-    },
+    SpeechAzure(SpeakAzureArgs),
 }
 
 #[derive(Subcommand)]
@@ -377,25 +530,134 @@ enum ImageCommands {
 }
 
 #[derive(Subcommand)]
+enum RouterCommands {
+    /// Chat via /v1/chat/completions (interactive REPL or pipe from stdin)
+    Chat(RouterChatArgs),
+    /// List available models from the Monocle router (with modality)
+    Models,
+    /// Generate or edit images via /v1/images/* (OpenAI compatible)
+    Image {
+        #[command(subcommand)]
+        command: ImageCommands,
+    },
+    /// Text-to-speech (speak) and speech-to-text (transcribe), OpenAI-compatible and Azure
+    Audio {
+        #[command(subcommand)]
+        command: RouterAudioCommands,
+    },
+}
+
+#[derive(Subcommand)]
 enum ModelCommands {
-    /// [Deprecated] Use `monocle models` instead
-    List,
-    /// [Deprecated] Use `monocle chat` instead
-    Chat(ChatArgs),
+    /// [Deprecated] Use `monocle router chat` instead
+    Chat(RouterChatArgs),
+}
+
+fn deprecation(old: &str, new: &str) -> String {
+    format!("Warning: `monocle {old}` is deprecated. Use `monocle {new}` instead.")
+}
+
+/// Map a deprecated root form (`models`, `audio …`, `image …`, `model chat`) to
+/// its warning line and `router` command; anything else comes back unchanged.
+// Called once per process on the parsed command; the large `Err` (the
+// unchanged `Commands`) is moved, not copied in a hot path.
+#[allow(clippy::result_large_err)]
+fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), Commands> {
+    use RouterAudioCommands as R;
+    let (old, new, rc) = match cmd {
+        Commands::Models => ("models", "router models", RouterCommands::Models),
+        Commands::Model {
+            command: ModelCommands::Chat(args),
+        } => ("model chat", "router chat", RouterCommands::Chat(args)),
+        Commands::Image { command } => {
+            let (old, new) = match command {
+                ImageCommands::Generate { .. } => ("image generate", "router image generate"),
+                ImageCommands::Edit { .. } => ("image edit", "router image edit"),
+            };
+            (old, new, RouterCommands::Image { command })
+        }
+        Commands::Audio { command } => {
+            let (old, new, command) = match command {
+                AudioCommands::Transcribe(a) => (
+                    "audio transcribe",
+                    "router audio transcribe",
+                    R::Transcribe(a),
+                ),
+                AudioCommands::TranscribeAzure(a) => (
+                    "audio transcribe-azure",
+                    "router audio transcribe-azure",
+                    R::TranscribeAzure(a),
+                ),
+                AudioCommands::Speech(a) => ("audio speech", "router audio speak", R::Speak(a)),
+                AudioCommands::SpeechAzure(a) => (
+                    "audio speech-azure",
+                    "router audio speak-azure",
+                    R::SpeakAzure(a),
+                ),
+            };
+            (old, new, RouterCommands::Audio { command })
+        }
+        other => return Err(other),
+    };
+    Ok((deprecation(old, new), rc))
 }
 
 fn main() {
     let cli = Cli::parse();
     let client = Client::new();
-    let creds = Credentials::new();
     let home = util::home_dir();
+    let config = Config::new();
+    if let Err(e) = profiles::migrate_legacy(&config, &home) {
+        eprintln!("Warning: Failed to migrate config to profiles: {e}");
+    }
+    let selection =
+        match profiles::resolve(&config, &home, cli.profile.as_deref(), cli.env.as_deref()) {
+            Ok(selection) => selection,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
+    if !matches!(&cli.command, Commands::Login { .. }) && selection.profile != "default" {
+        match config.read_strict() {
+            Ok(data) if data.profiles.contains_key(&selection.profile) => {}
+            Ok(_) => {
+                eprintln!(
+                    "Error: Unknown profile '{}'. Log in with --profile {} first.",
+                    selection.profile, selection.profile
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let creds = selection.store(&home);
 
-    let result: Result<()> = match cli.command {
+    let command = match legacy_alias(cli.command) {
+        Ok((warning, rc)) => {
+            eprintln!("{warning}");
+            Commands::Router { command: rc }
+        }
+        Err(c) => c,
+    };
+
+    let result: Result<()> = match command {
         Commands::Login {
             tenant,
-            env,
             device_code,
-        } => login_command(&client, &creds, tenant, env, device_code),
+        } => login_command(
+            &client,
+            &creds,
+            tenant,
+            selection.environment.clone(),
+            device_code,
+        )
+        .and_then(|_| {
+            profiles::save_environment(&config, &selection.profile, &selection.environment)
+        }),
         Commands::Token => {
             token_command(&client, &creds);
             Ok(())
@@ -403,17 +665,26 @@ fn main() {
         Commands::Setup => setup_command(&creds, &home),
         Commands::Unset => unset_command(&home),
         Commands::Status => {
-            status_command(&creds, &home);
+            status_command(&creds, &home, &selection);
             Ok(())
         }
+        Commands::Profile { command } => match command {
+            ProfileCommands::List => profile_list_command(&config, &home),
+            ProfileCommands::Show { name } => {
+                profile_show_command(&config, &home, name.as_deref(), &selection)
+            }
+            ProfileCommands::Use { name } => profiles::use_profile(&config, &name),
+        },
         Commands::Claude { args } => {
             claude_command(&creds, &args);
             Ok(())
         }
-        Commands::Acp => monocle_cli::acp::serve(),
-        Commands::Models => model_list_command(&client, &creds),
+        Commands::Acp => monocle_cli::acp::serve_with_credentials(creds.clone()),
         Commands::Chat { command, args } => match command {
-            Some(ChatCommand::List) => chat_list_command(&client, &creds),
+            Some(ChatCommand::List) => chat_list_command(&client, &creds, &selection),
+            Some(ChatCommand::Content { id, format }) => {
+                chat_content_command(&client, &creds, &selection, &id, format)
+            }
             None => chat_command(&client, &creds, args.into()),
         },
         Commands::Agent {
@@ -435,22 +706,19 @@ fn main() {
                 auto_approve,
             },
         ),
-        Commands::Audio { command } => run_audio(&client, &creds, command),
-        Commands::Image { command } => run_image(&client, &creds, command),
+        Commands::Router { command } => match command {
+            RouterCommands::Chat(args) => chat_command(&client, &creds, args.into()),
+            RouterCommands::Models => model_list_command(&client, &creds),
+            RouterCommands::Image { command } => run_image(&client, &creds, command),
+            RouterCommands::Audio { command } => run_audio(&client, &creds, command),
+        },
         Commands::Upgrade { check } => upgrade_command(&client, check),
-        Commands::Model { command } => {
-            match command {
-                ModelCommands::List => {
-                    eprintln!("Warning: `monocle model list` is deprecated. Use `monocle models` instead.");
-                    model_list_command(&client, &creds)
-                }
-                ModelCommands::Chat(args) => {
-                    eprintln!(
-                        "Warning: `monocle model chat` is deprecated. Use `monocle chat` instead."
-                    );
-                    chat_command(&client, &creds, args.into())
-                }
-            }
+        // Rewritten to `Router` by `legacy_alias` above.
+        Commands::Models
+        | Commands::Audio { .. }
+        | Commands::Image { .. }
+        | Commands::Model { .. } => {
+            unreachable!("legacy alias not rewritten")
         }
     };
 
@@ -463,9 +731,9 @@ fn main() {
     }
 }
 
-fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Result<()> {
+fn run_audio(client: &Client, creds: &Credentials, command: RouterAudioCommands) -> Result<()> {
     match command {
-        AudioCommands::Transcribe {
+        RouterAudioCommands::Transcribe(TranscribeArgs {
             file,
             model,
             language,
@@ -474,7 +742,7 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
             temperature,
             filename,
             content_type,
-        } => audio_transcribe_command(
+        }) => audio_transcribe_command(
             client,
             creds,
             file.as_deref(),
@@ -488,7 +756,7 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
                 content_type,
             },
         ),
-        AudioCommands::TranscribeAzure {
+        RouterAudioCommands::TranscribeAzure(TranscribeAzureArgs {
             file,
             locale,
             diarization,
@@ -497,7 +765,7 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
             definition,
             filename,
             content_type,
-        } => audio_transcribe_azure_command(
+        }) => audio_transcribe_azure_command(
             client,
             creds,
             file.as_deref(),
@@ -515,7 +783,7 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
                 content_type,
             },
         ),
-        AudioCommands::Speech {
+        RouterAudioCommands::Speak(SpeakArgs {
             text,
             model,
             voice,
@@ -523,7 +791,7 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
             speed,
             instructions,
             output,
-        } => audio_speech_command(
+        }) => audio_speech_command(
             client,
             creds,
             text.as_deref(),
@@ -536,11 +804,11 @@ fn run_audio(client: &Client, creds: &Credentials, command: AudioCommands) -> Re
                 output,
             },
         ),
-        AudioCommands::SpeechAzure {
+        RouterAudioCommands::SpeakAzure(SpeakAzureArgs {
             ssml,
             format,
             output,
-        } => audio_speech_azure_command(
+        }) => audio_speech_azure_command(
             client,
             creds,
             ssml.as_deref(),
@@ -623,6 +891,52 @@ mod tests {
     }
 
     #[test]
+    fn chat_content_parses() {
+        let cli = Cli::parse_from(["monocle", "chat", "content", "c1"]);
+        match cli.command {
+            Commands::Chat {
+                command: Some(ChatCommand::Content { id, format }),
+                ..
+            } => {
+                assert_eq!(id, "c1");
+                assert_eq!(format, ContentFormat::Text);
+            }
+            _ => panic!("expected chat content"),
+        }
+
+        let cli = Cli::parse_from([
+            "monocle",
+            "chat",
+            "content",
+            "c1",
+            "--format",
+            "json",
+            "--profile",
+            "x",
+        ]);
+        assert_eq!(cli.profile.as_deref(), Some("x"));
+        assert!(matches!(
+            cli.command,
+            Commands::Chat {
+                command: Some(ChatCommand::Content {
+                    format: ContentFormat::Json,
+                    ..
+                }),
+                ..
+            }
+        ));
+
+        let err = Cli::try_parse_from(["monocle", "chat", "content"])
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = Cli::try_parse_from(["monocle", "chat", "content", "c1", "--format", "xml"])
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
     fn chat_resume_flag_parses() {
         let cli = Cli::parse_from(["monocle", "chat", "--responses", "--resume", "abc-123"]);
         match cli.command {
@@ -632,5 +946,306 @@ mod tests {
             }
             _ => panic!("expected Chat command"),
         }
+    }
+
+    use clap::error::ErrorKind;
+
+    fn router(argv: &[&str]) -> RouterCommands {
+        match Cli::parse_from(argv).command {
+            Commands::Router { command } => command,
+            _ => panic!("expected Router command for {argv:?}"),
+        }
+    }
+
+    fn err_kind(argv: &[&str]) -> ErrorKind {
+        match Cli::try_parse_from(argv) {
+            Ok(_) => panic!("expected parse error for {argv:?}"),
+            Err(e) => e.kind(),
+        }
+    }
+
+    #[test]
+    fn router_chat_parses_router_args_only() {
+        let argv = [
+            "monocle",
+            "router",
+            "chat",
+            "--model",
+            "gpt-4o",
+            "--max-tokens",
+            "10",
+            "--file",
+            "a.png",
+        ];
+        let RouterCommands::Chat(args) = router(&argv) else {
+            panic!("expected RouterCommands::Chat");
+        };
+        let opts = ChatOptions::from(args);
+        assert!(!opts.responses);
+        assert_eq!(opts.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(opts.max_tokens.as_deref(), Some("10"));
+        assert_eq!(opts.files, vec!["a.png".to_string()]);
+    }
+
+    #[test]
+    fn router_chat_rejects_responses_flag() {
+        assert_eq!(
+            err_kind(&["monocle", "router", "chat", "--responses"]),
+            ErrorKind::UnknownArgument
+        );
+    }
+
+    #[test]
+    fn router_models_parses() {
+        assert!(matches!(
+            router(&["monocle", "router", "models"]),
+            RouterCommands::Models
+        ));
+    }
+
+    #[test]
+    fn router_image_generate_and_edit_parse() {
+        let gen = [
+            "monocle", "router", "image", "generate", "--model", "m", "-o", "o.png",
+        ];
+        assert!(matches!(
+            router(&gen),
+            RouterCommands::Image {
+                command: ImageCommands::Generate { .. }
+            }
+        ));
+        let edit = [
+            "monocle", "router", "image", "edit", "in.png", "--model", "m", "-o", "o.png",
+        ];
+        assert!(matches!(
+            router(&edit),
+            RouterCommands::Image {
+                command: ImageCommands::Edit { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn router_audio_all_four_parse() {
+        use RouterAudioCommands as R;
+        let speak = ["monocle", "router", "audio", "speak", "hi", "-o", "o.mp3"];
+        assert!(matches!(
+            router(&speak),
+            RouterCommands::Audio {
+                command: R::Speak(_)
+            }
+        ));
+        let speak_azure = [
+            "monocle",
+            "router",
+            "audio",
+            "speak-azure",
+            "x",
+            "-o",
+            "o.mp3",
+        ];
+        assert!(matches!(
+            router(&speak_azure),
+            RouterCommands::Audio {
+                command: R::SpeakAzure(_)
+            }
+        ));
+        assert!(matches!(
+            router(&["monocle", "router", "audio", "transcribe"]),
+            RouterCommands::Audio {
+                command: R::Transcribe(_)
+            }
+        ));
+        assert!(matches!(
+            router(&["monocle", "router", "audio", "transcribe-azure"]),
+            RouterCommands::Audio {
+                command: R::TranscribeAzure(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn router_audio_speech_is_not_a_router_name() {
+        assert_eq!(
+            err_kind(&["monocle", "router", "audio", "speech"]),
+            ErrorKind::InvalidSubcommand
+        );
+    }
+
+    fn alias(argv: &[&str]) -> (String, RouterCommands) {
+        match legacy_alias(Cli::parse_from(argv).command) {
+            Ok(mapped) => mapped,
+            Err(_) => panic!("expected {argv:?} to be a legacy alias"),
+        }
+    }
+
+    #[test]
+    fn legacy_alias_maps_every_root_form() {
+        use RouterAudioCommands as R;
+        let w = |old: &str, new: &str| {
+            format!("Warning: `monocle {old}` is deprecated. Use `monocle {new}` instead.")
+        };
+
+        let (warning, rc) = alias(&["monocle", "models"]);
+        assert_eq!(warning, w("models", "router models"));
+        assert!(matches!(rc, RouterCommands::Models));
+
+        let (warning, rc) = alias(&[
+            "monocle",
+            "audio",
+            "transcribe",
+            "a.wav",
+            "--language",
+            "ko",
+        ]);
+        assert_eq!(warning, w("audio transcribe", "router audio transcribe"));
+        let RouterCommands::Audio {
+            command: R::Transcribe(a),
+        } = rc
+        else {
+            panic!("expected Transcribe");
+        };
+        assert_eq!(a.file.as_deref(), Some("a.wav"));
+        assert_eq!(a.language.as_deref(), Some("ko"));
+
+        let (warning, rc) = alias(&["monocle", "audio", "transcribe-azure", "--diarization"]);
+        assert_eq!(
+            warning,
+            w("audio transcribe-azure", "router audio transcribe-azure")
+        );
+        let RouterCommands::Audio {
+            command: R::TranscribeAzure(a),
+        } = rc
+        else {
+            panic!("expected TranscribeAzure");
+        };
+        assert!(a.diarization);
+
+        let argv = [
+            "monocle", "audio", "speech", "hi", "-o", "o.mp3", "--voice", "nova",
+        ];
+        let (warning, rc) = alias(&argv);
+        assert_eq!(warning, w("audio speech", "router audio speak"));
+        let RouterCommands::Audio {
+            command: R::Speak(a),
+        } = rc
+        else {
+            panic!("expected Speak");
+        };
+        assert_eq!(a.text.as_deref(), Some("hi"));
+        assert_eq!(a.output.as_deref(), Some("o.mp3"));
+        assert_eq!(a.voice.as_deref(), Some("nova"));
+
+        let (warning, rc) = alias(&["monocle", "audio", "speech-azure", "x", "-o", "o.mp3"]);
+        assert_eq!(warning, w("audio speech-azure", "router audio speak-azure"));
+        let RouterCommands::Audio {
+            command: R::SpeakAzure(a),
+        } = rc
+        else {
+            panic!("expected SpeakAzure");
+        };
+        assert_eq!(a.ssml.as_deref(), Some("x"));
+
+        let argv = [
+            "monocle", "image", "generate", "p", "--model", "m", "-o", "o.png",
+        ];
+        let (warning, rc) = alias(&argv);
+        assert_eq!(warning, w("image generate", "router image generate"));
+        let RouterCommands::Image {
+            command: ImageCommands::Generate { model, output, .. },
+        } = rc
+        else {
+            panic!("expected Generate");
+        };
+        assert_eq!((model.as_str(), output.as_str()), ("m", "o.png"));
+
+        let argv = [
+            "monocle", "image", "edit", "in.png", "--model", "m", "-o", "o.png",
+        ];
+        let (warning, rc) = alias(&argv);
+        assert_eq!(warning, w("image edit", "router image edit"));
+        let RouterCommands::Image {
+            command: ImageCommands::Edit { image, .. },
+        } = rc
+        else {
+            panic!("expected Edit");
+        };
+        assert_eq!(image, "in.png");
+
+        let (warning, rc) = alias(&["monocle", "model", "chat", "--model", "gpt-4o"]);
+        assert_eq!(warning, w("model chat", "router chat"));
+        let RouterCommands::Chat(args) = rc else {
+            panic!("expected Chat");
+        };
+        assert_eq!(args.model, "gpt-4o");
+    }
+
+    #[test]
+    fn legacy_alias_passes_through_non_aliases() {
+        for argv in [
+            &["monocle", "router", "models"][..],
+            &["monocle", "chat"],
+            &["monocle", "chat", "list"],
+            &["monocle", "token"],
+        ] {
+            assert!(
+                legacy_alias(Cli::parse_from(argv).command).is_err(),
+                "{argv:?} must not be an alias"
+            );
+        }
+    }
+
+    #[test]
+    fn model_list_is_removed() {
+        assert_eq!(
+            err_kind(&["monocle", "model", "list"]),
+            ErrorKind::InvalidSubcommand
+        );
+    }
+
+    #[test]
+    fn handoff_is_removed() {
+        assert_eq!(
+            err_kind(&["monocle", "handoff"]),
+            ErrorKind::InvalidSubcommand
+        );
+        assert!(Cli::try_parse_from(["monocle", "handoff", "abc", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn profile_flag_parses_in_any_position() {
+        for argv in [
+            &["monocle", "--profile", "x", "router", "models"][..],
+            &["monocle", "router", "models", "--profile", "x"],
+            &[
+                "monocle",
+                "router",
+                "audio",
+                "speak",
+                "hi",
+                "-o",
+                "o",
+                "--profile",
+                "x",
+            ],
+            &["monocle", "models", "--profile", "x"],
+        ] {
+            assert_eq!(
+                Cli::parse_from(argv).profile.as_deref(),
+                Some("x"),
+                "{argv:?}"
+            );
+        }
+        let cli = Cli::parse_from(["monocle", "router", "chat", "--env", "stg"]);
+        assert_eq!(cli.env.as_deref(), Some("stg"));
+    }
+
+    #[test]
+    fn chat_unchanged_in_s1a() {
+        let Commands::Chat { args, .. } = Cli::parse_from(["monocle", "chat"]).command else {
+            panic!("expected Chat command");
+        };
+        assert!(!ChatOptions::from(args).responses);
+        assert!(Cli::try_parse_from(["monocle", "chat", "--responses", "--resume", "abc"]).is_ok());
     }
 }

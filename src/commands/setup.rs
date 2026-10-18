@@ -8,6 +8,7 @@ use crate::error::Result;
 
 /// Configure Claude Code (`~/.claude/settings.json`) to authenticate via Monocle.
 pub fn setup_command(creds: &Credentials, home: &Path) -> Result<()> {
+    let token_helper = creds.token_helper();
     let creds = match creds.read() {
         Some(c) => c,
         None => {
@@ -26,7 +27,7 @@ pub fn setup_command(creds: &Credentials, home: &Path) -> Result<()> {
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
-    settings.insert("apiKeyHelper".to_string(), json!("monocle token"));
+    settings.insert("apiKeyHelper".to_string(), json!(token_helper));
 
     // Resolve router URL.
     let router_url = match &creds.router_url {
@@ -63,7 +64,7 @@ pub fn setup_command(creds: &Credentials, home: &Path) -> Result<()> {
         "{} Claude Code configured to use Monocle authentication",
         c::green("✓")
     );
-    eprintln!("  {}       monocle token", c::dim("apiKeyHelper:"));
+    eprintln!("  {}       {token_helper}", c::dim("apiKeyHelper:"));
     eprintln!("  {} {router_url}", c::dim("ANTHROPIC_BASE_URL:"));
 
     // Warn about conflicting env vars.
