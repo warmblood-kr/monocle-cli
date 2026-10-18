@@ -10,7 +10,7 @@ use monocle_cli::commands::audio_transcribe_azure::{
     audio_transcribe_azure_command, AudioTranscribeAzureOptions,
 };
 use monocle_cli::commands::chat::{
-    chat_command, chat_list_command, ChatOptions, ToolFiringExpectation,
+    chat_command, chat_content_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
@@ -26,6 +26,7 @@ use monocle_cli::config::Config;
 use monocle_cli::credentials::Credentials;
 use monocle_cli::diag;
 use monocle_cli::error::Result;
+use monocle_cli::jarvice_chats::ContentFormat;
 use monocle_cli::net::Client;
 use monocle_cli::profiles::{self, Selection};
 use monocle_cli::util;
@@ -356,6 +357,14 @@ enum ChatCommand {
     /// threads created from jarvice's own web UI, since both share the same
     /// storage. Always lists jarvice's threads; doesn't take `--responses`.
     List,
+    /// Print one hosted Chat thread's active message path to stdout (text only; untrusted content)
+    Content {
+        /// Hosted Chat thread ID (see `monocle chat list`)
+        #[arg(value_name = "CHAT_ID")]
+        id: String,
+        #[arg(long, value_enum, default_value = "text")]
+        format: ContentFormat,
+    },
 }
 
 #[derive(Args)]
@@ -673,6 +682,9 @@ fn main() {
         Commands::Acp => monocle_cli::acp::serve_with_credentials(creds.clone()),
         Commands::Chat { command, args } => match command {
             Some(ChatCommand::List) => chat_list_command(&client, &creds, &selection),
+            Some(ChatCommand::Content { id, format }) => {
+                chat_content_command(&client, &creds, &selection, &id, format)
+            }
             None => chat_command(&client, &creds, args.into()),
         },
         Commands::Agent {
@@ -876,6 +888,52 @@ mod tests {
             }
             _ => panic!("expected Chat command"),
         }
+    }
+
+    #[test]
+    fn chat_content_parses() {
+        let cli = Cli::parse_from(["monocle", "chat", "content", "c1"]);
+        match cli.command {
+            Commands::Chat {
+                command: Some(ChatCommand::Content { id, format }),
+                ..
+            } => {
+                assert_eq!(id, "c1");
+                assert_eq!(format, ContentFormat::Text);
+            }
+            _ => panic!("expected chat content"),
+        }
+
+        let cli = Cli::parse_from([
+            "monocle",
+            "chat",
+            "content",
+            "c1",
+            "--format",
+            "json",
+            "--profile",
+            "x",
+        ]);
+        assert_eq!(cli.profile.as_deref(), Some("x"));
+        assert!(matches!(
+            cli.command,
+            Commands::Chat {
+                command: Some(ChatCommand::Content {
+                    format: ContentFormat::Json,
+                    ..
+                }),
+                ..
+            }
+        ));
+
+        let err = Cli::try_parse_from(["monocle", "chat", "content"])
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let err = Cli::try_parse_from(["monocle", "chat", "content", "c1", "--format", "xml"])
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

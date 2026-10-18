@@ -52,6 +52,7 @@ monocle status
 | `monocle token` | 현재 액세스 토큰 출력 (만료 임박 시 자동 갱신) |
 | `monocle router models` | 라우터에서 사용 가능한 모델 목록 (modality 포함) |
 | `monocle chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>]` | 모델과 채팅 (REPL 또는 stdin) |
+| `monocle chat content <chat-id> [--format text\|json]` | hosted Chat 스레드 하나의 활성 메시지 경로를 stdout으로 출력 (텍스트만, 첨부는 생략, 제어 문자 제거, 신뢰할 수 없는 콘텐츠로 표시, 1 MiB 상한) |
 | `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI 호환 음성 인식 |
 | `monocle router audio transcribe-azure [file] [--locale <code>] [--diarization] [--profanity <mode>] [--channels <list>] [--definition <json>]` | Azure Fast 음성 인식 |
 | `monocle router audio speak [text] -o <path> [--model <id>] [--voice <name>] [--format <fmt>]` | OpenAI 호환 음성 합성 |
@@ -120,6 +121,12 @@ OAuth 2.0은 사용자가 비밀번호를 공유하지 않고도 애플리케이
 
 ```bash
 monocle chat --system-prompt-file ./persona.md --model claude-opus-4-7
+```
+
+hosted Chat 스레드 하나를 코딩 에이전트에게 넘겨 이어서 작업하게 하려면 `chat content`를 써요. 텍스트만 출력하고 첨부는 생략하며, 터미널 제어 문자(줄바꿈·탭을 뺀 ESC 등 C0/C1 제어 문자)는 제거해요. 1 MiB를 넘으면 잘라내지 않고 실패하고, 스레드 ID는 `[A-Za-z0-9_-]{1,128}` 형식이어야 해요:
+
+```bash
+claude "Run \`monocle chat content <id>\` and continue that work"
 ```
 
 > [!NOTE]

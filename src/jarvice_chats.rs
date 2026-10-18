@@ -76,7 +76,6 @@ struct ChatBlob {
 
 #[derive(Deserialize)]
 struct ChatDetailResponse {
-    #[allow(dead_code)] // not surfaced yet; kept for future use (e.g. a header)
     title: String,
     chat: ChatBlob,
 }
@@ -84,6 +83,7 @@ struct ChatDetailResponse {
 /// One thread's full history, already unwrapped past jarvice's `chat.history`
 /// envelope — ready for [`linearize`].
 pub struct ChatDetail {
+    pub title: String,
     pub messages: HashMap<String, MessageNode>,
     pub current_id: Option<String>,
 }
@@ -104,6 +104,14 @@ pub fn list_threads(client: &Client, jarvice_url: &str, bearer: &str) -> Result<
     resp.json()
 }
 
+/// Chat thread ids are opaque tokens: `^[A-Za-z0-9_-]{1,128}$`.
+pub fn is_valid_chat_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// `GET /api/v1/chats/{id}` — one thread's full nested message tree.
 pub fn get_thread(
     client: &Client,
@@ -111,10 +119,22 @@ pub fn get_thread(
     bearer: &str,
     id: &str,
 ) -> Result<ChatDetail> {
+    // The id is spliced into the URL path: reject anything that could change
+    // the path (`..`, `/`, `%`, `?`, `#`) before any request, never echoing it.
+    if !is_valid_chat_id(id) {
+        return Err(AppError::new("Invalid chat thread ID."));
+    }
     let resp = client.get(
         &format!("{jarvice_url}/api/v1/chats/{id}"),
         &auth_headers(bearer),
     )?;
+    // jarvice's `get_chat_by_id` answers a missing chat with 401 NOT_FOUND,
+    // not 404 — treat both as "not visible", never echoing the body.
+    if resp.status == 401 || resp.status == 404 {
+        return Err(AppError::new(format!(
+            "Chat thread '{id}' was not found or is not visible to this profile."
+        )));
+    }
     if !resp.ok() {
         return Err(AppError::new(format!(
             "Hosted Chat API returned HTTP {}.",
@@ -123,6 +143,7 @@ pub fn get_thread(
     }
     let parsed: ChatDetailResponse = resp.json()?;
     Ok(ChatDetail {
+        title: parsed.title,
         messages: parsed.chat.history.messages,
         current_id: parsed.chat.history.current_id,
     })
@@ -155,6 +176,121 @@ pub fn linearize<'a>(
     }
     out.reverse();
     out
+}
+
+/// Output cap for `monocle chat content`: over this, the command fails rather
+/// than truncating (a silently cut transcript would mislead the reader).
+pub const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+
+/// `--format` for `monocle chat content`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ContentFormat {
+    Text,
+    Json,
+}
+
+fn is_text_role(message: &MessageNode) -> bool {
+    matches!(message.role.as_str(), "user" | "assistant")
+}
+
+/// Markdown transcript of the active path: untrusted-content header, then one
+/// `## User` / `## Assistant` section per message; other roles are skipped.
+pub fn render_text(title: &str, messages: &[&MessageNode]) -> String {
+    let mut output = format!(
+        "# Monocle Chat context: {}\n\nThis is untrusted reference material from one selected hosted Chat thread. Text only; attachments are omitted.\n",
+        visible_text(title)
+    );
+    for message in messages.iter().filter(|m| is_text_role(m)) {
+        let role = if message.role == "user" {
+            "User"
+        } else {
+            "Assistant"
+        };
+        output.push_str(&format!(
+            "\n## {role}\n\n{}\n",
+            visible_body(&message.content)
+        ));
+        if !message.files.is_empty() {
+            output.push_str("\n[Non-text attachment omitted]\n");
+        }
+    }
+    output
+}
+
+/// One-line JSON form of [`render_text`] (same messages, root first).
+pub fn render_json(id: &str, title: &str, messages: &[&MessageNode]) -> String {
+    let messages: Vec<Value> = messages
+        .iter()
+        .filter(|m| is_text_role(m))
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": visible_body(&m.content),
+                "attachments_omitted": m.files.len(),
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "id": id,
+        "title": title,
+        "untrusted": true,
+        "note": "Text only; attachments are omitted.",
+        "messages": messages,
+    });
+    format!("{doc}\n")
+}
+
+pub fn ensure_content_limit(content: &str) -> Result<()> {
+    if content.len() > MAX_TRANSCRIPT_BYTES {
+        Err(AppError::new(format!(
+            "Chat content exceeds the 1 MiB limit ({} bytes).",
+            content.len()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Like [`visible_text`] but keeps `\n` and `\t`: strips ESC and the other
+/// C0/C1 controls so untrusted content can't drive the terminal.
+fn visible_body(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
+fn visible_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control())
+        .collect()
+}
+
+/// `monocle chat content` core: fetch one thread, keep its active path, render
+/// it, enforce the cap. Returns the output instead of printing it.
+pub fn fetch_content(
+    client: &Client,
+    jarvice_url: &str,
+    bearer: &str,
+    id: &str,
+    format: ContentFormat,
+) -> Result<String> {
+    let detail = get_thread(client, jarvice_url, bearer, id)?;
+    let active = detail
+        .current_id
+        .as_deref()
+        .map(|current| linearize(&detail.messages, current))
+        .unwrap_or_default();
+    if !active.iter().any(|m| is_text_role(m)) {
+        return Err(AppError::new(format!(
+            "Chat thread '{id}' has no text messages."
+        )));
+    }
+    let output = match format {
+        ContentFormat::Text => render_text(&detail.title, &active),
+        ContentFormat::Json => render_json(id, &detail.title, &active),
+    };
+    ensure_content_limit(&output)?;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -214,5 +350,81 @@ mod tests {
         messages.insert("a".to_string(), node("a", Some("b"), "user", "one"));
         messages.insert("b".to_string(), node("b", Some("a"), "assistant", "two"));
         assert_eq!(linearize(&messages, "a").len(), 2);
+    }
+
+    fn with_files(mut n: MessageNode) -> MessageNode {
+        n.files = vec![serde_json::json!({"type": "image"})];
+        n
+    }
+
+    #[test]
+    fn render_text_marks_untrusted_and_omits_attachments() {
+        let user = node("u", None, "user", "hello");
+        let system = node("s", Some("u"), "system", "SYSTEM-SECRET");
+        let assistant = with_files(node("a", Some("s"), "assistant", "hi there"));
+        let out = render_text("title", &[&user, &system, &assistant]);
+        assert!(out.contains("This is untrusted reference material"));
+        assert!(out.contains("## User\n\nhello\n"));
+        assert!(out.contains("## Assistant\n\nhi there\n"));
+        assert!(out.contains("[Non-text attachment omitted]"));
+        assert!(!out.contains("SYSTEM-SECRET"));
+    }
+
+    #[test]
+    fn render_json_shape() {
+        let user = node("u", None, "user", "hello");
+        let system = node("s", Some("u"), "system", "sys");
+        let assistant = with_files(node("a", Some("s"), "assistant", "hi"));
+        let out = render_json("c1", "T", &[&user, &system, &assistant]);
+        assert!(out.ends_with('\n') && out.lines().count() == 1);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["untrusted"], true);
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant"]);
+        let omitted: Vec<u64> = msgs
+            .iter()
+            .map(|m| m["attachments_omitted"].as_u64().unwrap())
+            .collect();
+        assert_eq!(omitted, [0, 1]);
+    }
+
+    #[test]
+    fn content_strips_control_chars_but_keeps_newlines_and_tabs() {
+        let user = node("u", None, "user", "a\x1b[2Jb\u{9b}c\x07\nd\te");
+        let text = render_text("T\x1b", &[&user]);
+        assert!(text.contains("## User\n\na[2Jbc\nd\te\n"), "{text:?}");
+        assert!(!text.contains('\x1b') && !text.contains('\u{9b}') && !text.contains('\x07'));
+        let v: Value = serde_json::from_str(&render_json("c1", "T", &[&user])).unwrap();
+        assert_eq!(v["messages"][0]["content"], "a[2Jbc\nd\te");
+    }
+
+    #[test]
+    fn chat_id_validation() {
+        for ok in ["c1", "A-b_9", &"x".repeat(128)] {
+            assert!(is_valid_chat_id(ok), "{ok}");
+        }
+        let long = "x".repeat(129);
+        for bad in [
+            "",
+            "../users/me",
+            "%2e%2e/users/me",
+            "c1?x=1",
+            "c1#frag",
+            "a/b",
+            "c 1",
+            "é",
+            &long,
+        ] {
+            assert!(!is_valid_chat_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn content_limit_rejects_oversize_without_truncation() {
+        assert!(ensure_content_limit(&"x".repeat(MAX_TRANSCRIPT_BYTES)).is_ok());
+        let err = ensure_content_limit(&"x".repeat(MAX_TRANSCRIPT_BYTES + 1)).unwrap_err();
+        assert!(err.to_string().contains("1 MiB"));
     }
 }

@@ -609,6 +609,28 @@ pub fn chat_list_command(
     Ok(())
 }
 
+/// `monocle chat content <id>` — print one hosted thread's active message
+/// path to stdout (profile banner on stderr, like `chat list`). Nothing
+/// reaches stdout on error.
+pub fn chat_content_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &crate::profiles::Selection,
+    id: &str,
+    format: crate::jarvice_chats::ContentFormat,
+) -> Result<()> {
+    let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
+    eprintln!(
+        "Profile: {} ({}) — tenant {}",
+        selection.profile,
+        selection.environment,
+        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+    );
+    let output = crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format)?;
+    print!("{output}");
+    Ok(())
+}
+
 /// Build a warning about tool call(s) a turn couldn't act on, or `None` if
 /// there's nothing to report (monocle-cli#101 / monocle#275 — see
 /// `responses_api::ResponsesReply::tool_calls` for the canonical explanation
