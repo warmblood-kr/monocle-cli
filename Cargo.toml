@@ -60,7 +60,11 @@ tempfile = "3"
 # the unix build (which uses tar.gz) doesn't pull it in. Trim default features to
 # the deflate codec used by the release zips.
 [target.'cfg(windows)'.dependencies]
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+# Lets the zip extractor's tests run on every platform, not only windows.
+[dev-dependencies]
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [profile.release]
 strip = true
