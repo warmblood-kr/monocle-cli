@@ -152,6 +152,21 @@ impl Client {
         send("POST", url, req)
     }
 
+    /// Send a single-use authorization-code exchange without transport replay.
+    /// A failed send can occur after the provider consumed the code.
+    pub fn post_form_once(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        form: &[(&str, &str)],
+    ) -> Result<Resp> {
+        let mut req = self.inner.post(url).form(form);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        send_with_policy("POST", url, req, false)
+    }
+
     /// POST `application/json`.
     pub fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Resp> {
         let mut req = self.inner.post(url).json(body);
@@ -249,11 +264,9 @@ impl Client {
 /// different problem — real transient 5xx/429 responses from a server that
 /// *did* answer — and would need its own, separately-scoped retry policy).
 ///
-/// Safe to retry unconditionally here (not just for idempotent methods):
-/// every call site through this module is an LLM/media API call (chat
-/// completion, token exchange, audio upload/synthesis) where, at worst, a
-/// retry re-dispatches a request the first attempt never got a response for
-/// — wasteful if the server did somehow start work, never corrupting.
+/// Callers with single-use authorization codes must opt out via
+/// `post_form_once`: a missing response does not prove the first request
+/// was unprocessed. Existing other call sites retain their retry policy.
 ///
 /// `try_clone()` only fails for a non-replayable body (a raw stream); every
 /// body sent through this module (JSON, form, in-memory multipart) is
@@ -282,11 +295,25 @@ fn send_with_retry(
 }
 
 fn send(method: &str, url: &str, req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
+    send_with_policy(method, url, req, true)
+}
+
+fn send_with_policy(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+    retry_transport: bool,
+) -> Result<Resp> {
     // Total request timeout — non-streaming only (see `Client::new`). Streaming
     // (`post_json_stream`) builds and sends its own request without this, so a
     // long generation is never cut short.
     let req = req.timeout(std::time::Duration::from_secs(120));
-    let resp = send_with_retry(method, url, req).map_err(|e| {
+    let result = if retry_transport {
+        send_with_retry(method, url, req)
+    } else {
+        req.send()
+    };
+    let resp = result.map_err(|e| {
         let msg = e.to_string();
         crate::diag::log_network_error(method, url, &msg);
         AppError(msg)

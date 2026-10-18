@@ -72,12 +72,7 @@ pub fn ensure_fresh_token(client: &Client, creds: &Credentials) -> Result<AuthSe
     };
 
     let mut active = stored.clone();
-    let jwt_exp = jwt_exp_ms(&stored.access_token);
-    let expires_at = match jwt_exp {
-        Some(Some(exp)) => Some(exp),
-        Some(None) => None,
-        None => parse_iso_ms(&stored.access_token_expires_at),
-    };
+    let expires_at = access_expiry_ms(&stored);
     if expires_at.is_some_and(|exp| now_ms() + EXPIRY_BUFFER_MS >= exp) {
         match refresh_access_token(client, &stored, creds) {
             Ok(refreshed) => active = refreshed,
@@ -92,6 +87,15 @@ pub fn ensure_fresh_token(client: &Client, creds: &Credentials) -> Result<AuthSe
         token: active.access_token,
         router_url,
     })
+}
+
+/// Shared by refresh policy and diagnostics: decoded JWT `exp` takes precedence;
+/// a decoded JWT without `exp` has unknown expiry, never a fabricated ISO fallback.
+pub fn access_expiry_ms(creds: &CredentialsData) -> Option<i64> {
+    match jwt_exp_ms(&creds.access_token) {
+        Some(exp) => exp,
+        None => parse_iso_ms(&creds.access_token_expires_at),
+    }
 }
 
 /// `Some(None)` means a JWT payload was decoded but has no usable `exp`; `None`
@@ -122,6 +126,27 @@ pub fn get_access_token(client: &Client, creds: &Credentials) -> AuthSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_expiry_uses_auth_policy() {
+        use base64::Engine;
+        let mut creds: CredentialsData = serde_json::from_value(serde_json::json!({
+            "tenant_domain":"synthetic", "tenant_name":"synthetic", "email":"synthetic",
+            "access_token":"opaque", "refresh_token":"synthetic", "id_token":"synthetic",
+            "access_token_expires_at":"2000-01-01T00:00:00.000Z",
+            "refresh_token_expires_at":"2099-01-01T00:00:00.000Z"
+        }))
+        .unwrap();
+        assert_eq!(
+            access_expiry_ms(&creds),
+            parse_iso_ms(&creds.access_token_expires_at)
+        );
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":123}"#);
+        creds.access_token = format!("x.{payload}.x");
+        assert_eq!(access_expiry_ms(&creds), Some(123000));
+        creds.access_token = "x.e30.x".into();
+        assert_eq!(access_expiry_ms(&creds), None);
+    }
 
     #[test]
     fn try_access_token_errors_when_not_logged_in() {

@@ -266,7 +266,8 @@ fn handle_callback(
     };
 
     // Exchange code for tokens.
-    let resp = match client.post_form(
+    // Authorization codes are single-use; a lost response must not replay one.
+    let resp = match client.post_form_once(
         &oidc.token_endpoint,
         &[],
         &[
@@ -363,7 +364,9 @@ fn device_code_login(
             resp.status
         )));
     }
+    let issued_at = Instant::now();
     let device: DeviceAuthResponse = resp.json()?;
+    validate_device_timing(device.interval.unwrap_or(5), device.expires_in)?;
 
     eprintln!();
     eprintln!("{}", c::bold("To authenticate, visit:"));
@@ -377,6 +380,8 @@ fn device_code_login(
         eprintln!("  {}", c::cyan(complete));
         eprintln!();
     }
+    // Start the provider's lifetime before displaying the instructions.
+    eprintln!("This device code expires in {} seconds. If it expires before approval, rerun `monocle login --device-code` with the same tenant/environment options.", device.expires_in);
     eprintln!("{}", c::dim("Waiting for authorization..."));
 
     let token = poll_for_token(
@@ -385,6 +390,7 @@ fn device_code_login(
         &device.device_code,
         device.interval.unwrap_or(5),
         device.expires_in,
+        issued_at,
     )?;
 
     let creds = build_creds(
@@ -406,77 +412,123 @@ fn poll_for_token(
     device_code: &str,
     interval: i64,
     expires_in: i64,
+    issued_at: Instant,
 ) -> Result<TokenResponse> {
-    let deadline = now_ms() + expires_in * 1000;
-    let mut current_interval = interval;
+    poll_with_clock(
+        interval,
+        expires_in,
+        || issued_at.elapsed(),
+        std::thread::sleep,
+        || {
+            let resp = client.post_form(
+                token_endpoint,
+                &[],
+                &[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", device_code),
+                    ("client_id", CLIENT_ID),
+                ],
+            )?;
 
-    while now_ms() < deadline {
-        std::thread::sleep(Duration::from_secs(current_interval.max(0) as u64));
+            device_poll_response(resp.status, resp.bytes())
+        },
+    )
+}
 
-        let resp = client.post_form(
-            token_endpoint,
-            &[],
-            &[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", device_code),
-                ("client_id", CLIENT_ID),
-            ],
-        )?;
-
-        if resp.ok() {
-            return resp.json();
+fn device_poll_response(status: u16, body: impl AsRef<[u8]>) -> Result<PollReply> {
+    let body = body.as_ref();
+    if (200..300).contains(&status) {
+        let token: TokenResponse = serde_json::from_slice(body)?;
+        if token.access_token.as_deref().is_none_or(str::is_empty) {
+            return Err(AppError::new("No access_token in device token response"));
         }
-
-        let val = resp.json::<Value>().ok();
-        let error = val
-            .as_ref()
-            .and_then(|v| v.get("error"))
-            .and_then(Value::as_str);
-
-        match error {
-            Some("authorization_pending") => continue,
-            Some("slow_down") => {
-                current_interval += 5;
-                continue;
-            }
-            Some("expired_token") => {
-                return Err(AppError::new(
-                    "Device code expired. Please run login again.",
-                ))
-            }
-            Some("access_denied") => {
-                return Err(AppError::new(
-                    "Authorization request was denied by the user.",
-                ))
-            }
-            Some(e) => {
-                let desc = val
-                    .as_ref()
-                    .and_then(|v| v.get("error_description"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                return Err(AppError::new(format!("Token polling failed: {e} - {desc}")));
-            }
-            None => {
-                let raw = resp.text();
-                let snippet: String = raw.chars().take(200).collect();
-                let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-                let snippet = if snippet.is_empty() {
-                    "(empty)".to_string()
-                } else {
-                    snippet
-                };
-                return Err(AppError::new(format!(
-                    "Token polling failed: server returned HTTP {} with non-OAuth response. Body: {snippet}",
-                    resp.status
-                )));
-            }
-        }
+        return Ok(PollReply::Success(token));
     }
 
-    Err(AppError::new(
-        "Device code expired. Please run login again.",
-    ))
+    let val = serde_json::from_slice::<Value>(body).ok();
+    let error = val
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(Value::as_str);
+
+    match error {
+        Some("authorization_pending") => Ok(PollReply::Pending),
+        Some("slow_down") => Ok(PollReply::SlowDown),
+        Some("expired_token") => Err(device_expired()),
+        Some("access_denied") => Err(AppError::new(
+            "Authorization request was denied by the user.",
+        )),
+        Some(e) => {
+            let desc = val
+                .as_ref()
+                .and_then(|v| v.get("error_description"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Err(AppError::new(format!("Token polling failed: {e} - {desc}")))
+        }
+        None => {
+            let raw = String::from_utf8_lossy(body);
+            let snippet: String = raw.chars().take(200).collect();
+            let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+            let snippet = if snippet.is_empty() {
+                "(empty)".to_string()
+            } else {
+                snippet
+            };
+            Err(AppError::new(format!(
+            "Token polling failed: server returned HTTP {} with non-OAuth response. Body: {snippet}",
+            status
+        )))
+        }
+    }
+}
+
+fn device_expired() -> AppError {
+    AppError::new("Device authorization code expired before token retrieval completed. Rerun `monocle login --device-code` with the same tenant/environment options. This is not a refresh-token failure.")
+}
+
+fn validate_device_timing(interval: i64, expires_in: i64) -> Result<()> {
+    // Bounds avoid overflow/unbounded sleeps on malformed provider responses.
+    if !(1..=86400).contains(&interval) || !(1..=86400).contains(&expires_in) {
+        return Err(AppError::new("Invalid device authorization timing: interval and expires_in must be positive and at most 86400 seconds"));
+    }
+    Ok(())
+}
+
+enum PollReply {
+    Pending,
+    SlowDown,
+    Success(TokenResponse),
+}
+
+// The same loop runs in production and with a synthetic monotonic clock in tests.
+// It has no credentials/store argument: unsuccessful polling cannot persist tokens.
+fn poll_with_clock(
+    interval: i64,
+    expires_in: i64,
+    elapsed: impl Fn() -> Duration,
+    mut sleep: impl FnMut(Duration),
+    mut request: impl FnMut() -> Result<PollReply>,
+) -> Result<TokenResponse> {
+    validate_device_timing(interval, expires_in)?;
+    let lifetime = Duration::from_secs(expires_in as u64);
+    let mut interval = Duration::from_secs(interval as u64);
+    loop {
+        let remaining = lifetime.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return Err(device_expired());
+        }
+        sleep(interval.min(remaining));
+        // A sleep may overshoot. Never start an HTTP poll at/after the deadline.
+        if elapsed() >= lifetime {
+            return Err(device_expired());
+        }
+        match request()? {
+            PollReply::Pending => {}
+            PollReply::SlowDown => interval = interval.saturating_add(Duration::from_secs(5)),
+            PollReply::Success(token) => return Ok(token),
+        }
+    }
 }
 
 fn build_creds(
@@ -546,4 +598,471 @@ fn print_login_success(email: &str, tenant_name: &str, leading_newline: bool) {
         c::bold("monocle setup"),
         c::dim(".)")
     );
+}
+
+#[cfg(test)]
+mod device_deadline_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn success() -> PollReply {
+        PollReply::Success(serde_json::from_str(r#"{"access_token":"synthetic"}"#).unwrap())
+    }
+
+    #[test]
+    fn pending_then_success_uses_provider_interval() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut calls = 0;
+        let token = poll_with_clock(
+            2,
+            10,
+            || elapsed.get(),
+            |d| elapsed.set(elapsed.get() + d),
+            || {
+                calls += 1;
+                Ok(if calls == 1 {
+                    PollReply::Pending
+                } else {
+                    success()
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(elapsed.get(), Duration::from_secs(4));
+        assert_eq!(token.access_token.as_deref(), Some("synthetic"));
+    }
+
+    #[test]
+    fn sleep_crossing_deadline_never_polls() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = poll_with_clock(
+            2,
+            3,
+            || elapsed.get(),
+            |d| elapsed.set(elapsed.get() + d + Duration::from_secs(2)),
+            || panic!("must not request after expiry"),
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("not a refresh-token failure"));
+    }
+
+    #[test]
+    fn slow_down_crossing_deadline_does_not_request_again() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut calls = 0;
+        let result = poll_with_clock(
+            2,
+            8,
+            || elapsed.get(),
+            |d| elapsed.set(elapsed.get() + d),
+            || {
+                calls += 1;
+                Ok(PollReply::SlowDown)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert_eq!(elapsed.get(), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn server_expiry_stops_without_regenerating_grant() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut calls = 0;
+        let result = poll_with_clock(
+            1,
+            8,
+            || elapsed.get(),
+            |d| elapsed.set(elapsed.get() + d),
+            || {
+                calls += 1;
+                device_poll_response(400, r#"{"error":"expired_token"}"#)
+            },
+        );
+        assert_eq!(calls, 1);
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("same tenant/environment"));
+    }
+
+    #[test]
+    fn invalid_timing_never_sleeps_or_requests() {
+        for (interval, lifetime) in [
+            (0, 3),
+            (-1, 3),
+            (2, 0),
+            (2, -1),
+            (i64::MAX, 3),
+            (2, i64::MAX),
+        ] {
+            assert!(poll_with_clock(
+                interval,
+                lifetime,
+                || Duration::ZERO,
+                |_| panic!("invalid timing must not sleep"),
+                || panic!("invalid timing must not poll")
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn device_response_categories_and_missing_token_are_distinct() {
+        assert!(matches!(
+            device_poll_response(400, r#"{"error":"authorization_pending"}"#).unwrap(),
+            PollReply::Pending
+        ));
+        assert!(matches!(
+            device_poll_response(400, r#"{"error":"slow_down"}"#).unwrap(),
+            PollReply::SlowDown
+        ));
+        assert!(device_poll_response(400, r#"{"error":"expired_token"}"#)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("not a refresh-token failure"));
+        assert!(device_poll_response(400, r#"{"error":"access_denied"}"#)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("denied by the user"));
+        for body in [r#"{}"#, r#"{"access_token":""}"#] {
+            assert!(device_poll_response(200, body).is_err());
+        }
+        assert!(matches!(
+            device_poll_response(200, r#"{"access_token":"synthetic"}"#).unwrap(),
+            PollReply::Success(_)
+        ));
+    }
+
+    #[test]
+    fn device_expiry_diagnostic_does_not_infer_approval_timing() {
+        let local = poll_with_clock(
+            2,
+            3,
+            || Duration::from_secs(3),
+            |_| panic!("expired grant must not sleep"),
+            || panic!("expired grant must not poll"),
+        )
+        .err()
+        .unwrap();
+        let server = device_poll_response(400, r#"{"error":"expired_token"}"#)
+            .err()
+            .unwrap();
+        for error in [local, server] {
+            let message = error.to_string();
+            assert!(message.contains("expired before token retrieval completed"));
+            assert!(!message.contains("approval"));
+            assert!(message.contains("same tenant/environment options"));
+            assert!(message.contains("not a refresh-token failure"));
+        }
+    }
+
+    #[test]
+    fn already_expired_does_not_sleep_or_request() {
+        assert!(poll_with_clock(
+            2,
+            3,
+            || Duration::from_secs(3),
+            |_| panic!("expired grant must not sleep"),
+            || panic!("expired grant must not poll")
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod browser_exchange_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread;
+
+    // Each test runs in its own process with a temporary diagnostic HOME;
+    // never mutate process-global HOME while other tests are running.
+    fn isolated_parent(test: &str) -> bool {
+        if std::env::var_os("MONOCLE_BROWSER_TEST_HOME")
+            .is_some_and(|home| Some(home) == std::env::var_os("HOME"))
+        {
+            return false;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                &format!("commands::login::browser_exchange_tests::{test}"),
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("MONOCLE_BROWSER_TEST_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "synthetic child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    // All values are synthetic. No browser, discovery, live account or home store.
+    struct Outcome {
+        browser: Browser,
+        html: String,
+        forms: Vec<String>,
+        saved: bool,
+        unchanged: bool,
+    }
+
+    fn exercise(
+        state: &str,
+        status: u16,
+        body: &'static str,
+        lose_response: bool,
+        fail_save: bool,
+    ) -> Outcome {
+        let home = tempfile::tempdir().unwrap();
+        let store = Credentials::with_home(home.path());
+        if fail_save {
+            std::fs::write(store.dir(), "synthetic obstruction").unwrap();
+        } else {
+            store
+                .write(&build_creds(
+                    Some("synthetic.invalid"),
+                    None,
+                    "previous-synthetic-access".into(),
+                    None,
+                    None,
+                    None,
+                ))
+                .unwrap();
+        }
+        let prior_bytes = std::fs::read(store.path()).ok();
+        let tokens = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/token", tokens.local_addr().unwrap());
+        tokens.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let provider = thread::spawn(move || {
+            let mut forms = Vec::new();
+            while !stop_server.load(Ordering::SeqCst) {
+                let (mut stream, _) = match tokens.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(e) => panic!("synthetic listener failed: {e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST /token "));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut form = vec![0; length];
+                reader.read_exact(&mut form).unwrap();
+                forms.push(String::from_utf8(form).unwrap());
+                if lose_response && forms.len() == 1 {
+                    // Code consumed; response lost/corrupted before valid HTTP headers.
+                    // Invalid HTTP avoids timing-dependent empty-close behavior in hyper.
+                    stream.write_all(b"not an http response\r\n\r\n").unwrap();
+                } else {
+                    let (status, body) = if lose_response {
+                        (400, r#"{"error":"invalid_grant"}"#)
+                    } else {
+                        (status, body)
+                    };
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{body}", body.len()).unwrap();
+                }
+            }
+            forms
+        });
+        let callback = Server::http("127.0.0.1:0").unwrap();
+        let redirect = format!(
+            "http://{}/oauth/oidc/callback",
+            callback.server_addr().to_ip().unwrap()
+        );
+        let redirect_worker = redirect.clone();
+        let worker_home = home.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            let req = callback
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            handle_callback(
+                &Client::new(),
+                &Credentials::with_home(worker_home),
+                Some("synthetic.invalid"),
+                "synthetic-state",
+                &OIDCConfig {
+                    issuer: "synthetic".into(),
+                    authorization_endpoint: "unused".into(),
+                    token_endpoint: endpoint,
+                    device_authorization_endpoint: None,
+                    router_url: None,
+                },
+                &redirect_worker,
+                "synthetic-verifier",
+                req,
+            )
+            .unwrap()
+        });
+        let html = Client::new()
+            .get(
+                &format!("{redirect}?state={state}&code=synthetic-code"),
+                &[],
+            )
+            .unwrap()
+            .text();
+        let browser = worker.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let forms = provider.join().unwrap();
+        for form in &forms {
+            let params = parse_query(form);
+            let has = |name: &str, value: &str| params.iter().any(|(k, v)| k == name && v == value);
+            assert!(has("grant_type", "authorization_code"));
+            assert!(has("client_id", CLIENT_ID));
+            assert!(has("code", "synthetic-code"));
+            assert!(has("code_verifier", "synthetic-verifier"));
+            assert!(has("redirect_uri", &redirect));
+        }
+        let saved = if fail_save {
+            false
+        } else {
+            let data = store.read().unwrap();
+            let saved = data.access_token == "synthetic-access";
+            if saved {
+                #[cfg(unix)]
+                assert_eq!(store.file_mode(), Some(0o600));
+            }
+            saved
+        };
+        Outcome {
+            browser,
+            html,
+            forms,
+            saved,
+            unchanged: prior_bytes == std::fs::read(store.path()).ok(),
+        }
+    }
+
+    #[test]
+    fn consumed_code_is_not_replayed_after_response_loss() {
+        if isolated_parent("consumed_code_is_not_replayed_after_response_loss") {
+            return;
+        }
+        let out = exercise("synthetic-state", 200, "unused", true, false);
+        assert_eq!(out.forms.len(), 1, "single-use code must not be replayed");
+        assert!(matches!(out.browser, Browser::Fatal(_)));
+        assert!(!out.html.contains("invalid_grant"));
+        assert!(!out.saved);
+        assert!(out.unchanged);
+    }
+
+    #[test]
+    fn valid_callback_exchanges_and_saves() {
+        if isolated_parent("valid_callback_exchanges_and_saves") {
+            return;
+        }
+        let out = exercise(
+            "synthetic-state",
+            200,
+            r#"{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expires_in":3600}"#,
+            false,
+            false,
+        );
+        assert_eq!(out.forms.len(), 1);
+        assert!(matches!(out.browser, Browser::Success));
+        assert!(out.html.contains("Authentication Successful"));
+        assert!(!out.html.contains("synthetic-access"));
+        assert!(out.saved);
+    }
+
+    #[test]
+    fn state_mismatch_never_exchanges_or_saves() {
+        if isolated_parent("state_mismatch_never_exchanges_or_saves") {
+            return;
+        }
+        let out = exercise("wrong", 200, "unused", false, false);
+        assert!(out.forms.is_empty());
+        assert!(matches!(out.browser, Browser::Fatal(_)));
+        assert!(!out.saved);
+        assert!(out.unchanged);
+    }
+
+    #[test]
+    fn rejected_exchange_never_saves_or_retries() {
+        if isolated_parent("rejected_exchange_never_saves_or_retries") {
+            return;
+        }
+        let out = exercise(
+            "synthetic-state",
+            403,
+            r#"{"error":"access_denied"}"#,
+            false,
+            false,
+        );
+        assert_eq!(out.forms.len(), 1);
+        assert!(matches!(out.browser, Browser::Fatal(_)));
+        assert!(out.html.contains("Token exchange failed (HTTP 403)"));
+        assert!(!out.saved);
+        assert!(out.unchanged);
+    }
+
+    #[test]
+    fn malformed_or_missing_token_never_saves() {
+        if isolated_parent("malformed_or_missing_token_never_saves") {
+            return;
+        }
+        for body in ["not JSON", r#"{"refresh_token":"synthetic-refresh"}"#] {
+            let out = exercise("synthetic-state", 200, body, false, false);
+            assert_eq!(out.forms.len(), 1);
+            assert!(matches!(out.browser, Browser::Fatal(_)));
+            assert!(!out.saved);
+            assert!(out.unchanged);
+        }
+    }
+
+    #[test]
+    fn persistence_failure_does_not_report_login_success() {
+        if isolated_parent("persistence_failure_does_not_report_login_success") {
+            return;
+        }
+        let out = exercise(
+            "synthetic-state",
+            200,
+            r#"{"access_token":"synthetic-access"}"#,
+            false,
+            true,
+        );
+        assert_eq!(out.forms.len(), 1);
+        assert!(matches!(out.browser, Browser::Fatal(_)));
+        assert!(!out.html.contains("Authentication Successful"));
+    }
 }

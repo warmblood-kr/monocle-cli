@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::auth::ensure_fresh_token;
+use crate::auth::{access_expiry_ms, ensure_fresh_token};
 use crate::credentials::Credentials;
 use crate::net::Client;
 use crate::profiles::Selection;
@@ -51,29 +51,22 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
     eprintln!("User: {}", creds.email);
 
     // Access token.
-    match parse_iso_ms(&creds.access_token_expires_at) {
+    match access_expiry_ms(&creds) {
         Some(exp) if now <= exp => {
             eprintln!(
                 "Access Token: Valid ({} remaining)",
                 format_remaining(exp - now)
             );
         }
-        _ => eprintln!("Access Token: Expired"),
+        Some(_) => eprintln!("Access Token: Expired"),
+        None => eprintln!("Access Token: Expiry unknown"),
     }
 
-    // Refresh token.
-    match parse_iso_ms(&creds.refresh_token_expires_at) {
-        Some(exp) if now <= exp => {
-            eprintln!(
-                "Refresh Token: Valid ({} remaining)",
-                format_remaining(exp - now)
-            );
-        }
-        _ => {
-            eprintln!("Refresh Token: Expired");
-            eprintln!("\n⚠ Refresh token has expired. Run `monocle login --tenant <domain>` to re-authenticate.");
-        }
-    }
+    // The cached refresh timestamp is an estimate, not provider evidence.
+    eprintln!(
+        "{}",
+        refresh_expiry_diagnostic(&creds.refresh_token_expires_at, now)
+    );
 
     // Claude Code configuration.
     let settings_path = home.join(".claude").join("settings.json");
@@ -92,4 +85,30 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
             "Not configured"
         }
     );
+}
+
+fn refresh_expiry_diagnostic(timestamp: &str, now: i64) -> String {
+    match parse_iso_ms(timestamp) {
+        Some(exp) if now <= exp => format!(
+            "Refresh Token: Cached estimate ({} remaining; provider validity not established)",
+            format_remaining(exp - now)
+        ),
+        Some(_) => "Refresh Token: Cached expiry estimate passed; provider validity unknown. This does not establish a refresh-token failure.".into(),
+        None => "Refresh Token: Expiry estimate unavailable; provider validity unknown".into(),
+    }
+}
+
+#[cfg(test)]
+mod expiry_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn cached_estimates_never_claim_provider_validity_or_failure() {
+        let now = parse_iso_ms("2026-01-01T00:00:00.000Z").unwrap();
+        let future = refresh_expiry_diagnostic("2099-01-01T00:00:00.000Z", now);
+        assert!(future.contains("Cached estimate") && future.contains("validity not established"));
+        let past = refresh_expiry_diagnostic("2000-01-01T00:00:00.000Z", now);
+        assert!(past.contains("does not establish a refresh-token failure"));
+        assert!(!past.contains("login"));
+        assert!(refresh_expiry_diagnostic("bad", now).contains("unavailable"));
+    }
 }
