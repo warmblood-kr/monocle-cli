@@ -55,7 +55,7 @@ Commands:
     profile  List, inspect, and select saved profiles
 
   Chat:
-    chat     Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
+    chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -127,7 +127,7 @@ enum Commands {
         #[command(subcommand)]
         command: RouterCommands,
     },
-    /// Chat with LLM via Monocle router (interactive REPL or pipe from stdin)
+    /// Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     Chat {
         #[command(subcommand)]
         command: Option<ChatCommand>,
@@ -195,39 +195,36 @@ struct ChatArgs {
     /// Model ID to use
     #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
     model: String,
-    /// System prompt text
-    #[arg(long = "system-prompt")]
+    /// Router-only; ignored with a warning (use `monocle router chat`).
+    #[arg(long = "system-prompt", hide = true)]
     system_prompt: Option<String>,
-    /// Load system prompt from file
-    #[arg(long = "system-prompt-file")]
+    /// Router-only; ignored with a warning (use `monocle router chat`).
+    #[arg(long = "system-prompt-file", hide = true)]
     system_prompt_file: Option<String>,
-    /// Maximum output tokens (omitted by default → model/router uses its own)
-    #[arg(long = "max-tokens")]
+    /// Router-only; ignored with a warning (use `monocle router chat`).
+    #[arg(long = "max-tokens", hide = true)]
     max_tokens: Option<String>,
     /// Attach a file/image (repeatable); local path or http(s) URL. One-shot
     /// (piped stdin) only — see also inband `file:<path>` tokens in the text.
     #[arg(long = "file")]
     file: Vec<String>,
-    /// Experimental: talk to jarvice's `/api/responses` instead of the plain
-    /// `/v1/chat/completions` — the server owns the conversation thread, so
-    /// this CLI doesn't accumulate history itself. jarvice-only (not reachable
-    /// through chat-proxy); no custom `--system-prompt` support (see
-    /// `responses_api` module docs).
-    #[arg(long)]
+    /// Hidden no-op kept until 2.0: plain `monocle chat` is already hosted
+    /// Chat (`/api/responses`).
+    #[arg(long, hide = true)]
     responses: bool,
-    /// With `--responses`, continue this existing server-side thread id
+    /// Continue this existing server-side thread id
     /// instead of starting a new one. When entering the interactive REPL,
     /// its prior history is replayed to stderr before the prompt. (See also
     /// `monocle chat list` to discover thread ids.)
     #[arg(long)]
     resume: Option<String>,
-    /// With `--responses`, MCP/connected-app server ids to activate for this
-    /// turn (comma-separated). Without this, a turn only gets tools from the
+    /// MCP/connected-app server ids to activate for this turn
+    /// (comma-separated). Without this, a turn only gets tools from the
     /// model's own static config — there is no other way to select which MCP
-    /// servers are on for a given `--responses` call.
+    /// servers are on for a given call.
     #[arg(long = "tool-ids", value_delimiter = ',')]
     tool_ids: Vec<String>,
-    /// With `--responses`, assert from the server's `tools_used` that a
+    /// Assert from the server's `tools_used` that a
     /// server-executed tool actually RAN, as a scriptable exit code. Pass a
     /// tool name to require THAT tool (`--verify-tool-firing=web_search`);
     /// bare, it only requires that at least one tool ran. Exit codes: 0 = the
@@ -248,7 +245,8 @@ impl From<ChatArgs> for ChatOptions {
             system_prompt_file: a.system_prompt_file,
             max_tokens: a.max_tokens,
             files: a.file,
-            responses: a.responses,
+            // 1.8: hosted Chat is the default; `--responses` is a no-op.
+            responses: true,
             resume: a.resume,
             tool_ids: a.tool_ids,
             verify_tool_firing: a.verify_tool_firing.map(|v| match v {
@@ -355,7 +353,7 @@ fn profile_show_command(
 enum ChatCommand {
     /// List existing jarvice chat threads (id/title/last-updated) — including
     /// threads created from jarvice's own web UI, since both share the same
-    /// storage. Always lists jarvice's threads; doesn't take `--responses`.
+    /// storage. Always lists jarvice's threads.
     List,
     /// Print one hosted Chat thread's active message path to stdout (text only; untrusted content)
     Content {
@@ -1240,12 +1238,74 @@ mod tests {
         assert_eq!(cli.env.as_deref(), Some("stg"));
     }
 
+    fn chat_opts(argv: &[&str]) -> ChatOptions {
+        match Cli::parse_from(argv).command {
+            Commands::Chat { args, .. } => ChatOptions::from(args),
+            _ => panic!("expected Chat command for {argv:?}"),
+        }
+    }
+
+    // Was S1a's `chat_unchanged_in_s1a` (asserted `responses == false`);
+    // flipped in 1b: plain `chat` is hosted Chat.
     #[test]
-    fn chat_unchanged_in_s1a() {
-        let Commands::Chat { args, .. } = Cli::parse_from(["monocle", "chat"]).command else {
-            panic!("expected Chat command");
+    fn chat_is_hosted_by_default() {
+        assert!(chat_opts(&["monocle", "chat"]).responses);
+    }
+
+    #[test]
+    fn chat_responses_flag_is_hidden_noop() {
+        assert!(chat_opts(&["monocle", "chat", "--responses"]).responses);
+        let opts = chat_opts(&[
+            "monocle",
+            "chat",
+            "--responses",
+            "--resume",
+            "abc",
+            "--tool-ids",
+            "a,b",
+        ]);
+        assert!(opts.responses);
+        assert_eq!(opts.resume.as_deref(), Some("abc"));
+        assert_eq!(opts.tool_ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn chat_router_flags_still_parse() {
+        let opts = chat_opts(&[
+            "monocle",
+            "chat",
+            "--system-prompt",
+            "s",
+            "--system-prompt-file",
+            "f",
+            "--max-tokens",
+            "5",
+        ]);
+        assert!(opts.responses);
+        assert_eq!(opts.system_prompt.as_deref(), Some("s"));
+        assert_eq!(opts.system_prompt_file.as_deref(), Some("f"));
+        assert_eq!(opts.max_tokens.as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn router_chat_still_router() {
+        let RouterCommands::Chat(args) = router(&["monocle", "router", "chat"]) else {
+            panic!("expected RouterCommands::Chat");
         };
         assert!(!ChatOptions::from(args).responses);
-        assert!(Cli::try_parse_from(["monocle", "chat", "--responses", "--resume", "abc"]).is_ok());
+    }
+
+    #[test]
+    fn chat_help_hides_responses_and_router_flags() {
+        use clap::CommandFactory;
+        let help = Cli::command()
+            .find_subcommand_mut("chat")
+            .expect("chat subcommand")
+            .render_help()
+            .to_string();
+        for hidden in ["--responses", "--system-prompt", "--max-tokens"] {
+            assert!(!help.contains(hidden), "{hidden} in chat help:\n{help}");
+        }
+        assert!(help.contains("--resume"), "{help}");
     }
 }

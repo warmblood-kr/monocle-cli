@@ -1,5 +1,5 @@
 //! Client for jarvice's existing chat-thread storage (`/api/v1/chats`), used
-//! to let `monocle chat --responses` discover and replay threads that already
+//! to let `monocle chat` (hosted Chat) discover and replay threads that already
 //! exist — including ones created entirely from jarvice's own web UI, since
 //! both write to the exact same `chat` table (`backend/open_webui/models/chats.py`).
 //!
