@@ -45,6 +45,11 @@ pub fn claude_command(creds: &Credentials, args: &[String]) {
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env("ANTHROPIC_BASE_URL", &router_url)
         .env("ANTHROPIC_CUSTOM_HEADERS", &custom_headers);
+    // Bare `monocle token` calls inside the session (plugins, scripts) must
+    // resolve the same profile as the apiKeyHelper above, not the default.
+    if let Some(profile) = creds.profile() {
+        cmd.env("MONOCLE_PROFILE", profile);
+    }
 
     run(cmd);
 }
