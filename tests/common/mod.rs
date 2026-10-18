@@ -108,6 +108,18 @@ pub fn stub<F>(handler: F) -> Stub
 where
     F: Fn(&str, &str, &str, &str) -> (u16, String) + Send + 'static,
 {
+    stub_with_headers(move |addr, method, url, body| {
+        let (status, resp_body) = handler(addr, method, url, body);
+        (status, resp_body, Vec::new())
+    })
+}
+
+/// Like [`stub`] but the handler also returns response headers
+/// (`(name, value)` pairs), e.g. `x-thread-id` for `/api/responses`.
+pub fn stub_with_headers<F>(handler: F) -> Stub
+where
+    F: Fn(&str, &str, &str, &str) -> (u16, String, Vec<(&'static str, String)>) + Send + 'static,
+{
     let server = Server::http("127.0.0.1:0").unwrap();
     let port = server.server_addr().to_ip().unwrap().port();
     let addr = format!("127.0.0.1:{port}");
@@ -118,8 +130,14 @@ where
             let url = req.url().to_string();
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
-            let (status, resp_body) = handler(&addr_for_thread, &method, &url, &body);
-            let _ = req.respond(Response::from_string(resp_body).with_status_code(status));
+            let (status, resp_body, headers) = handler(&addr_for_thread, &method, &url, &body);
+            let mut resp = Response::from_string(resp_body).with_status_code(status);
+            for (name, value) in headers {
+                resp = resp.with_header(
+                    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap(),
+                );
+            }
+            let _ = req.respond(resp);
         }
     });
     Stub { addr }
