@@ -248,9 +248,13 @@ fn handle_diag_toggle(
         "/diag on" | "/diag off" => {
             let value = trimmed == "/diag on";
             *always_on = value;
-            if let Err(e) = cfg.write(&ConfigData {
-                diag_always_on: value,
-                ..ConfigData::default()
+            // Read-modify-write so profiles survive; a corrupt file is left
+            // alone rather than overwritten.
+            if let Err(e) = cfg.read_strict().and_then(|data| {
+                cfg.write(&ConfigData {
+                    diag_always_on: value,
+                    ..data
+                })
             }) {
                 eprintln!("Warning: failed to save diagnostics preference: {e}");
             }
@@ -1399,6 +1403,34 @@ mod tests {
         ));
         assert!(!always_on);
         assert!(!cfg.read().diag_always_on);
+    }
+
+    // Blocker (d): `/diag on|off` must not wipe profiles/default_profile.
+    #[test]
+    fn diag_toggle_preserves_profiles() {
+        let mut model = "monocle-auto".to_string();
+        let diagnostics: Option<TurnDiagnostics> = None;
+        let mut always_on = false;
+        let (_dir, cfg) = test_config();
+        use crate::config::ConfigData;
+        let mut data = ConfigData {
+            default_profile: Some("work".into()),
+            config_version: 1,
+            ..ConfigData::default()
+        };
+        data.profiles.insert("work".into(), Default::default());
+        cfg.write(&data).unwrap();
+
+        dispatch_chat_command("/diag on", &mut model, &diagnostics, &mut always_on, &cfg);
+        let saved = cfg.read_strict().unwrap();
+        assert!(saved.diag_always_on);
+        assert_eq!(
+            saved,
+            ConfigData {
+                diag_always_on: true,
+                ..data
+            }
+        );
     }
 
     #[test]

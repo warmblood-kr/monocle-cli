@@ -474,6 +474,9 @@ fn main() {
     let client = Client::new();
     let home = util::home_dir();
     let config = Config::new();
+    if let Err(e) = profiles::migrate_legacy(&config, &home) {
+        eprintln!("Warning: Failed to migrate config to profiles: {e}");
+    }
     let selection =
         match profiles::resolve(&config, &home, cli.profile.as_deref(), cli.env.as_deref()) {
             Ok(selection) => selection,

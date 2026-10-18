@@ -73,6 +73,8 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 
 Profile selection is consistent across authenticated commands. `--profile` takes precedence over `MONOCLE_PROFILE`, then the saved default, then `default`. Each profile remembers its environment; `--env` selects a separate credential slot without replacing another environment's session. The default profile continues to use the existing `~/.monocle/credentials.json` when it matches the saved or inferred environment.
 
+Upgrading from a release without profiles needs no re-login: on first run the existing session becomes the `default` profile, `~/.monocle/config.json` is backed up once to `~/.monocle/config.json.pre-profiles`, and an existing `apiKeyHelper` of `monocle token` keeps working. Downgrading is not supported; to go back, restore that backup.
+
 `monocle handoff` reads one authorized hosted Chat thread using the selected profile, confirms the tenant and message count, and gives Claude Code a temporary private transcript. The transcript is removed when Claude Code exits. The command does not change the hosted conversation.
 
 ## 💬 Chat with models
