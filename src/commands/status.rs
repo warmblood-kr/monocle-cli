@@ -77,11 +77,14 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
 
     // Claude Code configuration.
     let settings_path = home.join(".claude").join("settings.json");
-    let token_helper = store.token_helper();
     let claude_configured = std::fs::read_to_string(&settings_path)
         .ok()
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .map(|s| s.get("apiKeyHelper").and_then(Value::as_str) == Some(token_helper.as_str()))
+        .and_then(|s| {
+            s.get("apiKeyHelper")?
+                .as_str()
+                .map(|h| store.accepts_token_helper(h))
+        })
         .unwrap_or(false);
 
     eprintln!(

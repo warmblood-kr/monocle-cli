@@ -27,6 +27,10 @@ pub struct ConfigData {
     /// Per-profile non-secret connection settings.
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileData>,
+    /// Schema marker. `0` (absent) = pre-profiles config; see
+    /// `profiles::migrate_legacy`.
+    #[serde(default)]
+    pub config_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -104,7 +108,10 @@ impl Config {
         let path = self.path();
         fs::create_dir_all(&dir)?;
         let json = serde_json::to_string_pretty(data)?;
-        fs::write(&path, json)?;
+        // Temp file + rename so concurrent runs never see a half-written file.
+        let tmp = dir.join(format!("config.json.tmp.{}", std::process::id()));
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, &path)?;
         Ok(())
     }
 }

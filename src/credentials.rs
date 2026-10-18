@@ -173,13 +173,32 @@ impl Credentials {
         self.environment.as_deref()
     }
 
+    /// The `apiKeyHelper` command `setup` writes. The default profile's
+    /// legacy slot keeps the pre-profiles short form so existing Claude Code
+    /// setups stay valid; other slots pin profile and environment.
     pub fn token_helper(&self) -> String {
-        match (&self.profile, &self.environment) {
-            (Some(profile), Some(environment)) => {
-                format!("monocle --profile {profile} --env {environment} token")
+        match self.pinned_token_helper() {
+            Some(pinned)
+                if !(self.legacy_path
+                    && self.profile.as_deref() == Some(crate::profiles::DEFAULT_PROFILE)) =>
+            {
+                pinned
             }
             _ => "monocle token".to_string(),
         }
+    }
+
+    /// Whether an existing `apiKeyHelper` targets this slot: the current
+    /// form or the long pinned form both count.
+    pub fn accepts_token_helper(&self, helper: &str) -> bool {
+        helper == self.token_helper() || Some(helper.to_string()) == self.pinned_token_helper()
+    }
+
+    fn pinned_token_helper(&self) -> Option<String> {
+        let (profile, environment) = (self.profile.as_ref()?, self.environment.as_ref()?);
+        Some(format!(
+            "monocle --profile {profile} --env {environment} token"
+        ))
     }
 }
 
