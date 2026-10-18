@@ -75,6 +75,8 @@ Profile selection is consistent across authenticated commands. `--profile` takes
 
 Upgrading from a release without profiles needs no re-login: on first run the existing session becomes the `default` profile, `~/.monocle/config.json` is backed up once to `~/.monocle/config.json.pre-profiles`, and an existing `apiKeyHelper` of `monocle token` keeps working. Downgrading is not supported; to go back, restore that backup.
 
+Known limits: the first-run migration rewrites `config.json` without a lock, so a config change made by another `monocle` process at that same moment can be lost (first run only). If the default profile's saved environment has no credentials of its own but the existing session is for another environment, the default profile uses that session — this also applies to plain `monocle login`, which then signs in to the existing session's environment; pass `--env` to choose explicitly.
+
 `monocle handoff` reads one authorized hosted Chat thread using the selected profile, confirms the tenant and message count, and gives Claude Code a temporary private transcript. The transcript is removed when Claude Code exits. The command does not change the hosted conversation.
 
 ## 💬 Chat with models

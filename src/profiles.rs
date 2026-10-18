@@ -166,11 +166,11 @@ pub fn migrate_legacy(config: &Config, home: &Path) -> Result<()> {
     }
     if let Some(original) = original {
         let backup = config.dir().join("config.json.pre-profiles");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&backup)
-        {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&backup) {
             Ok(mut file) => std::io::Write::write_all(&mut file, original.as_bytes())?,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
@@ -438,6 +438,20 @@ mod tests {
         migrate_legacy(&config, home.path()).unwrap();
         assert_eq!(std::fs::read(&backup).unwrap(), b"original");
         assert_eq!(config.read_strict().unwrap().config_version, CONFIG_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_backup_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        write_legacy(home.path(), "warmblood.monocle-ai.com");
+        let config = Config::with_home(home.path());
+        std::fs::write(config.path(), br#"{"diag_always_on":true}"#).unwrap();
+        migrate_legacy(&config, home.path()).unwrap();
+        let backup = config.dir().join("config.json.pre-profiles");
+        let mode = std::fs::metadata(backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
