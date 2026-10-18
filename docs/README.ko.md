@@ -80,6 +80,7 @@ monocle status
 | 바뀐 점 | 할 일 |
 |---------|-------|
 | `echo q \| monocle chat`이 이제 hosted 스레드를 만들어요(웹 UI에 보임, 스트리밍/토큰 통계 없음) | 예전 라우터 직접 호출 동작은 `monocle router chat`을 쓰세요. `chat`에 준 `--system-prompt*`/`--max-tokens`는 경고와 함께 무시되고, `--responses`는 아무 동작도 하지 않아요 |
+| `chat --model X`를 더 이상 라우터 모델 목록으로 검증하지 않아요 | 없음 — 어떤 모델을 받을지는 hosted Chat이 정해요 |
 
 ### 1.6에서 1.7로 업그레이드
 
@@ -89,7 +90,7 @@ monocle status
 | `models`, `audio`, `image`, `model chat`이 `monocle router` 아래로 이동 | 옛 형태도 stderr 경고와 함께 동작해요. 2.0 전에 새 형태로 바꾸세요 |
 | `audio speech[-azure]` 이름 변경 | `monocle router audio speak[-azure]`를 쓰세요 |
 | `monocle model list` 제거 | `monocle router models`를 쓰세요 |
-| `monocle model chat --responses`는 이제 오류(exit 2) | `monocle chat --responses`를 쓰세요 |
+| `monocle model chat --responses`는 이제 오류(exit 2) | `monocle chat`을 쓰세요 |
 | 새 명령 `monocle chat content <id> [--format text\|json]`, chat id 엄격 검증, 출력의 제어 문자 제거 | — |
 | `zip` 의존성 업그레이드(RUSTSEC-2026-0367/0368/0369, Windows `upgrade`만 해당) | — |
 

@@ -97,6 +97,7 @@ These root forms still work and print a one-line warning on stderr (stdout is un
 | Change | What to do |
 |--------|------------|
 | `echo q \| monocle chat` now creates a hosted thread (web UI, no streaming/token stats) | For the old direct-router behaviour use `monocle router chat`. `--system-prompt*`/`--max-tokens` on `chat` are ignored with a warning; `--responses` is a no-op |
+| `chat --model X` is no longer validated against the router model list | Nothing — hosted Chat decides which models it accepts |
 
 ### Upgrading from 1.6 to 1.7
 
@@ -106,7 +107,7 @@ These root forms still work and print a one-line warning on stderr (stdout is un
 | `models`, `audio`, `image`, `model chat` move under `monocle router` | Old forms still work with a stderr warning; switch to the new form before 2.0 |
 | `audio speech[-azure]` is renamed | Use `monocle router audio speak[-azure]` |
 | `monocle model list` is removed | Use `monocle router models` |
-| `monocle model chat --responses` is now an error (exit 2) | Use `monocle chat --responses` |
+| `monocle model chat --responses` is now an error (exit 2) | Use `monocle chat` |
 | New `monocle chat content <id> [--format text\|json]`; chat ids are validated strictly and control characters are stripped from output | — |
 | `zip` dependency upgraded (RUSTSEC-2026-0367/0368/0369, Windows `upgrade` only) | — |
 
