@@ -146,23 +146,28 @@ fn extract_binary(bytes: &[u8], temp_path: &Path) -> Result<()> {
 /// Extract the `monocle.exe` binary from the downloaded zip into `temp_path`.
 #[cfg(windows)]
 fn extract_binary(bytes: &[u8], temp_path: &Path) -> Result<()> {
+    extract_zip_binary(bytes, temp_path)
+}
+
+/// Copies the bytes of the one regular-file entry named `monocle.exe` to
+/// `temp_path`. Entry paths, permissions and links are never applied (no
+/// `ZipArchive::extract`), so an archive can't write outside `temp_path` or
+/// set SUID/SGID bits. Compiled for tests on every platform.
+#[cfg(any(windows, test))]
+fn extract_zip_binary(bytes: &[u8], temp_path: &Path) -> Result<()> {
+    let zip_err = |e: zip::result::ZipError| AppError::new(e.to_string());
     let reader = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| AppError::new(e.to_string()))?;
+    let mut archive = zip::ZipArchive::new(reader).map_err(zip_err)?;
     let target = format!("{BINARY}.exe");
     for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| AppError::new(e.to_string()))?;
-        // Accept only a *file* entry named `monocle.exe` — skip directory entries
-        // so an odd archive layout can't produce a 0-byte install.
-        if file.is_dir() {
+        let mut file = archive.by_index(i).map_err(zip_err)?;
+        // Only a regular file: a directory would yield a 0-byte install, and a
+        // symlink entry's "contents" are just its target path.
+        if !file.is_file() {
             continue;
         }
-        let matches = Path::new(file.name())
-            .file_name()
-            .map(|n| n == target.as_str())
-            .unwrap_or(false);
-        if !matches {
+        let name = file.name().map_err(zip_err)?;
+        if Path::new(name.as_ref()).file_name() != Some(target.as_ref()) {
             continue;
         }
         // Stream the entry straight to disk (no second full-size in-memory copy).
@@ -456,5 +461,50 @@ mod tests {
             !out.exists(),
             "no file must be created for a dir-only archive"
         );
+    }
+
+    fn make_zip(build: impl FnOnce(&mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>)) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        build(&mut writer);
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn zip_extract_writes_only_to_temp_path_without_special_bits() {
+        use std::io::Write;
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o6755);
+        // Traversal-style entry name: only its bytes may land, at temp_path.
+        let archive = make_zip(|w| {
+            w.start_file("../../monocle.exe", options).unwrap();
+            w.write_all(b"binary").unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sub").join("out");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        extract_zip_binary(&archive, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"binary");
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "nothing written outside temp_path's dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7000, 0, "SUID/SGID/sticky must not be applied");
+        }
+    }
+
+    #[test]
+    fn zip_extract_skips_symlink_and_directory_entries() {
+        let options = zip::write::SimpleFileOptions::default();
+        let archive = make_zip(|w| {
+            w.add_symlink("monocle.exe", "/etc/passwd", options)
+                .unwrap();
+            w.add_directory("dir/monocle.exe/", options).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let err = extract_zip_binary(&archive, &out).unwrap_err();
+        assert!(err.to_string().contains("did not contain"), "got: {err}");
+        assert!(!out.exists());
     }
 }
