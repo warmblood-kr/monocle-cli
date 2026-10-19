@@ -581,10 +581,11 @@ from source instead (see Setup).
 
 ### Update notice
 
-After a command finishes, monocle checks for a newer release at most once every
-24 hours (3-second timeout, failures ignored; the result is cached in
-`~/.monocle/update-check.json`) and, if one exists, prints a single line to
-stderr:
+While a command runs, monocle checks for a newer release in the background at
+most once every 24 hours (3-second timeout, failures ignored; the result is
+cached in `~/.monocle/update-check.json`; the command never waits more than
+~300 ms for it) and, if one exists, prints a single line to stderr when the
+command finishes:
 
 ```
 monocle X.Y.Z is available (current A.B.C). Run `monocle upgrade`.

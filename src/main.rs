@@ -36,6 +36,7 @@ use monocle_cli::error::Result;
 use monocle_cli::jarvice_chats::ContentFormat;
 use monocle_cli::net::Client;
 use monocle_cli::profiles::{self, Selection};
+use monocle_cli::update_notice;
 use monocle_cli::util;
 
 // clap 4 has no native way to group subcommands under section headings, so the
@@ -813,12 +814,13 @@ fn main() {
         Err(c) => c,
     };
 
-    // `token` (apiKeyHelper: pristine stdout, no network), `upgrade` (does its
-    // own check) and `acp` (protocol stream) never get the update notice.
-    let notice_eligible = !matches!(
-        command,
-        Commands::Token | Commands::Upgrade { .. } | Commands::Acp
-    );
+    let notice_name = match &command {
+        Commands::Token => "token",
+        Commands::Upgrade { .. } => "upgrade",
+        Commands::Acp => "acp",
+        _ => "other",
+    };
+    let notice = update_notice::start(notice_name, &home);
 
     let result: Result<()> = match command {
         Commands::Login {
@@ -974,8 +976,8 @@ fn main() {
         }
     };
 
-    if result.is_ok() && notice_eligible {
-        monocle_cli::update_notice::run(&client, &home);
+    if result.is_ok() {
+        update_notice::finish(notice, notice_name, &home, update_notice::DEFAULT_GRACE);
     }
 
     if let Err(e) = result {

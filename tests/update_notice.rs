@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use monocle_cli::credentials::{Credentials, CredentialsData};
 use monocle_cli::net::Client;
-use monocle_cli::update_notice::{check, is_stale, notice_message, suppressed, Env};
+use monocle_cli::update_notice::{
+    check, command_eligible, enabled_for, finish_with, is_stale, notice_message, start_with,
+    suppressed, Env,
+};
 
 const DAY: i64 = 24 * 60 * 60;
 
@@ -166,4 +169,81 @@ fn token_command_is_untouched_by_a_stale_cache() {
     // A check would have bumped last_checked.
     let after = std::fs::read(home.path().join(".monocle/update-check.json")).unwrap();
     assert_eq!(before, after);
+}
+
+const TTY_ENV: Env = Env {
+    stderr_is_tty: true,
+    ci: false,
+    opted_out: false,
+};
+
+#[test]
+fn token_upgrade_acp_excluded_by_logic_even_on_a_tty() {
+    for name in ["token", "upgrade", "acp"] {
+        assert!(!command_eligible(name), "{name}");
+        assert!(!enabled_for(name, TTY_ENV), "{name}");
+    }
+    assert!(enabled_for("chat", TTY_ENV));
+    assert!(!enabled_for(
+        "chat",
+        Env {
+            ci: true,
+            ..TTY_ENV
+        }
+    ));
+}
+
+#[test]
+fn background_refresh_updates_cache_and_does_not_start_for_token() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let stub = release_stub("v2.5.0", hits.clone());
+    let home = tempfile::tempdir().unwrap();
+    seed(home.path(), 1, "1.0.0");
+
+    let p = start_with("token", home.path(), TTY_ENV, url(&stub));
+    finish_with(
+        p,
+        "token",
+        home.path(),
+        std::time::Duration::from_secs(2),
+        TTY_ENV,
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    let p = start_with("chat", home.path(), TTY_ENV, url(&stub));
+    finish_with(
+        p,
+        "chat",
+        home.path(),
+        std::time::Duration::from_secs(5),
+        TTY_ENV,
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let saved = std::fs::read_to_string(home.path().join(".monocle/update-check.json")).unwrap();
+    assert!(saved.contains("2.5.0"), "{saved}");
+}
+
+#[test]
+fn slow_server_does_not_delay_beyond_grace_and_still_backs_off() {
+    let stub = common::stub(|_, _, _, _| {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        (200, r#"{"tag_name":"v9.0.0"}"#.into())
+    });
+    let home = tempfile::tempdir().unwrap();
+    let t = std::time::Instant::now();
+    let p = start_with("chat", home.path(), TTY_ENV, url(&stub));
+    finish_with(
+        p,
+        "chat",
+        home.path(),
+        std::time::Duration::from_millis(300),
+        TTY_ENV,
+    );
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(1000),
+        "{:?}",
+        t.elapsed()
+    );
+    // Backoff was written before the fetch, so the next run will not retry.
+    assert!(home.path().join(".monocle/update-check.json").exists());
 }

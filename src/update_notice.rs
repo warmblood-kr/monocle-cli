@@ -1,14 +1,13 @@
 //! Passive "a newer monocle is available" notice (stderr only).
 //!
-//! Design: once the command has finished, `run` loads `~/.monocle/update-check.json`.
-//! If the cache is older than 24h it does ONE short-timeout (3s) GitHub check,
-//! then rewrites the cache (also on failure, so an offline user is not retried
-//! on every run). The notice is printed from the cached `latest_version`.
-//! Because it runs after the command, it can never delay or fail the command's
-//! own work; the worst case is one ~3s wait per day while offline/slow.
-//! Everything is best-effort: all errors are swallowed.
+//! Design: at startup, if enabled and `~/.monocle/update-check.json` is older
+//! than 24h, a detached thread bumps `last_checked` (backoff) and does ONE 3s
+//! GitHub check, storing `latest_version`. When the command finishes, `finish`
+//! waits at most ~300ms for that thread, then prints the notice from the cache.
+//! So the command is never delayed by more than the grace bound, and a slow
+//! check just lands in the cache for the next run. All errors are swallowed.
 //!
-//! The caller (main.rs) excludes `token`, `upgrade` and `acp`.
+//! `token`, `upgrade` and `acp` are excluded by [`command_eligible`].
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -88,36 +87,86 @@ fn write_cache(home: &Path, cache: &Cache) {
     }
 }
 
-/// Refresh the cache if stale (one network call at most), and return the notice
-/// to print, if any. `url` is injectable for tests.
-pub fn check(client: &Client, home: &Path, url: &str, now: i64, current: &str) -> Option<String> {
-    let mut cache = read_cache(home);
-    if is_stale(now, cache.as_ref()) {
-        let latest = fetch_latest_version(client, url, Some(CHECK_TIMEOUT)).ok();
-        let mut next = cache.unwrap_or_default();
-        next.last_checked = now;
-        if latest.is_some() {
-            next.latest_version = latest;
-        }
-        write_cache(home, &next);
-        cache = Some(next);
-    }
-    notice_message(current, cache?.latest_version.as_deref()?)
+/// Commands that never get the notice: `token` (apiKeyHelper: pristine stdout,
+/// no network), `upgrade` (does its own check), `acp` (protocol stream).
+pub fn command_eligible(name: &str) -> bool {
+    !matches!(name, "token" | "upgrade" | "acp")
 }
 
-/// Thin wrapper called by `main` after a command completes successfully.
-pub fn run(client: &Client, home: &Path) {
-    if suppressed(Env::from_process()) {
+/// Full decision: should a background check even start for this command?
+pub fn enabled_for(name: &str, env: Env) -> bool {
+    command_eligible(name) && !suppressed(env)
+}
+
+/// If the cache is stale, bump `last_checked` FIRST (so a slow/offline fetch
+/// that gets cut off with the process still backs off for 24h), then fetch and
+/// store the new version on success. Returns whether a fetch was attempted.
+pub fn refresh_if_stale(client: &Client, home: &Path, url: &str, now: i64) -> bool {
+    let cache = read_cache(home);
+    if !is_stale(now, cache.as_ref()) {
+        return false;
+    }
+    let mut next = cache.unwrap_or_default();
+    next.last_checked = now;
+    write_cache(home, &next);
+    if let Ok(latest) = fetch_latest_version(client, url, Some(CHECK_TIMEOUT)) {
+        next.latest_version = Some(latest);
+        write_cache(home, &next);
+    }
+    true
+}
+
+/// The notice to print from the cache, if any (no network).
+pub fn cached_notice(home: &Path, current: &str) -> Option<String> {
+    notice_message(current, read_cache(home)?.latest_version.as_deref()?)
+}
+
+/// Refresh then notice, synchronously (tests / simple callers).
+pub fn check(client: &Client, home: &Path, url: &str, now: i64, current: &str) -> Option<String> {
+    refresh_if_stale(client, home, url, now);
+    cached_notice(home, current)
+}
+
+/// Handle for the background refresh started by [`start`].
+pub struct Pending(Option<std::sync::mpsc::Receiver<()>>);
+
+/// Called at startup: if enabled and the cache is stale, refresh on a detached
+/// thread so the command itself is never delayed.
+pub fn start(name: &str, home: &Path) -> Pending {
+    start_with(name, home, Env::from_process(), latest_release_url())
+}
+
+pub fn start_with(name: &str, home: &Path, env: Env, url: String) -> Pending {
+    let now = chrono::Utc::now().timestamp();
+    if !enabled_for(name, env) || !is_stale(now, read_cache(home).as_ref()) {
+        return Pending(None);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let home = home.to_path_buf();
+    std::thread::spawn(move || {
+        refresh_if_stale(&Client::new(), &home, &url, now);
+        let _ = tx.send(());
+    });
+    Pending(Some(rx))
+}
+
+/// Called after the command finished: wait at most `grace` for the background
+/// refresh, then print the cached notice (if enabled) to stderr.
+pub fn finish(pending: Pending, name: &str, home: &Path, grace: Duration) {
+    finish_with(pending, name, home, grace, Env::from_process());
+}
+
+pub fn finish_with(pending: Pending, name: &str, home: &Path, grace: Duration, env: Env) {
+    if !enabled_for(name, env) {
         return;
     }
-    let now = chrono::Utc::now().timestamp();
-    if let Some(msg) = check(
-        client,
-        home,
-        &latest_release_url(),
-        now,
-        env!("CARGO_PKG_VERSION"),
-    ) {
+    if let Some(rx) = pending.0 {
+        let _ = rx.recv_timeout(grace);
+    }
+    if let Some(msg) = cached_notice(home, env!("CARGO_PKG_VERSION")) {
         eprintln!("{msg}");
     }
 }
+
+/// Default bound on how long the command's exit may wait for the refresh.
+pub const DEFAULT_GRACE: Duration = Duration::from_millis(300);
