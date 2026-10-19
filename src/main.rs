@@ -15,6 +15,10 @@ use monocle_cli::commands::chat::{
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
+use monocle_cli::commands::knowledge::{
+    knowledge_create_command, knowledge_delete_command, knowledge_list_command,
+    knowledge_upload_command,
+};
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
@@ -56,6 +60,7 @@ Commands:
 
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
+    knowledge  Manage knowledge collections (create, upload files, list, delete)
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -133,6 +138,11 @@ enum Commands {
         command: Option<ChatCommand>,
         #[command(flatten)]
         args: ChatArgs,
+    },
+    /// Manage knowledge collections (create, upload files, list, delete)
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
     },
     /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
     Agent {
@@ -235,6 +245,10 @@ struct ChatArgs {
     /// regardless of the verdict.
     #[arg(long = "verify-tool-firing", num_args = 0..=1)]
     verify_tool_firing: Option<Option<String>>,
+    /// After each reply, print the tools the server reports it ran
+    /// (`tools_used`) to stderr, e.g. `Tools: web_search, model_designer__delegate_model`.
+    #[arg(long = "show-tools")]
+    show_tools: bool,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -253,6 +267,7 @@ impl From<ChatArgs> for ChatOptions {
                 Some(name) => ToolFiringExpectation::Named(name),
                 None => ToolFiringExpectation::Any,
             }),
+            show_tools: a.show_tools,
         }
     }
 }
@@ -291,6 +306,7 @@ impl From<RouterChatArgs> for ChatOptions {
             resume: None,
             tool_ids: Vec::new(),
             verify_tool_firing: None,
+            show_tools: false,
         }
     }
 }
@@ -362,6 +378,40 @@ enum ChatCommand {
         id: String,
         #[arg(long, value_enum, default_value = "text")]
         format: ContentFormat,
+        /// Replace each tool-call block with a one-line summary (tool name,
+        /// sub-agent `model_id`, `report_to_parent`); with `--format json`,
+        /// add a structured `tool_calls` list per message
+        #[arg(long = "show-tools")]
+        show_tools: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KnowledgeCommand {
+    /// Create an empty collection; prints its id to stdout
+    Create {
+        /// Collection name (must not already exist)
+        name: String,
+    },
+    /// Upload and index files (pdf, docx, md, txt) into a collection. A directory
+    /// contributes its supported top-level files; files already in the collection
+    /// (same name) are skipped; a failed file is reported and the rest continue
+    Upload {
+        /// Collection name or id (see `monocle knowledge list`)
+        collection: String,
+        /// Files and/or directories to upload
+        #[arg(required = true, value_name = "FILE_OR_DIR")]
+        paths: Vec<String>,
+    },
+    /// List collections, or the files of one collection
+    List {
+        /// Collection name or id; omit to list all collections
+        collection: Option<String>,
+    },
+    /// Delete a collection and all of its files
+    Delete {
+        /// Collection name or id
+        collection: String,
     },
 }
 
@@ -680,10 +730,26 @@ fn main() {
         Commands::Acp => monocle_cli::acp::serve_with_credentials(creds.clone()),
         Commands::Chat { command, args } => match command {
             Some(ChatCommand::List) => chat_list_command(&client, &creds, &selection),
-            Some(ChatCommand::Content { id, format }) => {
-                chat_content_command(&client, &creds, &selection, &id, format)
-            }
+            Some(ChatCommand::Content {
+                id,
+                format,
+                show_tools,
+            }) => chat_content_command(&client, &creds, &selection, &id, format, show_tools),
             None => chat_command(&client, &creds, args.into()),
+        },
+        Commands::Knowledge { command } => match command {
+            KnowledgeCommand::Create { name } => {
+                knowledge_create_command(&client, &creds, &selection, &name)
+            }
+            KnowledgeCommand::Upload { collection, paths } => {
+                knowledge_upload_command(&client, &creds, &selection, &collection, &paths)
+            }
+            KnowledgeCommand::List { collection } => {
+                knowledge_list_command(&client, &creds, &selection, collection.as_deref())
+            }
+            KnowledgeCommand::Delete { collection } => {
+                knowledge_delete_command(&client, &creds, &selection, &collection)
+            }
         },
         Commands::Agent {
             prompt,
@@ -893,7 +959,7 @@ mod tests {
         let cli = Cli::parse_from(["monocle", "chat", "content", "c1"]);
         match cli.command {
             Commands::Chat {
-                command: Some(ChatCommand::Content { id, format }),
+                command: Some(ChatCommand::Content { id, format, .. }),
                 ..
             } => {
                 assert_eq!(id, "c1");

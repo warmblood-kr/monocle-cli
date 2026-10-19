@@ -46,6 +46,9 @@ pub struct ChatOptions {
     /// server's `tools_used` that a tool actually ran, as an exit code.
     /// `None` = flag absent. One-shot only.
     pub verify_tool_firing: Option<ToolFiringExpectation>,
+    /// `--show-tools`: after each reply, print the tool names the server
+    /// reports it executed (`tools_used`) to stderr.
+    pub show_tools: bool,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -579,7 +582,10 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
 /// `chat_list_command`, since both need the same auth + jarvice-host
 /// resolution. Deliberately `jarvice_url_for`, NOT `session.router_url`
 /// (chat-proxy) — see `responses_api` module docs for why.
-fn resolve_jarvice(client: &Client, creds: &Credentials) -> Result<(AuthSession, String, String)> {
+pub(crate) fn resolve_jarvice(
+    client: &Client,
+    creds: &Credentials,
+) -> Result<(AuthSession, String, String)> {
     let session = get_access_token(client, creds);
     let stored = creds.read().ok_or_else(|| {
         crate::error::AppError::new("Not logged in. Run `monocle login --tenant <domain>` first.")
@@ -619,6 +625,7 @@ pub fn chat_content_command(
     selection: &crate::profiles::Selection,
     id: &str,
     format: crate::jarvice_chats::ContentFormat,
+    show_tools: bool,
 ) -> Result<()> {
     let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
     eprintln!(
@@ -627,7 +634,8 @@ pub fn chat_content_command(
         selection.environment,
         creds.read().map(|c| c.tenant_domain).unwrap_or_default()
     );
-    let output = crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format)?;
+    let output =
+        crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format, show_tools)?;
     print!("{output}");
     Ok(())
 }
@@ -644,6 +652,22 @@ pub fn chat_content_command(
 /// field at all. Shared by both `run_responses_chat` and `run_completions_chat`
 /// so plain `monocle chat` gets the same non-silent behavior, not just
 /// `--responses` mode (monocle-cli#101 code review).
+/// The `--show-tools` stderr line for one turn. "none" and "unknown" differ:
+/// an older jarvice that never reports `tools_used` proves nothing either way.
+fn tools_line(tools_used: &[String], unparsed: usize, present: bool) -> String {
+    if !present {
+        return "Tools: unknown (this server does not report `tools_used`)".to_string();
+    }
+    if tools_used.is_empty() && unparsed == 0 {
+        return "Tools: none".to_string();
+    }
+    format!(
+        "Tools: {}{}",
+        tools_used.join(", "),
+        unparsed_note(unparsed)
+    )
+}
+
 fn dropped_tool_calls_message(
     tool_calls: &[ToolCall],
     unparsed: usize,
@@ -896,6 +920,16 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         if let Some(id) = reply.thread_id {
             eprintln!("Thread: {id}");
         }
+        if options.show_tools {
+            eprintln!(
+                "{}",
+                tools_line(
+                    &reply.tools_used,
+                    reply.unparsed_tools_used,
+                    reply.tools_used_present
+                )
+            );
+        }
         if let Some(expected) = &options.verify_tool_firing {
             let verdict = tool_firing_verification(
                 expected,
@@ -1052,6 +1086,16 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                     if let Some(id) = &thread_id {
                         eprintln!("Thread: {id}");
                     }
+                }
+                if options.show_tools {
+                    eprintln!(
+                        "{}",
+                        tools_line(
+                            &reply.tools_used,
+                            reply.unparsed_tools_used,
+                            reply.tools_used_present
+                        )
+                    );
                 }
                 println!();
                 // `/diag on` mode — see the completions path's identical

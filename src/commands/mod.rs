@@ -7,6 +7,7 @@ pub mod chat;
 pub mod claude;
 pub mod image_edit;
 pub mod image_generate;
+pub mod knowledge;
 pub mod login;
 pub mod model_list;
 pub mod repl;

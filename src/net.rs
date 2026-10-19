@@ -108,6 +108,17 @@ impl Client {
         send("GET", url, req)
     }
 
+    /// DELETE (no body). Goes through the shared `send()`, so — like every call
+    /// here — a connection failure before any response is retried once; deleting
+    /// is idempotent, so a replay is harmless.
+    pub fn delete(&self, url: &str, headers: &[(&str, &str)]) -> Result<Resp> {
+        let mut req = self.inner.delete(url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        send("DELETE", url, req)
+    }
+
     /// GET a large file download (e.g. the `monocle upgrade` release binary).
     ///
     /// This deliberately does NOT route through the shared `send()`: a multi-MB
@@ -171,6 +182,28 @@ impl Client {
         files: Vec<FilePart>,
         text_fields: &[(&str, &str)],
     ) -> Result<Resp> {
+        self.post_multipart_opt(url, headers, files, text_fields, true)
+    }
+
+    /// [`post_multipart`](Self::post_multipart) making exactly one attempt.
+    pub fn post_multipart_once(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        files: Vec<FilePart>,
+        text_fields: &[(&str, &str)],
+    ) -> Result<Resp> {
+        self.post_multipart_opt(url, headers, files, text_fields, false)
+    }
+
+    fn post_multipart_opt(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        files: Vec<FilePart>,
+        text_fields: &[(&str, &str)],
+        retry: bool,
+    ) -> Result<Resp> {
         let mut form = reqwest::blocking::multipart::Form::new();
         for file in files {
             let part = reqwest::blocking::multipart::Part::bytes(file.data)
@@ -186,7 +219,23 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send("POST", url, req)
+        send_opt("POST", url, req, retry)
+    }
+
+    /// [`post_json`](Self::post_json) making exactly one attempt — no transport
+    /// retry. For non-idempotent writes (a replay after a lost response would
+    /// duplicate the effect).
+    pub fn post_json_once(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Resp> {
+        let mut req = self.inner.post(url).json(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        send_opt("POST", url, req, false)
     }
 
     /// POST a raw body with an explicit `Content-Type` (Azure SSML).
@@ -249,6 +298,8 @@ impl Client {
 /// different problem — real transient 5xx/429 responses from a server that
 /// *did* answer — and would need its own, separately-scoped retry policy).
 ///
+/// (Timeouts are the exception — see the guard in the `match` below.)
+///
 /// Safe to retry unconditionally here (not just for idempotent methods):
 /// every call site through this module is an LLM/media API call (chat
 /// completion, token exchange, audio upload/synthesis) where, at worst, a
@@ -267,6 +318,10 @@ fn send_with_retry(
     let retry = req.try_clone();
     match req.send() {
         Ok(resp) => Ok(resp),
+        // A timeout means the request WAS sent and the server may still be
+        // working on it (e.g. a long agent delegation) — replaying it would run
+        // the work twice. Only failures that look like a dead connection retry.
+        Err(first_err) if first_err.is_timeout() => Err(first_err),
         Err(first_err) => {
             crate::diag::log_network_error(
                 method,
@@ -282,13 +337,35 @@ fn send_with_retry(
 }
 
 fn send(method: &str, url: &str, req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
+    send_opt(method, url, req, true)
+}
+
+/// [`send`] with the transport retry switchable: `retry = false` makes exactly
+/// one attempt (for non-idempotent writes where a lost response after
+/// server-side success must not be replayed).
+fn send_opt(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+    retry: bool,
+) -> Result<Resp> {
     // Total request timeout — non-streaming only (see `Client::new`). Streaming
     // (`post_json_stream`) builds and sends its own request without this, so a
     // long generation is never cut short.
     let req = req.timeout(std::time::Duration::from_secs(120));
-    let resp = send_with_retry(method, url, req).map_err(|e| {
+    let sent = if retry {
+        send_with_retry(method, url, req)
+    } else {
+        req.send()
+    };
+    let resp = sent.map_err(|e| {
         let msg = e.to_string();
         crate::diag::log_network_error(method, url, &msg);
+        if e.is_timeout() {
+            return AppError::new(
+                "Request timed out after 120s. The server may still be processing it; it was not re-sent.",
+            );
+        }
         AppError(msg)
     })?;
     let status = resp.status().as_u16();
@@ -412,6 +489,35 @@ mod tests {
         let url = format!("http://{addr}/");
         let resp = send_with_retry("GET", &url, client.get(&url)).expect("retry should recover");
         assert_eq!(resp.status(), 200);
+    }
+
+    /// A timed-out request was already delivered; the server may still be
+    /// running it, so it must NOT be sent a second time.
+    #[test]
+    fn send_with_retry_does_not_replay_a_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            // Accept and read, never answer; keep the sockets open.
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                held.push(stream);
+            }
+        });
+
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://{addr}/");
+        let req = client
+            .post(&url)
+            .timeout(std::time::Duration::from_millis(300));
+        let err = send_with_retry("POST", &url, req).unwrap_err();
+        assert!(err.is_timeout());
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// When even the retry fails (the peer never comes back at all), the
