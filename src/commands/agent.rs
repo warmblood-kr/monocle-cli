@@ -530,7 +530,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
                 Ok(LoopControl::Continue)
             }
             Command::Unknown(cmd) => {
-                eprintln!("unknown command: {cmd} (try /help)");
+                eprintln!("unknown command: {} (try /help)", crate::util::plain(&cmd));
                 Ok(LoopControl::Continue)
             }
             Command::Turn => {

@@ -121,10 +121,13 @@ pub fn handle_model_command(trimmed: &str, model: &mut String) -> bool {
     match parse_model_command(trimmed) {
         ModelCommand::NotModel => false,
         ModelCommand::Show => {
-            eprintln!("{}", crate::colors::dim(&format!("model: {model}")));
+            let shown = crate::util::plain(model);
+            eprintln!("{}", crate::colors::dim(&format!("model: {shown}")));
             true
         }
         ModelCommand::Switch(id) => {
+            // Strip control chars so what is shown is what is sent.
+            let id = crate::util::plain(&id);
             eprintln!("{}", crate::colors::dim(&format!("model → {id}")));
             *model = id;
             true
@@ -227,6 +230,13 @@ pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_switch_strips_control_chars() {
+        let mut m = "a".to_string();
+        assert!(handle_model_command("/model x\u{1b}[2Jy", &mut m));
+        assert_eq!(m, "x[2Jy");
+    }
 
     #[test]
     fn parse_model_command_variants() {
