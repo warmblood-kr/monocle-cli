@@ -1,4 +1,4 @@
-//! `monocle knowledge create|upload|list|delete` — manage the logged-in user's
+//! `monocle knowledge create|upload|list|update|remove|replace|reprocess|content|delete` — manage the logged-in user's
 //! jarvice knowledge collections. Data (ids, tables) goes to stdout; progress,
 //! the profile banner and summaries go to stderr, so output pipes cleanly.
 
@@ -189,5 +189,126 @@ pub fn knowledge_delete_command(
         "Deleted collection '{}' ({}) and {n} file(s).",
         target.name, target.id
     );
+    Ok(())
+}
+
+/// `monocle knowledge update COLLECTION [--name N] [--description D]`.
+pub fn knowledge_update_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    collection: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> Result<()> {
+    if name.is_none() && description.is_none() {
+        return Err(AppError::new(
+            "Nothing to update: pass --name and/or --description.",
+        ));
+    }
+    let (url, bearer) = connect(client, creds, selection)?;
+    let all = kb::list_knowledge(client, &url, &bearer, true)?;
+    let target = kb::find(&all, collection)?;
+    if let Some(n) = name.filter(|n| *n != target.name) {
+        if all.iter().any(|k| k.name == n) {
+            return Err(AppError::new(format!(
+                "Collection '{n}' already exists; pick another name."
+            )));
+        }
+    }
+    kb::update_knowledge(client, &url, &bearer, target, name, description)?;
+    eprintln!("Updated collection '{}' ({}).", target.name, target.id);
+    Ok(())
+}
+
+/// Resolve `collection` (writable) and `file` (id or name inside it).
+fn resolve_file(
+    client: &Client,
+    url: &str,
+    bearer: &str,
+    collection: &str,
+    file: &str,
+) -> Result<(String, String, String)> {
+    let all = kb::list_knowledge(client, url, bearer, true)?;
+    let target = kb::find(&all, collection)?;
+    let f = kb::find_file(target, file)?;
+    Ok((target.id.clone(), f.id.clone(), f.meta.name.clone()))
+}
+
+/// `monocle knowledge remove COLLECTION FILE` — detach one file; the collection stays.
+pub fn knowledge_remove_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    collection: &str,
+    file: &str,
+) -> Result<()> {
+    let (url, bearer) = connect(client, creds, selection)?;
+    let (kid, fid, name) = resolve_file(client, &url, &bearer, collection, file)?;
+    kb::remove_file(client, &url, &bearer, &kid, &fid)?;
+    eprintln!("Removed '{name}' ({fid}) from the collection.");
+    Ok(())
+}
+
+/// `monocle knowledge replace COLLECTION PATH` — swap the same-named file for a new upload.
+/// The new file is stored and attached before the old one is removed, so a
+/// failure leaves the old version in place.
+pub fn knowledge_replace_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    collection: &str,
+    path: &str,
+) -> Result<()> {
+    let files = kb::collect_files(&[path.to_string()])?;
+    let file = &files[0];
+    let name = file
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let (url, bearer) = connect(client, creds, selection)?;
+    let (kid, old, _) = resolve_file(client, &url, &bearer, collection, &name)?;
+    let new = kb::upload_file(client, &url, &bearer, &name, file)?;
+    if let Err(e) = kb::add_file(client, &url, &bearer, &kid, &new) {
+        let _ = kb::delete_file(client, &url, &bearer, &new);
+        return Err(e);
+    }
+    kb::remove_file(client, &url, &bearer, &kid, &old)?;
+    println!("{new}\t{name}");
+    eprintln!("Replaced '{name}' ({old} -> {new}).");
+    Ok(())
+}
+
+/// `monocle knowledge reprocess COLLECTION FILE [--force]`.
+pub fn knowledge_reprocess_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    collection: &str,
+    file: &str,
+    force: bool,
+) -> Result<()> {
+    let (url, bearer) = connect(client, creds, selection)?;
+    let (kid, fid, name) = resolve_file(client, &url, &bearer, collection, file)?;
+    kb::reprocess_file(client, &url, &bearer, &kid, &fid, force)?;
+    eprintln!("Reprocessed '{name}' ({fid}).");
+    Ok(())
+}
+
+/// `monocle knowledge content COLLECTION FILE` — the server-extracted text, to stdout.
+pub fn knowledge_content_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    collection: &str,
+    file: &str,
+) -> Result<()> {
+    let (url, bearer) = connect(client, creds, selection)?;
+    let all = kb::list_knowledge(client, &url, &bearer, false)?;
+    let f = kb::find_file(kb::find(&all, collection)?, file)?;
+    let text = kb::file_content(client, &url, &bearer, &f.id)?;
+    let _ = write!(std::io::stdout(), "{text}");
     Ok(())
 }

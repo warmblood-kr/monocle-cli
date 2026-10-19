@@ -56,7 +56,13 @@ pub struct Knowledge {
     pub id: String,
     pub name: String,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
     pub files: Option<Vec<KbFile>>,
+    /// Everything else the server sent (`access_control`, `data`, ...), kept so
+    /// `update` can echo it back untouched.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl Knowledge {
@@ -263,6 +269,152 @@ pub fn add_file(
         return Err(api_error("Adding the file to the collection", &resp));
     }
     Ok(())
+}
+
+/// `POST /api/v1/knowledge/{id}/update` — rename and/or re-describe. The server
+/// replaces `access_control` wholesale (null means public), so it is echoed back
+/// from the listing; if the listing did not carry it, refuse rather than risk
+/// publishing a private collection.
+pub fn update_knowledge(
+    client: &Client,
+    jarvice_url: &str,
+    bearer: &str,
+    kb: &Knowledge,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> Result<()> {
+    let access = kb.extra.get("access_control").ok_or_else(|| {
+        AppError::new("The server did not report this collection's access control; not updating.")
+    })?;
+    let mut body = json!({
+        "name": name.unwrap_or(&kb.name),
+        "description": description.unwrap_or(&kb.description),
+        "access_control": access,
+    });
+    if let Some(data) = kb.extra.get("data").filter(|d| d.is_object()) {
+        body["data"] = data.clone();
+    }
+    let resp = client.post_json_once(
+        &format!(
+            "{jarvice_url}/api/v1/knowledge/{}/update",
+            checked_id(&kb.id)?
+        ),
+        &auth_headers(bearer),
+        &body,
+    )?;
+    if !resp.ok() {
+        return Err(api_error("Updating the collection", &resp));
+    }
+    Ok(())
+}
+
+/// Pick one file of a collection by exact id or exact name (ambiguous names list ids).
+pub fn find_file<'a>(kb: &'a Knowledge, key: &str) -> Result<&'a KbFile> {
+    if let Some(f) = kb.files().iter().find(|f| f.id == key) {
+        return Ok(f);
+    }
+    let named: Vec<&KbFile> = kb.files().iter().filter(|f| f.meta.name == key).collect();
+    match named.as_slice() {
+        [one] => Ok(one),
+        [] => Err(AppError::new(format!(
+            "File '{key}' is not in collection '{}' (run `monocle knowledge list {}`).",
+            kb.name, kb.name
+        ))),
+        many => {
+            let ids: Vec<&str> = many.iter().map(|f| f.id.as_str()).collect();
+            Err(AppError::new(format!(
+                "File name '{key}' is ambiguous; use one of these ids: {}",
+                ids.join(", ")
+            )))
+        }
+    }
+}
+
+/// `POST /api/v1/knowledge/{id}/file/remove` — detach one file, keep the
+/// collection. The server also deletes the file itself unless something else
+/// (another collection, a chat) still references it.
+pub fn remove_file(
+    client: &Client,
+    jarvice_url: &str,
+    bearer: &str,
+    knowledge_id: &str,
+    file_id: &str,
+) -> Result<()> {
+    let resp = client.post_json_once(
+        &format!(
+            "{jarvice_url}/api/v1/knowledge/{}/file/remove",
+            checked_id(knowledge_id)?
+        ),
+        &auth_headers(bearer),
+        &json!({ "file_id": checked_id(file_id)? }),
+    )?;
+    if !resp.ok() {
+        return Err(api_error("Removing the file from the collection", &resp));
+    }
+    Ok(())
+}
+
+/// Re-extract a file's text from its stored binary (`POST /files/{id}/reprocess`,
+/// `force` needed when it already has text), then re-embed it into the
+/// collection (`POST /knowledge/{id}/file/update`).
+pub fn reprocess_file(
+    client: &Client,
+    jarvice_url: &str,
+    bearer: &str,
+    knowledge_id: &str,
+    file_id: &str,
+    force: bool,
+) -> Result<()> {
+    let q = if force { "?force=true" } else { "" };
+    let resp = client.post_json_once(
+        &format!(
+            "{jarvice_url}/api/v1/files/{}/reprocess{q}",
+            checked_id(file_id)?
+        ),
+        &auth_headers(bearer),
+        &json!({}),
+    )?;
+    if resp.status == 409 {
+        return Err(AppError::new(
+            "File is already processed; pass --force to re-extract it.",
+        ));
+    }
+    if !resp.ok() {
+        return Err(api_error("Reprocessing the file", &resp));
+    }
+    let resp = client.post_json_once(
+        &format!(
+            "{jarvice_url}/api/v1/knowledge/{}/file/update",
+            checked_id(knowledge_id)?
+        ),
+        &auth_headers(bearer),
+        &json!({ "file_id": file_id }),
+    )?;
+    if !resp.ok() {
+        return Err(api_error("Re-indexing the file in the collection", &resp));
+    }
+    Ok(())
+}
+
+/// `GET /api/v1/files/{id}/data/content` — the text the server extracted.
+pub fn file_content(
+    client: &Client,
+    jarvice_url: &str,
+    bearer: &str,
+    file_id: &str,
+) -> Result<String> {
+    let resp = client.get(
+        &format!(
+            "{jarvice_url}/api/v1/files/{}/data/content",
+            checked_id(file_id)?
+        ),
+        &auth_headers(bearer),
+    )?;
+    if !resp.ok() {
+        return Err(api_error("Reading the file content", &resp));
+    }
+    let v: Value = resp.json()?;
+    Ok(v["content"].as_str().unwrap_or("").to_string())
 }
 
 /// `DELETE /api/v1/files/{id}`. A file that is already gone (404) counts as deleted.
