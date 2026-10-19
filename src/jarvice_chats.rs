@@ -311,28 +311,99 @@ fn looks_secret(word: &str) -> bool {
     (w.starts_with("sk-") && w.len() >= 20) || (w.starts_with("eyJ") && w.len() >= 20)
 }
 
-/// Redact credential-looking text inside a free-form string: `Bearer <x>`,
-/// `sk-…`/JWT words, and `key=value` / `key: value` where the key is sensitive.
-fn redact_str(text: &str) -> String {
-    let words: Vec<&str> = text.split(' ').collect();
-    let mut out: Vec<String> = Vec::with_capacity(words.len());
-    let mut after_bearer = false;
-    for word in words {
-        let lower = word.to_ascii_lowercase();
-        let kv_secret = word
-            .split_once(['=', ':'])
-            .is_some_and(|(k, v)| !v.is_empty() && is_sensitive_key(k));
-        if after_bearer || looks_secret(word) {
-            out.push(REDACTED.to_string());
-        } else if kv_secret {
-            let (k, _) = word.split_once(['=', ':']).unwrap();
-            out.push(format!("{k}={REDACTED}"));
-        } else {
-            out.push(word.to_string());
+/// Split into alternating separator / word parts. A separator is any run of
+/// Unicode whitespace plus the literal two-character escapes `\t`, `\n`, `\r`
+/// (a JSON string that was escaped twice still reads "Bearer\tsecret").
+fn split_parts(text: &str) -> Vec<(bool, &str)> {
+    let bytes = text.as_bytes();
+    let sep_len_at = |i: usize| -> usize {
+        if bytes[i] == b'\\' && matches!(bytes.get(i + 1), Some(b't' | b'n' | b'r')) {
+            return 2;
         }
-        after_bearer = lower == "bearer";
+        match text[i..].chars().next() {
+            Some(c) if c.is_whitespace() => c.len_utf8(),
+            _ => 0,
+        }
+    };
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let is_sep = sep_len_at(i) > 0;
+        let start = i;
+        while i < text.len() && (sep_len_at(i) > 0) == is_sep {
+            i += if is_sep {
+                sep_len_at(i)
+            } else {
+                text[i..].chars().next().unwrap().len_utf8()
+            };
+        }
+        parts.push((is_sep, &text[start..i]));
     }
-    out.join(" ")
+    parts
+}
+
+/// Redact credential-looking text inside a free-form string: the word after
+/// `Bearer`/`Basic` (or a long one after `token`), `sk-…`/JWT words, and the
+/// value of a sensitive key written `key=value`, `key: value` or `key = value`.
+/// Words are separated by any whitespace (tabs, newlines, CRLF, runs), and the
+/// original separators are kept.
+fn redact_str(text: &str) -> String {
+    let parts = split_parts(text);
+    let next_word = |from: usize| {
+        parts[from + 1..]
+            .iter()
+            .find(|(sep, _)| !sep)
+            .map(|(_, w)| *w)
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut redact_next = false;
+    let mut key_pending = false; // a bare sensitive key; its `=`/`:` may come next
+    for (idx, (is_sep, word)) in parts.iter().enumerate() {
+        if *is_sep {
+            out.push_str(word);
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        let was_key_pending = std::mem::take(&mut key_pending);
+        let this_redact_next = std::mem::take(&mut redact_next);
+        if this_redact_next {
+            out.push_str(REDACTED);
+            // "Authorization: Bearer x" — keep going through the scheme word.
+            redact_next = matches!(lower.as_str(), "bearer" | "basic");
+        } else if was_key_pending && (word.starts_with('=') || word.starts_with(':')) {
+            let sep = &word[..1];
+            if word.len() == 1 {
+                out.push_str(word);
+                redact_next = true;
+            } else {
+                out.push_str(&format!("{sep}{REDACTED}"));
+            }
+        } else if looks_secret(word) {
+            out.push_str(REDACTED);
+        } else if let Some((k, v)) = word.split_once(['=', ':']) {
+            if is_sensitive_key(k) {
+                let sep = &word[k.len()..k.len() + 1];
+                if v.is_empty() {
+                    out.push_str(word);
+                    redact_next = true;
+                } else {
+                    out.push_str(&format!("{k}{sep}{REDACTED}"));
+                }
+            } else {
+                out.push_str(word);
+            }
+        } else if matches!(lower.as_str(), "bearer" | "basic")
+            || (lower == "token" && next_word(idx).is_some_and(|w| w.len() >= 8))
+        {
+            out.push_str(word);
+            redact_next = true;
+        } else {
+            out.push_str(word);
+            key_pending = is_sensitive_key(word)
+                && next_word(idx).is_some_and(|w| w.starts_with('=') || w.starts_with(':'));
+        }
+    }
+    out
 }
 
 /// Redact a parsed JSON value: values under sensitive keys are replaced
@@ -899,5 +970,56 @@ mod tests {
             .as_str()
             .unwrap()
             .contains('\u{1b}'));
+    }
+
+    #[test]
+    fn redaction_is_whitespace_class_and_case_insensitive() {
+        let cases = [
+            "Bearer\tSECRET1",
+            "Bearer\nSECRET1",
+            "Bearer\r\nSECRET1",
+            "Bearer   SECRET1",
+            "bEaReR SECRET1",
+            "BEARER\u{a0}SECRET1",
+            "Bearer\\tSECRET1",
+            "Bearer\\nSECRET1",
+            "Basic\tSECRET1",
+            "Authorization:\tBearer\nSECRET1",
+            "password:\tSECRET1",
+            "password =\nSECRET1",
+            "password\t=\tSECRET1",
+            "PassWord=SECRET1",
+            "token\tSECRET1xxxx",
+        ];
+        for c in cases {
+            let out = redact_str(c);
+            assert!(!out.contains("SECRET1"), "{c:?} leaked: {out:?}");
+            assert!(out.contains(REDACTED), "{c:?}: {out:?}");
+        }
+        // separators are preserved and ordinary prose is untouched
+        assert_eq!(redact_str("a\tb\r\nc  d"), "a\tb\r\nc  d");
+        assert_eq!(
+            redact_str("reset your password page"),
+            "reset your password page"
+        );
+        assert_eq!(
+            redact_str("mode=fast  speed: high"),
+            "mode=fast  speed: high"
+        );
+    }
+
+    #[test]
+    fn redaction_covers_json_escaped_whitespace_end_to_end() {
+        // `Bearer<TAB>secret` as a real tab, and as the two characters `\` `t`.
+        let args = serde_json::json!({
+            "a": "x Bearer\tSECRET2",
+            "b": "x Bearer\nSECRET2",
+            "c": "x Bearer\\tSECRET2",
+            "d": "password:\r\n SECRET2",
+        });
+        let content = block("t", &args, &serde_json::json!({}));
+        let call = only(&content);
+        assert!(!call.arguments.contains("SECRET2"), "{}", call.arguments);
+        assert!(!body_text(&content, true).contains("SECRET2"));
     }
 }
