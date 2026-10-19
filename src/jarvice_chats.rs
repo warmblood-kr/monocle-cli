@@ -27,7 +27,9 @@ use crate::origin::auth_headers;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatSummary {
+    #[serde(deserialize_with = "crate::util::de_plain")]
     pub id: String,
+    #[serde(deserialize_with = "crate::util::de_plain")]
     pub title: String,
     pub updated_at: i64,
     pub created_at: i64,

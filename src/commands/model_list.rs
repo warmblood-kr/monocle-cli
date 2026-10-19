@@ -14,10 +14,14 @@ use crate::origin::auth_headers;
 
 #[derive(Deserialize)]
 struct ModelInfo {
+    #[serde(deserialize_with = "crate::util::de_plain")]
     id: String,
+    #[serde(default, deserialize_with = "crate::util::de_plain_opt")]
     name: Option<String>,
+    #[serde(default, deserialize_with = "crate::util::de_plain_opt")]
     owned_by: Option<String>,
     context_window: Option<f64>,
+    #[serde(default, deserialize_with = "crate::util::de_plain_opt")]
     modality: Option<String>,
 }
 
@@ -310,5 +314,16 @@ mod tests {
         let models = model_ids(&["claude-sonnet-4-6"]);
         let got = fuzzy_model_candidates(&models, "CLAUDE");
         assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn model_fields_are_stripped_of_control_characters_on_parse() {
+        let body = r#"{"data":[{"id":"m\u001b[2J1","name":"n\nforged","owned_by":"o\r","modality":"t\u0007"}]}"#;
+        let parsed: ModelsResponse = serde_json::from_str(body).unwrap();
+        let m = &parsed.data[0];
+        assert_eq!(m.id, "m[2J1");
+        assert_eq!(m.name.as_deref(), Some("nforged"));
+        assert_eq!(m.owned_by.as_deref(), Some("o"));
+        assert_eq!(m.modality.as_deref(), Some("t"));
     }
 }

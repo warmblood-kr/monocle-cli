@@ -25,16 +25,11 @@ struct State {
 type Shared = Arc<Mutex<State>>;
 
 fn kb_json(kb: &Kb) -> String {
-    let files: Vec<String> =
+    let files: Vec<_> =
         kb.2.iter()
-            .map(|(id, n)| format!(r#"{{"id":"{id}","meta":{{"name":"{n}"}}}}"#))
+            .map(|(id, n)| serde_json::json!({"id": id, "meta": {"name": n}}))
             .collect();
-    format!(
-        r#"{{"id":"{}","name":"{}","description":"","files":[{}]}}"#,
-        kb.0,
-        kb.1,
-        files.join(",")
-    )
+    serde_json::json!({"id": kb.0, "name": kb.1, "description": "", "files": files}).to_string()
 }
 
 /// Stub jarvice. File names with special meaning: `bad.pdf` uploads with a
@@ -451,4 +446,22 @@ fn shared_post_still_retries_once() {
     let body = serde_json::json!({});
     assert!(Client::new().post_json(&url, &[], &body).is_err());
     assert_eq!(accepts.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn server_supplied_names_cannot_inject_terminal_control() {
+    let (state, home, _docs) = setup();
+    state.lock().unwrap().kbs = vec![(
+        "k1".into(),
+        "ev\u{1b}[2Jil\nTHREAD forged".into(),
+        vec![("f1".into(), "a\rb\u{1b}[31m.md".into())],
+    )];
+    for args in [vec!["knowledge", "list"], vec!["knowledge", "list", "k1"]] {
+        let o = run(home.path(), &args);
+        assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+        let text = out(&o);
+        assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
+        // header + one row: the embedded newline did not add a line
+        assert_eq!(text.lines().count(), 2, "{text:?}");
+    }
 }

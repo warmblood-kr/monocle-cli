@@ -12,6 +12,24 @@ pub fn to_iso(ts_ms: i64) -> String {
         .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Drop every control character (C0/C1, ESC, CR, LF, TAB, DEL). Server-supplied
+/// strings (ids, titles, names) are printed to the terminal, so a hostile or
+/// corrupted value must not be able to forge lines or drive escape sequences.
+pub fn plain(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// serde `deserialize_with` for a server string that will be printed: [`plain`]ed
+/// on the way in, so no print site can forget.
+pub fn de_plain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    <String as serde::Deserialize>::deserialize(d).map(|s| plain(&s))
+}
+
+/// [`de_plain`] for an optional field (pair with `#[serde(default)]`).
+pub fn de_plain_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    <Option<String> as serde::Deserialize>::deserialize(d).map(|o| o.map(|s| plain(&s)))
+}
+
 /// Current wall-clock time in epoch milliseconds (JS `Date.now()`).
 pub fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
@@ -103,4 +121,15 @@ pub fn home_dir() -> PathBuf {
     #[cfg(not(windows))]
     let key = "HOME";
     PathBuf::from(std::env::var_os(key).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod plain_tests {
+    use super::plain;
+
+    #[test]
+    fn plain_drops_every_control_character() {
+        assert_eq!(plain("a\nb\rc\x1b[2Jd\te\u{7f}f\u{85}g"), "abc[2Jdefg");
+        assert_eq!(plain("한글 🙂 ok"), "한글 🙂 ok");
+    }
 }

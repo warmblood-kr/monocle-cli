@@ -38,14 +38,14 @@ const SUPPORTED: [(&str, &str); 4] = [
 
 #[derive(Debug, Default, Deserialize)]
 pub struct FileMeta {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::util::de_plain")]
     pub name: String,
 }
 
 /// One file as the knowledge endpoints list it (id + display name).
 #[derive(Debug, Deserialize)]
 pub struct KbFile {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::util::de_plain")]
     pub id: String,
     #[serde(default)]
     pub meta: FileMeta,
@@ -53,7 +53,9 @@ pub struct KbFile {
 
 #[derive(Debug, Deserialize)]
 pub struct Knowledge {
+    #[serde(deserialize_with = "crate::util::de_plain")]
     pub id: String,
+    #[serde(deserialize_with = "crate::util::de_plain")]
     pub name: String,
     #[serde(default)]
     pub files: Option<Vec<KbFile>>,
@@ -72,7 +74,7 @@ fn api_error(what: &str, resp: &Resp) -> AppError {
     let code = resp
         .json::<Value>()
         .ok()
-        .and_then(|v| v["detail"]["code"].as_str().map(str::to_string));
+        .and_then(|v| v["detail"]["code"].as_str().map(crate::util::plain));
     match code {
         Some(code) => AppError::new(format!("{what} failed: HTTP {} ({code}).", resp.status)),
         None => AppError::new(format!("{what} failed: HTTP {}.", resp.status)),
@@ -118,12 +120,14 @@ pub fn find<'a>(all: &'a [Knowledge], key: &str) -> Result<&'a Knowledge> {
     match named.as_slice() {
         [one] => Ok(one),
         [] => Err(AppError::new(format!(
-            "Collection '{key}' was not found (run `monocle knowledge list`)."
+            "Collection '{}' was not found (run `monocle knowledge list`).",
+            crate::util::plain(key)
         ))),
         many => {
             let ids: Vec<&str> = many.iter().map(|k| k.id.as_str()).collect();
             Err(AppError::new(format!(
-                "Collection name '{key}' is ambiguous; use one of these ids: {}",
+                "Collection name '{}' is ambiguous; use one of these ids: {}",
+                crate::util::plain(key),
                 ids.join(", ")
             )))
         }
@@ -233,7 +237,7 @@ pub fn upload_file(
     }
     let body: Value = resp.json()?;
     let id = checked_id(body["id"].as_str().unwrap_or(""))?.to_string();
-    if let Some(code) = body["error"]["code"].as_str() {
+    if let Some(code) = body["error"]["code"].as_str().map(crate::util::plain) {
         // Stored but unusable — remove it so it is not left orphaned.
         let _ = delete_file(client, jarvice_url, bearer, &id);
         return Err(AppError::new(format!(
