@@ -813,6 +813,13 @@ fn main() {
         Err(c) => c,
     };
 
+    // `token` (apiKeyHelper: pristine stdout, no network), `upgrade` (does its
+    // own check) and `acp` (protocol stream) never get the update notice.
+    let notice_eligible = !matches!(
+        command,
+        Commands::Token | Commands::Upgrade { .. } | Commands::Acp
+    );
+
     let result: Result<()> = match command {
         Commands::Login {
             tenant,
@@ -966,6 +973,10 @@ fn main() {
             unreachable!("legacy alias not rewritten")
         }
     };
+
+    if result.is_ok() && notice_eligible {
+        monocle_cli::update_notice::run(&client, &home);
+    }
 
     if let Err(e) = result {
         eprintln!("Error: {e}");

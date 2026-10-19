@@ -579,6 +579,21 @@ monocle upgrade --check
 Intel Macs have no prebuilt binary, so `upgrade` reports an error there — build
 from source instead (see Setup).
 
+### Update notice
+
+After a command finishes, monocle checks for a newer release at most once every
+24 hours (3-second timeout, failures ignored; the result is cached in
+`~/.monocle/update-check.json`) and, if one exists, prints a single line to
+stderr:
+
+```
+monocle X.Y.Z is available (current A.B.C). Run `monocle upgrade`.
+```
+
+The notice is never shown when stderr is not a terminal, when `CI` is set, or
+for `token`, `upgrade` and `acp`. Set `MONOCLE_NO_UPDATE_CHECK=1` to disable
+the check entirely.
+
 ## 🤖 Claude Code integration
 
 ```bash

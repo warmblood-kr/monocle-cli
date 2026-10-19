@@ -1,0 +1,169 @@
+//! Update notice: cache honored, suppression rules, message format, and the
+//! `token` command staying untouched.
+mod common;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use monocle_cli::credentials::{Credentials, CredentialsData};
+use monocle_cli::net::Client;
+use monocle_cli::update_notice::{check, is_stale, notice_message, suppressed, Env};
+
+const DAY: i64 = 24 * 60 * 60;
+
+fn release_stub(tag: &'static str, hits: Arc<AtomicUsize>) -> common::Stub {
+    common::stub(move |_, _, _, _| {
+        hits.fetch_add(1, Ordering::SeqCst);
+        (200, format!(r#"{{"tag_name":"{tag}"}}"#))
+    })
+}
+
+fn url(s: &common::Stub) -> String {
+    format!("{}/releases/latest", s.router_url())
+}
+
+fn seed(home: &std::path::Path, last_checked: i64, latest: &str) {
+    std::fs::create_dir_all(home.join(".monocle")).unwrap();
+    std::fs::write(
+        home.join(".monocle/update-check.json"),
+        format!(r#"{{"last_checked":{last_checked},"latest_version":"{latest}"}}"#),
+    )
+    .unwrap();
+}
+
+#[test]
+fn message_format_and_semver_gate() {
+    assert_eq!(
+        notice_message("1.2.3", "1.3.0").unwrap(),
+        "monocle 1.3.0 is available (current 1.2.3). Run `monocle upgrade`."
+    );
+    assert!(notice_message("1.3.0", "1.3.0").is_none());
+    assert!(notice_message("1.10.0", "1.9.0").is_none());
+    assert!(notice_message("1.0.0", "garbage").is_none());
+}
+
+#[test]
+fn suppression_rules_every_combination() {
+    for bits in 0..8u8 {
+        let env = Env {
+            stderr_is_tty: bits & 1 != 0,
+            ci: bits & 2 != 0,
+            opted_out: bits & 4 != 0,
+        };
+        // Only "TTY, no CI, not opted out" shows the notice.
+        assert_eq!(suppressed(env), bits != 1, "bits={bits}");
+    }
+}
+
+#[test]
+fn staleness_window() {
+    let c = monocle_cli::update_notice::Cache {
+        last_checked: 1000,
+        latest_version: None,
+    };
+    assert!(is_stale(1000, None));
+    assert!(!is_stale(1000 + DAY - 1, Some(&c)));
+    assert!(is_stale(1000 + DAY, Some(&c)));
+    assert!(is_stale(999, Some(&c)));
+}
+
+#[test]
+fn fresh_cache_makes_no_network_hit_but_still_notifies() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let stub = release_stub("v9.9.9", hits.clone());
+    let home = tempfile::tempdir().unwrap();
+    seed(home.path(), 5000, "2.0.0");
+    let msg = check(&Client::new(), home.path(), &url(&stub), 5000 + 60, "1.0.0");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        msg.unwrap(),
+        "monocle 2.0.0 is available (current 1.0.0). Run `monocle upgrade`."
+    );
+}
+
+#[test]
+fn stale_cache_hits_network_once_and_updates_cache() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let stub = release_stub("v2.5.0", hits.clone());
+    let home = tempfile::tempdir().unwrap();
+    seed(home.path(), 5000, "1.0.0");
+    let now = 5000 + 2 * DAY;
+    let c = Client::new();
+    let msg = check(&c, home.path(), &url(&stub), now, "1.0.0").unwrap();
+    assert!(msg.starts_with("monocle 2.5.0 is available"));
+    // Second run right after: cache is fresh now.
+    check(&c, home.path(), &url(&stub), now + 1, "1.0.0");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_check_bumps_last_checked_and_keeps_old_version() {
+    let stub = common::stub(|_, _, _, _| (500, "boom".into()));
+    let home = tempfile::tempdir().unwrap();
+    seed(home.path(), 5000, "1.5.0");
+    let now = 5000 + 2 * DAY;
+    let msg = check(&Client::new(), home.path(), &url(&stub), now, "1.0.0");
+    assert!(msg.unwrap().contains("1.5.0"));
+    let saved = std::fs::read_to_string(home.path().join(".monocle/update-check.json")).unwrap();
+    assert!(
+        saved.contains(&format!(r#""last_checked":{now}"#)),
+        "{saved}"
+    );
+}
+
+#[test]
+fn unreachable_server_is_swallowed_and_backs_off() {
+    let home = tempfile::tempdir().unwrap();
+    // Port 9 (discard) on loopback: refused immediately.
+    let msg = check(
+        &Client::new(),
+        home.path(),
+        "http://127.0.0.1:9/x",
+        777,
+        "1.0.0",
+    );
+    assert!(msg.is_none());
+    let saved = std::fs::read_to_string(home.path().join(".monocle/update-check.json")).unwrap();
+    assert!(saved.contains(r#""last_checked":777"#), "{saved}");
+}
+
+#[test]
+fn token_command_is_untouched_by_a_stale_cache() {
+    let stub = common::stub(|_, _, _, _| (404, String::new()));
+    let home = tempfile::tempdir().unwrap();
+    Credentials::with_home(home.path())
+        .write(&CredentialsData {
+            tenant_domain: stub.addr.clone(),
+            tenant_name: "t".into(),
+            email: "e@example.com".into(),
+            access_token: "tok".into(),
+            refresh_token: "r".into(),
+            id_token: "i".into(),
+            access_token_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_token_expires_at: "2099-01-01T00:00:00Z".into(),
+            router_url: Some(stub.router_url()),
+        })
+        .unwrap();
+    seed(home.path(), 1, "0.0.1");
+    let before = std::fs::read(home.path().join(".monocle/update-check.json")).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_monocle"))
+        .arg("token")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("MONOCLE_PROFILE")
+        .env_remove("CI")
+        .env_remove("MONOCLE_NO_UPDATE_CHECK")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "tok");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A check would have bumped last_checked.
+    let after = std::fs::read(home.path().join(".monocle/update-check.json")).unwrap();
+    assert_eq!(before, after);
+}

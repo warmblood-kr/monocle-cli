@@ -110,6 +110,32 @@ impl Client {
         send("GET", url, req)
     }
 
+    /// GET with a caller-chosen total timeout and no transport retry — for
+    /// best-effort background checks (e.g. the update notice) that must never
+    /// hang or double their wait.
+    pub fn get_with_timeout(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        timeout: std::time::Duration,
+    ) -> Result<Resp> {
+        let mut req = self.inner.get(url).timeout(timeout);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().map_err(|e| AppError(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+        let headers = collect_headers(resp.headers());
+        let body = resp.bytes().map_err(|e| AppError(e.to_string()))?.to_vec();
+        Ok(Resp {
+            status,
+            status_text,
+            body,
+            headers,
+        })
+    }
+
     /// DELETE (no body). Goes through the shared `send()`, so — like every call
     /// here — a connection failure before any response is retried once; deleting
     /// is idempotent, so a replay is harmless.
