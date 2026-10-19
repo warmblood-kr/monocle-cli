@@ -24,18 +24,19 @@ fn env_host(environment: &str) -> Option<&'static str> {
     }
 }
 
-/// Host part of an `http(s)://host[:port]/...` URL (no userinfo allowed).
-fn url_host(url: &str) -> Option<(&str, &str)> {
+/// `(scheme, host, port)` of an `http(s)://host[:port]/...` URL (no userinfo allowed).
+fn url_parts(url: &str) -> Option<(&str, &str, Option<&str>)> {
     let (scheme, rest) = url.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next()?;
     if authority.contains('@') {
         return None;
     }
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next()?,
-        None => authority.split(':').next()?,
+    let (host, tail) = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']')?,
+        None => authority.split_at(authority.find(':').unwrap_or(authority.len())),
     };
-    Some((scheme, host))
+    let port = tail.strip_prefix(':');
+    Some((scheme, host, port))
 }
 
 /// Craft server for the selected environment. `MONOCLE_CRAFT_URL` overrides it,
@@ -53,7 +54,7 @@ pub fn base_url(environment: &str) -> Result<String> {
     };
     let url = url.trim_end_matches('/').to_string();
     let refuse = |why: &str| AppError::new(format!("Refusing MONOCLE_CRAFT_URL: {why}."));
-    let (scheme, host) = url_host(&url).ok_or_else(|| refuse("not a valid http(s) URL"))?;
+    let (scheme, host, port) = url_parts(&url).ok_or_else(|| refuse("not a valid http(s) URL"))?;
     match host {
         STG_HOST | PRD_HOST => {
             if env_host(environment) != Some(host) {
@@ -61,8 +62,10 @@ pub fn base_url(environment: &str) -> Result<String> {
                     "host {host} does not belong to env '{environment}'"
                 )));
             }
-            if scheme != "https" {
-                return Err(refuse("known Craft hosts require https"));
+            if scheme != "https" || !matches!(port, None | Some("443")) {
+                return Err(refuse(
+                    "known Craft hosts require https on the default port",
+                ));
             }
         }
         "localhost" | "127.0.0.1" | "::1" if scheme == "http" || scheme == "https" => {}

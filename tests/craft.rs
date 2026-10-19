@@ -429,6 +429,12 @@ fn missing_craft_url_names_the_environment() {
         monocle_cli::craft_server::base_url("stg").unwrap(),
         "https://craft-stg.monocle-ai.com"
     );
+    // An explicit :443 is the default https port and stays allowed. (Kept in this
+    // test so the process-wide env var is never set concurrently with the asserts above.)
+    std::env::set_var("MONOCLE_CRAFT_URL", "https://craft-stg.monocle-ai.com:443/");
+    let r = monocle_cli::craft_server::base_url("stg");
+    std::env::remove_var("MONOCLE_CRAFT_URL");
+    assert_eq!(r.unwrap(), "https://craft-stg.monocle-ai.com:443");
     assert!(requests(&log).is_empty());
 }
 
@@ -480,6 +486,12 @@ fn craft_url_override_must_match_env() {
             "does not belong to env 'prod'",
         ),
         ("stg", "http://craft-stg.monocle-ai.com", "require https"),
+        (
+            "stg",
+            "https://craft-stg.monocle-ai.com:8443",
+            "default port",
+        ),
+        ("stg", "https://craft-stg.monocle-ai.com:", "default port"),
         (
             "stg",
             "https://evil.example.com",
