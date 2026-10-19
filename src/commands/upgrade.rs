@@ -223,7 +223,7 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
             resp.text()
         )));
     }
-    let tag = resp.json::<LatestRelease>()?.tag_name;
+    let tag = crate::util::plain(&resp.json::<LatestRelease>()?.tag_name);
     let latest = tag.strip_prefix('v').unwrap_or(&tag).to_string();
 
     let ordering = compare_versions(current, &latest);

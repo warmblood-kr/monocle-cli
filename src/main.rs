@@ -332,7 +332,11 @@ fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
             "not logged in"
         };
         let marker = if name == selected { "*" } else { " " };
-        println!("{marker} {name}  {}  ({state})", selection.environment);
+        println!(
+            "{marker} {}  {}  ({state})",
+            util::plain(&name),
+            selection.environment
+        );
     }
     Ok(())
 }
@@ -356,8 +360,8 @@ fn profile_show_command(
     println!("Environment: {}", selection.environment);
     match store.read() {
         Some(creds) => {
-            println!("Tenant: {}", creds.tenant_domain);
-            println!("User: {}", creds.email);
+            println!("Tenant: {}", util::plain(&creds.tenant_domain));
+            println!("User: {}", util::plain(&creds.email));
             println!("Status: logged in");
         }
         None => println!("Status: not logged in"),

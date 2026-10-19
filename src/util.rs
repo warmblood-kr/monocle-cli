@@ -19,6 +19,20 @@ pub fn plain(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// Like [`plain`] but keeps `\n` and `\t` (and all Unicode, e.g. Korean): for
+/// message text and error bodies, where line structure matters. Strips ESC, CR,
+/// the other C0/C1 controls and DEL, so an escape sequence cannot survive.
+pub fn body(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// serde `deserialize_with` for message text: [`body`]ed on the way in.
+pub fn de_body<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    <String as serde::Deserialize>::deserialize(d).map(|s| body(&s))
+}
+
 /// serde `deserialize_with` for a server string that will be printed: [`plain`]ed
 /// on the way in, so no print site can forget.
 pub fn de_plain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -131,5 +145,14 @@ mod plain_tests {
     fn plain_drops_every_control_character() {
         assert_eq!(plain("a\nb\rc\x1b[2Jd\te\u{7f}f\u{85}g"), "abc[2Jdefg");
         assert_eq!(plain("한글 🙂 ok"), "한글 🙂 ok");
+    }
+
+    #[test]
+    fn body_keeps_newline_tab_and_unicode_but_strips_escapes() {
+        use super::body;
+        assert_eq!(
+            body("안녕\n\tline\x1b[31m red\x1b[0m\r\x07\u{7f}\u{9b}2J end"),
+            "안녕\n\tline[31m red[0m2J end"
+        );
     }
 }

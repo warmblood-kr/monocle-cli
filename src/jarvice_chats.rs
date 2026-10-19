@@ -58,7 +58,7 @@ where
     D: serde::Deserializer<'de>,
 {
     match Value::deserialize(deserializer)? {
-        Value::String(content) => Ok(content),
+        Value::String(content) => Ok(crate::util::body(&content)),
         _ => Ok("[Non-text message content omitted]".to_string()),
     }
 }
@@ -1023,5 +1023,14 @@ mod tests {
         let call = only(&content);
         assert!(!call.arguments.contains("SECRET2"), "{}", call.arguments);
         assert!(!body_text(&content, true).contains("SECRET2"));
+    }
+
+    #[test]
+    fn message_node_content_is_stripped_on_parse_keeping_newlines() {
+        let node: MessageNode = serde_json::from_str(
+            r#"{"id":"m","parentId":null,"role":"assistant","content":"안녕\u001b[2J\nline\r2\u0007"}"#,
+        )
+        .unwrap();
+        assert_eq!(node.content, "안녕[2J\nline2");
     }
 }

@@ -266,7 +266,7 @@ fn parse_reply(data: &Value, thread_id: Option<String>) -> Result<ResponsesReply
         )));
     }
     let message = &data["choices"][0]["message"];
-    let content = message["content"].as_str().unwrap_or_default().to_string();
+    let content = crate::util::body(message["content"].as_str().unwrap_or_default());
     let (tool_calls, unparsed_tool_calls) = parse_tool_calls(&message["tool_calls"]);
     // Top-level, a sibling of `choices` — not a field on the message.
     let (tools_used, unparsed_tools_used, tools_used_present) =
@@ -302,7 +302,7 @@ fn parse_tools_used(value: Option<&Value>) -> (Vec<String>, usize, bool) {
     let mut unparsed = 0usize;
     for entry in entries {
         match entry.get("name").and_then(|n| n.as_str()) {
-            Some(name) if !name.is_empty() => names.push(name.to_string()),
+            Some(name) if !name.is_empty() => names.push(crate::util::plain(name)),
             _ => unparsed += 1,
         }
     }
@@ -590,5 +590,14 @@ mod tests {
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[1]["image_url"], json!("data:image/png;base64,AAAA"));
         assert_eq!(parts[2]["image_url"], json!("https://example.com/b.png"));
+    }
+
+    #[test]
+    fn reply_content_is_stripped_of_escapes_but_keeps_newlines_and_korean() {
+        let data = json!({"choices":[{"message":{"role":"assistant","content":"안녕\x1b[2J\nline2\r\x07\ttab"}}],
+            "tools_used":[{"name":"web\x1b[31m_search"}]});
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.content, "안녕[2J\nline2\ttab");
+        assert_eq!(reply.tools_used, vec!["web[31m_search".to_string()]);
     }
 }

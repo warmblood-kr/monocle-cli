@@ -41,8 +41,11 @@ h1{{color:#ef4444;margin-bottom:0.5rem}}p{{color:#6b7280}}</style></head>
 #[derive(Deserialize)]
 struct DeviceAuthResponse {
     device_code: String,
+    #[serde(deserialize_with = "crate::util::de_plain")]
     user_code: String,
+    #[serde(deserialize_with = "crate::util::de_plain")]
     verification_uri: String,
+    #[serde(default, deserialize_with = "crate::util::de_plain_opt")]
     verification_uri_complete: Option<String>,
     expires_in: i64,
     interval: Option<i64>,
@@ -163,7 +166,10 @@ fn browser_code_login(
     );
 
     eprintln!("Opening browser for authentication...");
-    eprintln!("If the browser doesn't open, visit: {auth_url}");
+    eprintln!(
+        "If the browser doesn't open, visit: {}",
+        crate::util::plain(&auth_url)
+    );
 
     if let Err(e) = open::that(&auth_url) {
         return Browser::Unavailable(format!("failed to launch browser: {e}"));
@@ -530,8 +536,8 @@ fn print_login_success(email: &str, tenant_name: &str, leading_newline: bool) {
         "{}{} Logged in as {} {}",
         if leading_newline { "\n" } else { "" },
         c::green("✓"),
-        c::bold(email),
-        c::dim(&format!("({tenant_name})"))
+        c::bold(&crate::util::plain(email)),
+        c::dim(&format!("({})", crate::util::plain(tenant_name)))
     );
     eprintln!(
         "\n{} {}",

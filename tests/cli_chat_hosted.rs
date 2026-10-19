@@ -272,3 +272,23 @@ fn malformed_resume_ids_are_rejected_without_echo_or_requests() {
     }
     assert_eq!(hits(&hits_map, "/api/responses"), 0, "a request was sent");
 }
+
+#[test]
+fn reply_text_cannot_inject_terminal_escapes() {
+    let body = serde_json::json!({"choices":[{"message":{"role":"assistant",
+        "content":"안녕\u{1b}[2J\u{1b}]0;pwned\u{7}\nsecond\rline"}}]})
+    .to_string();
+    let stub = common::stub_with_headers(move |_, _, _, _| {
+        (200, body.clone(), vec![("x-thread-id", "t1".to_string())])
+    });
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        !out.contains('\u{1b}') && !out.contains('\r') && !out.contains('\u{7}'),
+        "{out:?}"
+    );
+    // newline and Korean survive
+    assert_eq!(out, "안녕[2J]0;pwned\nsecondline\n");
+}

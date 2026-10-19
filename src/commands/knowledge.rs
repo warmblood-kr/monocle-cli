@@ -25,7 +25,10 @@ fn connect(
         "Profile: {} ({}) — tenant {}",
         selection.profile,
         selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+        creds
+            .read()
+            .map(|c| crate::util::plain(&c.tenant_domain))
+            .unwrap_or_default()
     );
     Ok((jarvice_url, bearer))
 }

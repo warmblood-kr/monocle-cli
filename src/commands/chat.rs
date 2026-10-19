@@ -392,10 +392,10 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
                     })
                     .unwrap_or_default();
                 if !ids.iter().any(|id| id == &model) {
-                    eprintln!("Error: Model \"{model}\" not found.");
+                    eprintln!("Error: Model \"{}\" not found.", crate::util::plain(&model));
                     eprintln!("Available models:");
                     for id in &ids {
-                        eprintln!("  {id}");
+                        eprintln!("  {}", crate::util::plain(id));
                     }
                     std::process::exit(1);
                 }
@@ -406,8 +406,8 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
 
     // Non-interactive: stdin was piped (input + attachments already resolved above).
     if let Some((text, images, files)) = one_shot_input {
-        eprintln!("Using model: {model}");
-        eprintln!("Router: {router_url}");
+        eprintln!("Using model: {}", crate::util::plain(&model));
+        eprintln!("Router: {}", crate::util::plain(&router_url));
         let provider = MonocleProvider::new(token, router_url.clone());
         let mut messages = Vec::new();
         if let Some(sp) = &system_prompt {
@@ -433,8 +433,8 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     let mut provider = MonocleProvider::new(token, router_url.clone());
 
     // Interactive REPL.
-    eprintln!("Monocle Chat (model: {model})");
-    eprintln!("Router: {router_url}");
+    eprintln!("Monocle Chat (model: {})", crate::util::plain(&model));
+    eprintln!("Router: {}", crate::util::plain(&router_url));
     if let Some(sp) = &system_prompt {
         eprintln!("System prompt loaded ({} chars)", sp.chars().count());
     }
@@ -610,7 +610,10 @@ pub fn chat_list_command(
         "Profile: {} ({}) — tenant {}",
         selection.profile,
         selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+        creds
+            .read()
+            .map(|c| crate::util::plain(&c.tenant_domain))
+            .unwrap_or_default()
     );
     print_threads_table(&threads);
     Ok(())
@@ -632,7 +635,10 @@ pub fn chat_content_command(
         "Profile: {} ({}) — tenant {}",
         selection.profile,
         selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+        creds
+            .read()
+            .map(|c| crate::util::plain(&c.tenant_domain))
+            .unwrap_or_default()
     );
     // Only a well-formed id is echoed (invalid ones are rejected without being printed).
     announce_thread(id);
@@ -927,8 +933,8 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     let one_shot_input = read_one_shot_input(stdin_is_tty, &options.files)?;
 
     if let Some((text, images, files)) = one_shot_input {
-        eprintln!("Using model: {model}");
-        eprintln!("jarvice: {jarvice_url}");
+        eprintln!("Using model: {}", crate::util::plain(&model));
+        eprintln!("jarvice: {}", crate::util::plain(&jarvice_url));
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
         // A resumed thread's id is known up front — print it before the (possibly
         // long) request so it is on screen even if the request later times out.
@@ -990,8 +996,11 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     }
 
     // Interactive REPL.
-    eprintln!("Monocle Chat — Responses API (model: {model})");
-    eprintln!("jarvice: {jarvice_url}");
+    eprintln!(
+        "Monocle Chat — Responses API (model: {})",
+        crate::util::plain(&model)
+    );
+    eprintln!("jarvice: {}", crate::util::plain(&jarvice_url));
     eprintln!("{}", chat_help_text());
     eprintln!("The server owns this conversation's thread — no local history is resent.");
     eprintln!("---");
