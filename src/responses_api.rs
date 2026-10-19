@@ -196,7 +196,9 @@ impl<'a> ResponsesClient<'a> {
 
         let body = build_request_body(model, text, images, &file_ids, thread_id, tool_ids);
 
-        let resp = self.client.post_json(
+        // `_once`: a turn can run paid tool calls / sub-agent delegations, so a
+        // lost response must not replay it (monocle-cli#172).
+        let resp = self.client.post_json_once(
             &format!("{}/api/responses", self.jarvice_url),
             &responses_headers(&bearer),
             &body,
@@ -221,7 +223,7 @@ impl<'a> ResponsesClient<'a> {
     /// plain pair is the right convention here rather than
     /// `responses_headers`.
     fn upload_file(&self, bearer: &str, file: &FileAttachment) -> Result<String> {
-        let resp = self.client.post_multipart(
+        let resp = self.client.post_multipart_once(
             &format!("{}/api/v1/files/", self.jarvice_url),
             &auth_headers(bearer),
             vec![FilePart {

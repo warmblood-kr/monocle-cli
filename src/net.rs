@@ -298,6 +298,8 @@ impl Client {
 /// different problem — real transient 5xx/429 responses from a server that
 /// *did* answer — and would need its own, separately-scoped retry policy).
 ///
+/// (Timeouts are the exception — see the guard in the `match` below.)
+///
 /// Safe to retry unconditionally here (not just for idempotent methods):
 /// every call site through this module is an LLM/media API call (chat
 /// completion, token exchange, audio upload/synthesis) where, at worst, a
@@ -316,6 +318,10 @@ fn send_with_retry(
     let retry = req.try_clone();
     match req.send() {
         Ok(resp) => Ok(resp),
+        // A timeout means the request WAS sent and the server may still be
+        // working on it (e.g. a long agent delegation) — replaying it would run
+        // the work twice. Only failures that look like a dead connection retry.
+        Err(first_err) if first_err.is_timeout() => Err(first_err),
         Err(first_err) => {
             crate::diag::log_network_error(
                 method,
@@ -355,6 +361,11 @@ fn send_opt(
     let resp = sent.map_err(|e| {
         let msg = e.to_string();
         crate::diag::log_network_error(method, url, &msg);
+        if e.is_timeout() {
+            return AppError::new(
+                "Request timed out after 120s. The server may still be processing it; it was not re-sent.",
+            );
+        }
         AppError(msg)
     })?;
     let status = resp.status().as_u16();
@@ -478,6 +489,35 @@ mod tests {
         let url = format!("http://{addr}/");
         let resp = send_with_retry("GET", &url, client.get(&url)).expect("retry should recover");
         assert_eq!(resp.status(), 200);
+    }
+
+    /// A timed-out request was already delivered; the server may still be
+    /// running it, so it must NOT be sent a second time.
+    #[test]
+    fn send_with_retry_does_not_replay_a_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            // Accept and read, never answer; keep the sockets open.
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                held.push(stream);
+            }
+        });
+
+        let client = reqwest::blocking::Client::new();
+        let url = format!("http://{addr}/");
+        let req = client
+            .post(&url)
+            .timeout(std::time::Duration::from_millis(300));
+        let err = send_with_retry("POST", &url, req).unwrap_err();
+        assert!(err.is_timeout());
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// When even the retry fails (the peer never comes back at all), the
