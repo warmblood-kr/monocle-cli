@@ -102,7 +102,7 @@ fn verify_checksum(client: &Client, tag: &str, asset: &str, bytes: &[u8]) -> Res
 /// fails to parse — so the caller can distinguish "definitely not newer" from
 /// "can't tell" (e.g. a non-semver release tag) instead of silently no-op'ing.
 /// `Ordering::Less` means `current < latest` (an upgrade is available).
-fn compare_versions(current: &str, latest: &str) -> Option<std::cmp::Ordering> {
+pub fn compare_versions(current: &str, latest: &str) -> Option<std::cmp::Ordering> {
     match (
         semver::Version::parse(current),
         semver::Version::parse(latest),
@@ -199,6 +199,34 @@ fn map_self_replace_error(e: std::io::Error) -> AppError {
     }
 }
 
+/// GitHub "latest release" API endpoint for this repo.
+pub fn latest_release_url() -> String {
+    format!("https://api.github.com/repos/{REPO}/releases/latest")
+}
+
+/// Fetch the latest release version (leading `v` stripped). `timeout: Some(_)`
+/// uses the short no-retry path (update notice); `None` the standard client.
+pub fn fetch_latest_version(
+    client: &Client,
+    url: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<String> {
+    let headers = [("Accept", "application/vnd.github+json")];
+    let resp = match timeout {
+        Some(t) => client.get_with_timeout(url, &headers, t)?,
+        None => client.get(url, &headers)?,
+    };
+    if !resp.ok() {
+        return Err(AppError::new(format!(
+            "GitHub API error {}: {}",
+            resp.status,
+            resp.text()
+        )));
+    }
+    let tag = resp.json::<LatestRelease>()?.tag_name;
+    Ok(tag.strip_prefix('v').unwrap_or(&tag).to_string())
+}
+
 pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
     use std::cmp::Ordering;
 
@@ -209,19 +237,8 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
     // only consulted later, on the actual download path.
     eprintln!("Checking for updates...");
 
-    let resp = client.get(
-        &format!("https://api.github.com/repos/{REPO}/releases/latest"),
-        &[("Accept", "application/vnd.github+json")],
-    )?;
-    if !resp.ok() {
-        return Err(AppError::new(format!(
-            "GitHub API error {}: {}",
-            resp.status,
-            resp.text()
-        )));
-    }
-    let tag = resp.json::<LatestRelease>()?.tag_name;
-    let latest = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+    let latest = fetch_latest_version(client, &latest_release_url(), None)?;
+    let tag = format!("v{latest}");
 
     let ordering = compare_versions(current, &latest);
 

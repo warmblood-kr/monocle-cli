@@ -37,6 +37,7 @@ use monocle_cli::error::Result;
 use monocle_cli::jarvice_chats::ContentFormat;
 use monocle_cli::net::Client;
 use monocle_cli::profiles::{self, Selection};
+use monocle_cli::update_notice;
 use monocle_cli::util;
 
 // clap 4 has no native way to group subcommands under section headings, so the
@@ -832,6 +833,14 @@ fn main() {
         Err(c) => c,
     };
 
+    let notice_name = match &command {
+        Commands::Token => "token",
+        Commands::Upgrade { .. } => "upgrade",
+        Commands::Acp => "acp",
+        _ => "other",
+    };
+    let notice = update_notice::start(notice_name, &home);
+
     let result: Result<()> = match command {
         Commands::Login {
             tenant,
@@ -989,6 +998,10 @@ fn main() {
             unreachable!("legacy alias not rewritten")
         }
     };
+
+    if result.is_ok() {
+        update_notice::finish(notice, notice_name, &home, update_notice::DEFAULT_GRACE);
+    }
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
