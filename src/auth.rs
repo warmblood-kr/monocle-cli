@@ -3,6 +3,9 @@
 //! Like the TS version, this exits the process with a friendly message when no
 //! credentials exist or refresh fails — callers don't handle those cases.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use crate::credentials::{Credentials, CredentialsData};
 use crate::error::{AppError, Result};
 use crate::net::Client;
@@ -53,6 +56,33 @@ pub fn jarvice_url_for(creds: &CredentialsData) -> String {
 /// Return a usable access token, serializing refreshes across processes.
 /// The lock is held from the post-lock read through any refresh and write.
 pub fn ensure_fresh_token(client: &Client, creds: &Credentials) -> Result<AuthSession> {
+    // A token can expire mid-command (long batches reuse one bearer): let the
+    // client refresh once and replay when the server answers 401.
+    let hook_creds = creds.clone();
+    client.set_unauthorized_refresher(Arc::new(move |client, rejected| {
+        match locked_token(client, &hook_creds, Some(rejected)) {
+            Ok(session) => Some(session.token),
+            Err(e) => {
+                // Once per process, so a batch doesn't repeat the guidance.
+                if !REFRESH_FAILURE_SHOWN.swap(true, Ordering::SeqCst) {
+                    eprintln!("{e}");
+                }
+                None
+            }
+        }
+    }));
+    locked_token(client, creds, None)
+}
+
+static REFRESH_FAILURE_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// `rejected` = a bearer the server just 401'd: refresh unless the stored token
+/// already differs (someone else refreshed), ignoring the expiry heuristic.
+fn locked_token(
+    client: &Client,
+    creds: &Credentials,
+    rejected: Option<&str>,
+) -> Result<AuthSession> {
     let dir = creds.dir();
     std::fs::create_dir_all(&dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -72,13 +102,21 @@ pub fn ensure_fresh_token(client: &Client, creds: &Credentials) -> Result<AuthSe
     };
 
     let mut active = stored.clone();
+    let force = rejected.is_some_and(|r| r == stored.access_token);
+    if rejected.is_some() && !force {
+        let router_url = router_url_for(&active);
+        return Ok(AuthSession {
+            token: active.access_token,
+            router_url,
+        });
+    }
     let jwt_exp = jwt_exp_ms(&stored.access_token);
     let expires_at = match jwt_exp {
         Some(Some(exp)) => Some(exp),
         Some(None) => None,
         None => parse_iso_ms(&stored.access_token_expires_at),
     };
-    if expires_at.is_some_and(|exp| now_ms() + EXPIRY_BUFFER_MS >= exp) {
+    if force || expires_at.is_some_and(|exp| now_ms() + EXPIRY_BUFFER_MS >= exp) {
         match refresh_access_token(client, &stored, creds) {
             Ok(refreshed) => active = refreshed,
             // refresh.rs's 400/401 message already says to run `monocle login`;

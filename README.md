@@ -60,7 +60,19 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle knowledge create <name>` | Create an empty knowledge collection (name must be new); prints its id |
 | `monocle knowledge upload <collection> <file-or-dir>...` | Upload and index pdf/docx/md/txt files into a collection (a directory contributes its top-level supported files). A failed file is reported and the rest continue (exit `1`); files already in the collection (same name) are skipped, so re-runs are safe. Prints `file-id<TAB>name` per stored file |
 | `monocle knowledge list [<collection>]` | List collections (id, name, file count), or one collection's files |
+| `monocle knowledge update <collection> [--name N] [--description D]` | Rename and/or re-describe a collection; sharing (access control) is left as is |
+| `monocle knowledge remove <collection> <file>` | Detach one file (name or id) and keep the collection; the server also deletes the file itself unless another collection or chat still uses it |
+| `monocle knowledge replace <collection> <file>` | Replace the same-named file with a new local version (new one is attached before the old one is removed). Prints `file-id<TAB>name` |
+| `monocle knowledge reprocess <collection> <file> [--force]` | Re-extract the file's text on the server and re-index it in the collection |
+| `monocle knowledge content <collection> <file>` | Print the text the server extracted from the file (to check parsing before testing search) |
+| `monocle knowledge ask <collection> <question> [--model M] [--json]` | Ask one question with the collection attached (one model turn, not saved to your threads). Answer on stdout; the files it was grounded in on stderr (or `{"answer","sources"}` with `--json`). jarvice has no retrieval endpoint, so this is the only way to see whether stored content is used |
 | `monocle knowledge delete <collection>` | Delete a collection **and its files** (kept if any file can't be deleted, so you can retry) |
+| `monocle workspace-model list` | List workspace (custom) models: id, name, base model, active |
+| `monocle workspace-model show <id>` | Print one model as JSON |
+| `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment) |
+| `monocle workspace-model update <id> [same flags]` | Change only the given fields (`--tool`/`--knowledge` replace the lists) |
+| `monocle workspace-model toggle <id>` / `delete <id>` | Flip active/inactive; delete |
+| `monocle craft [--lane openworker\|sdk] session list\|show <id>\|history <id>\|files <id>\|download <id> <path>\|delete <id>` | Inspect and delete Craft sessions; see [Craft sessions](#-craft-sessions) |
 | `monocle router models` | List available models from the router (with modality) |
 | `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat via the router's plain `/v1/chat/completions` (REPL or stdin); no Responses-API options |
 | `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
@@ -286,7 +298,38 @@ monocle knowledge list my-fixtures                   # the collection's files
 monocle knowledge delete my-fixtures                 # collection and its files
 ```
 
+### 🧩 Workspace (custom) models
+
+Create, use and clean up the same models as the web UI's Workspace > Models page (needs the `workspace.models` permission; without it jarvice answers 401 and the CLI says so). Named `workspace-model` because `monocle models`/`monocle model` are deprecated aliases of `monocle router ...` (base models):
+
+```bash
+monocle router models                                   # pick a base model id
+monocle workspace-model create e2e-1 --base <base> --system "Answer in one line." \
+  --tool mcp:myserver --knowledge my-fixtures
+monocle chat --model e2e-1 "hello"
+monocle workspace-model delete e2e-1
+```
+
 `<collection>` is an exact name or id; a name shared by several collections is an error that lists their ids. Uploads index each file on the server before the next one starts, so large PDFs take a while. Data goes to stdout and progress to stderr, so output pipes cleanly. Commands act on the selected `--profile`/`--env` tenant.
+
+### 🗂️ Craft sessions
+
+Inspect and clean up Craft sessions from the terminal, on either backend (`--lane`, default `openworker`):
+
+```bash
+monocle craft session list [--workspace PATH]       # id, messages, updated, title
+monocle craft session show <id>
+monocle craft session history <id> [--all]          # openworker: `role<TAB>text` per message (--all adds system)
+monocle craft session files <id>                    # sdk: [--folder uploads|outputs]
+monocle craft session download <id> <path> [-o FILE]  # bytes to stdout, or to FILE
+monocle craft session delete <id>
+monocle --env stg craft --lane sdk session list     # jarvice agent sessions
+```
+
+- `openworker` talks to the Craft server with your monocle access token. Its URL is `MONOCLE_CRAFT_URL` if set, else `https://craft-stg.monocle-ai.com` for `--env stg` and `https://craft.monocle-ai.com` for `--env prod`; for `local` set `MONOCLE_CRAFT_URL`. An override is refused if it names the other environment's Craft host (your token is never sent across environments) or any host other than loopback. `--workspace` filters `list` (this lane only).
+- `sdk` uses your tenant's jarvice agent sessions (`--folder` on `files` applies here only).
+- `list`, `show`, `history`, `files` and `delete` take `--json` for the raw server data on stdout. Data goes to stdout; the profile banner and confirmations go to stderr.
+- Server error bodies are never printed: you see the HTTP status and, when the server sends one, a short error code. On the openworker lane `files` reports "session files unavailable" if the session is parked or its sandbox is gone.
 
 ### 🧵 Hosted Chat: server-managed threads
 
@@ -555,6 +598,22 @@ monocle upgrade --check
 
 Intel Macs have no prebuilt binary, so `upgrade` reports an error there — build
 from source instead (see Setup).
+
+### Update notice
+
+While a command runs, monocle checks for a newer release in the background at
+most once every 24 hours (3-second timeout, failures ignored; the result is
+cached in `~/.monocle/update-check.json`; the command never waits more than
+~300 ms for it) and, if one exists, prints a single line to stderr when the
+command finishes:
+
+```
+monocle X.Y.Z is available (current A.B.C). Run `monocle upgrade`.
+```
+
+The notice is never shown when stderr is not a terminal, when `CI` is set, or
+for `token`, `upgrade` and `acp`. Set `MONOCLE_NO_UPDATE_CHECK=1` to disable
+the check entirely.
 
 ## 🤖 Claude Code integration
 

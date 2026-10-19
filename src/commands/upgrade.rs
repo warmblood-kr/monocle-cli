@@ -74,7 +74,7 @@ fn find_checksum<'a>(sums: &'a str, asset: &str) -> Option<&'a str> {
 /// is a hard error.
 fn verify_checksum(client: &Client, tag: &str, asset: &str, bytes: &[u8]) -> Result<()> {
     let url = download_url(tag, "SHA256SUMS");
-    let resp = match client.get(&url, &[("User-Agent", "monocle-cli")]) {
+    let resp = match client.get(&url, &[]) {
         Ok(r) if r.ok() => r,
         _ => {
             eprintln!("⚠ SHA256SUMS not available, skipping checksum verification");
@@ -102,7 +102,7 @@ fn verify_checksum(client: &Client, tag: &str, asset: &str, bytes: &[u8]) -> Res
 /// fails to parse — so the caller can distinguish "definitely not newer" from
 /// "can't tell" (e.g. a non-semver release tag) instead of silently no-op'ing.
 /// `Ordering::Less` means `current < latest` (an upgrade is available).
-fn compare_versions(current: &str, latest: &str) -> Option<std::cmp::Ordering> {
+pub fn compare_versions(current: &str, latest: &str) -> Option<std::cmp::Ordering> {
     match (
         semver::Version::parse(current),
         semver::Version::parse(latest),
@@ -199,6 +199,34 @@ fn map_self_replace_error(e: std::io::Error) -> AppError {
     }
 }
 
+/// GitHub "latest release" API endpoint for this repo.
+pub fn latest_release_url() -> String {
+    format!("https://api.github.com/repos/{REPO}/releases/latest")
+}
+
+/// Fetch the latest release version (leading `v` stripped). `timeout: Some(_)`
+/// uses the short no-retry path (update notice); `None` the standard client.
+pub fn fetch_latest_version(
+    client: &Client,
+    url: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<String> {
+    let headers = [("Accept", "application/vnd.github+json")];
+    let resp = match timeout {
+        Some(t) => client.get_with_timeout(url, &headers, t)?,
+        None => client.get(url, &headers)?,
+    };
+    if !resp.ok() {
+        return Err(AppError::new(format!(
+            "GitHub API error {}: {}",
+            resp.status,
+            resp.text()
+        )));
+    }
+    let tag = resp.json::<LatestRelease>()?.tag_name;
+    Ok(tag.strip_prefix('v').unwrap_or(&tag).to_string())
+}
+
 pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
     use std::cmp::Ordering;
 
@@ -209,22 +237,8 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
     // only consulted later, on the actual download path.
     eprintln!("Checking for updates...");
 
-    let resp = client.get(
-        &format!("https://api.github.com/repos/{REPO}/releases/latest"),
-        &[
-            ("User-Agent", "monocle-cli"),
-            ("Accept", "application/vnd.github+json"),
-        ],
-    )?;
-    if !resp.ok() {
-        return Err(AppError::new(format!(
-            "GitHub API error {}: {}",
-            resp.status,
-            resp.text()
-        )));
-    }
-    let tag = resp.json::<LatestRelease>()?.tag_name;
-    let latest = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+    let latest = fetch_latest_version(client, &latest_release_url(), None)?;
+    let tag = format!("v{latest}");
 
     let ordering = compare_versions(current, &latest);
 
@@ -284,7 +298,7 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
 
     // Use the dedicated download path: a multi-MB binary on a slow link must not
     // inherit the shared `send()`'s short total API timeout.
-    let resp = client.get_download(&url, &[("User-Agent", "monocle-cli")])?;
+    let resp = client.get_download(&url, &[])?;
     if !resp.ok() {
         return Err(AppError::new(format!(
             "download failed {}: {}",

@@ -13,10 +13,13 @@ use monocle_cli::commands::chat::{
     chat_command, chat_content_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
+use monocle_cli::commands::craft::{craft_session_command, Lane, SessionCommand};
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::knowledge::{
-    knowledge_create_command, knowledge_delete_command, knowledge_list_command,
+    knowledge_ask_command, knowledge_content_command, knowledge_create_command,
+    knowledge_delete_command, knowledge_list_command, knowledge_remove_command,
+    knowledge_replace_command, knowledge_reprocess_command, knowledge_update_command,
     knowledge_upload_command,
 };
 use monocle_cli::commands::login::login_command;
@@ -26,6 +29,7 @@ use monocle_cli::commands::status::status_command;
 use monocle_cli::commands::token::token_command;
 use monocle_cli::commands::unset::unset_command;
 use monocle_cli::commands::upgrade::upgrade_command;
+use monocle_cli::commands::workspace_model::{self as wm, WriteArgs};
 use monocle_cli::config::Config;
 use monocle_cli::credentials::Credentials;
 use monocle_cli::diag;
@@ -33,6 +37,7 @@ use monocle_cli::error::Result;
 use monocle_cli::jarvice_chats::ContentFormat;
 use monocle_cli::net::Client;
 use monocle_cli::profiles::{self, Selection};
+use monocle_cli::update_notice;
 use monocle_cli::util;
 
 // clap 4 has no native way to group subcommands under section headings, so the
@@ -60,7 +65,9 @@ Commands:
 
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
-    knowledge  Manage knowledge collections (create, upload files, list, delete)
+    knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
+    workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
+    craft    Inspect and delete Craft sessions (list, show, history, files, download, delete)
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -139,10 +146,23 @@ enum Commands {
         #[command(flatten)]
         args: ChatArgs,
     },
-    /// Manage knowledge collections (create, upload files, list, delete)
+    /// Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommand,
+    },
+    /// Manage workspace (custom) models: system prompt, tools, knowledge (then `chat --model <id>`)
+    WorkspaceModel {
+        #[command(subcommand)]
+        command: WorkspaceModelCommand,
+    },
+    /// Inspect and delete Craft sessions (list, show, history, files, download, delete)
+    Craft {
+        /// Craft backend: the Craft server (openworker) or jarvice agent sessions (sdk)
+        #[arg(long, value_enum, default_value = "openworker")]
+        lane: Lane,
+        #[command(subcommand)]
+        command: CraftCommand,
     },
     /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
     Agent {
@@ -387,6 +407,15 @@ enum ChatCommand {
 }
 
 #[derive(Subcommand)]
+enum CraftCommand {
+    /// Manage sessions
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Subcommand)]
 enum KnowledgeCommand {
     /// Create an empty collection; prints its id to stdout
     Create {
@@ -408,11 +437,123 @@ enum KnowledgeCommand {
         /// Collection name or id; omit to list all collections
         collection: Option<String>,
     },
+    /// Rename and/or re-describe a collection (sharing/access is left unchanged)
+    Update {
+        /// Collection name or id
+        collection: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Remove one file from a collection (the collection is kept). The server
+    /// also deletes the file itself unless another collection or chat still uses it
+    Remove {
+        /// Collection name or id
+        collection: String,
+        /// File name or id within the collection (see `monocle knowledge list COLLECTION`)
+        file: String,
+    },
+    /// Replace the same-named file in a collection with a new local version
+    Replace {
+        /// Collection name or id
+        collection: String,
+        /// Local file (pdf, docx, md, txt); its name selects the file to replace
+        path: String,
+    },
+    /// Re-extract a file's text on the server and re-index it in the collection
+    Reprocess {
+        /// Collection name or id
+        collection: String,
+        /// File name or id within the collection
+        file: String,
+        /// Re-extract even if the file already has text
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the text the server extracted from a file (check parsing before search)
+    Content {
+        /// Collection name or id
+        collection: String,
+        /// File name or id within the collection
+        file: String,
+    },
+    /// Ask a question with a collection attached; prints the answer (stdout) and
+    /// the files its retrieved passages came from (stderr). Costs one model turn; not saved to your threads
+    Ask {
+        /// Collection name or id
+        collection: String,
+        /// The question
+        question: String,
+        /// Model ID to use
+        #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
+        model: String,
+        /// Print {"answer", "sources"} as JSON on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete a collection and all of its files
     Delete {
         /// Collection name or id
         collection: String,
     },
+}
+
+#[derive(Args)]
+struct ModelWriteArgs {
+    /// Model id (what `monocle chat --model` takes)
+    id: String,
+    /// JSON file with ModelForm fields (base_model_id, name, meta, params, ...); flags override it
+    #[arg(long, value_name = "PATH")]
+    file: Option<String>,
+    /// Display name (default for create: the id)
+    #[arg(long)]
+    name: Option<String>,
+    /// Base model id (see `monocle router models`); required for create unless in --file
+    #[arg(long)]
+    base: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    /// System prompt
+    #[arg(long)]
+    system: Option<String>,
+    /// Tool id, e.g. `mcp:server` (repeatable; replaces the model's tool list)
+    #[arg(long = "tool", value_name = "TOOL_ID")]
+    tools: Vec<String>,
+    /// Knowledge collection name or id (repeatable; replaces the model's collections)
+    #[arg(long = "knowledge", value_name = "COLLECTION")]
+    knowledge: Vec<String>,
+}
+
+impl From<ModelWriteArgs> for WriteArgs {
+    fn from(a: ModelWriteArgs) -> Self {
+        WriteArgs {
+            id: a.id,
+            file: a.file,
+            name: a.name,
+            base: a.base,
+            description: a.description,
+            system: a.system,
+            tools: a.tools,
+            knowledge: a.knowledge,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum WorkspaceModelCommand {
+    /// List workspace models (id, name, base, active)
+    List,
+    /// Print one model as JSON
+    Show { id: String },
+    /// Create a private, active model; prints its id to stdout
+    Create(ModelWriteArgs),
+    /// Change a model: only the given flags/--file fields change
+    Update(ModelWriteArgs),
+    /// Flip a model between active and inactive
+    Toggle { id: String },
+    /// Delete a model
+    Delete { id: String },
 }
 
 #[derive(Args)]
@@ -692,6 +833,14 @@ fn main() {
         Err(c) => c,
     };
 
+    let notice_name = match &command {
+        Commands::Token => "token",
+        Commands::Upgrade { .. } => "upgrade",
+        Commands::Acp => "acp",
+        _ => "other",
+    };
+    let notice = update_notice::start(notice_name, &home);
+
     let result: Result<()> = match command {
         Commands::Login {
             tenant,
@@ -747,10 +896,74 @@ fn main() {
             KnowledgeCommand::List { collection } => {
                 knowledge_list_command(&client, &creds, &selection, collection.as_deref())
             }
+            KnowledgeCommand::Update {
+                collection,
+                name,
+                description,
+            } => knowledge_update_command(
+                &client,
+                &creds,
+                &selection,
+                &collection,
+                name.as_deref(),
+                description.as_deref(),
+            ),
+            KnowledgeCommand::Remove { collection, file } => {
+                knowledge_remove_command(&client, &creds, &selection, &collection, &file)
+            }
+            KnowledgeCommand::Replace { collection, path } => {
+                knowledge_replace_command(&client, &creds, &selection, &collection, &path)
+            }
+            KnowledgeCommand::Reprocess {
+                collection,
+                file,
+                force,
+            } => {
+                knowledge_reprocess_command(&client, &creds, &selection, &collection, &file, force)
+            }
+            KnowledgeCommand::Content { collection, file } => {
+                knowledge_content_command(&client, &creds, &selection, &collection, &file)
+            }
+            KnowledgeCommand::Ask {
+                collection,
+                question,
+                model,
+                json,
+            } => knowledge_ask_command(
+                &client,
+                &creds,
+                &selection,
+                &collection,
+                &question,
+                &model,
+                json,
+            ),
             KnowledgeCommand::Delete { collection } => {
                 knowledge_delete_command(&client, &creds, &selection, &collection)
             }
         },
+        Commands::WorkspaceModel { command } => match command {
+            WorkspaceModelCommand::List => wm::list_command(&client, &creds, &selection),
+            WorkspaceModelCommand::Show { id } => {
+                wm::show_command(&client, &creds, &selection, &id)
+            }
+            WorkspaceModelCommand::Create(a) => {
+                wm::create_command(&client, &creds, &selection, &a.into())
+            }
+            WorkspaceModelCommand::Update(a) => {
+                wm::update_command(&client, &creds, &selection, &a.into())
+            }
+            WorkspaceModelCommand::Toggle { id } => {
+                wm::toggle_command(&client, &creds, &selection, &id)
+            }
+            WorkspaceModelCommand::Delete { id } => {
+                wm::delete_command(&client, &creds, &selection, &id)
+            }
+        },
+        Commands::Craft {
+            lane,
+            command: CraftCommand::Session { command },
+        } => craft_session_command(&client, &creds, &selection, lane, &command),
         Commands::Agent {
             prompt,
             workdir,
@@ -785,6 +998,10 @@ fn main() {
             unreachable!("legacy alias not rewritten")
         }
     };
+
+    if result.is_ok() {
+        update_notice::finish(notice, notice_name, &home, update_notice::DEFAULT_GRACE);
+    }
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
