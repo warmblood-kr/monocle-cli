@@ -127,6 +127,7 @@ fn chat_content_binary_e2e() {
 
     let ok = run(home.path(), &["chat", "content", "c1"]);
     assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
+    assert!(stderr(&ok).contains("Thread: c1"), "{}", stderr(&ok));
     assert_eq!(String::from_utf8_lossy(&ok.stdout), EXPECTED_TEXT);
 
     let missing = run(home.path(), &["chat", "content", "missing"]);

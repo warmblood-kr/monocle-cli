@@ -634,6 +634,10 @@ pub fn chat_content_command(
         selection.environment,
         creds.read().map(|c| c.tenant_domain).unwrap_or_default()
     );
+    // Only a well-formed id is echoed (invalid ones are rejected without being printed).
+    if crate::jarvice_chats::is_valid_chat_id(id) {
+        eprintln!("Thread: {id}");
+    }
     let output =
         crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format, show_tools)?;
     print!("{output}");
@@ -652,6 +656,19 @@ pub fn chat_content_command(
 /// field at all. Shared by both `run_responses_chat` and `run_completions_chat`
 /// so plain `monocle chat` gets the same non-silent behavior, not just
 /// `--responses` mode (monocle-cli#101 code review).
+/// jarvice creates a new thread inside the same request and reports its id only
+/// in the response, so after a timeout the id is unknown — say where to look
+/// instead of leaving it a mystery.
+fn with_new_thread_hint(e: crate::error::AppError, new_thread: bool) -> crate::error::AppError {
+    if new_thread && e.to_string().contains("timed out") {
+        crate::error::AppError::new(format!(
+            "{e} A new thread may exist on the server; find it with `monocle chat list`."
+        ))
+    } else {
+        e
+    }
+}
+
 /// The `--show-tools` stderr line for one turn. "none" and "unknown" differ:
 /// an older jarvice that never reports `tools_used` proves nothing either way.
 fn tools_line(tools_used: &[String], unparsed: usize, present: bool) -> String {
@@ -899,14 +916,21 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
-        let reply = rc.respond(
-            &model,
-            &text,
-            &images,
-            &files,
-            options.resume.as_deref(),
-            &options.tool_ids,
-        )?;
+        // A resumed thread's id is known up front — print it before the (possibly
+        // long) request so it is on screen even if the request later times out.
+        if let Some(id) = &options.resume {
+            eprintln!("Thread: {id}");
+        }
+        let reply = rc
+            .respond(
+                &model,
+                &text,
+                &images,
+                &files,
+                options.resume.as_deref(),
+                &options.tool_ids,
+            )
+            .map_err(|e| with_new_thread_hint(e, options.resume.is_none()))?;
         let dropped_msg = dropped_tool_calls_message(
             &reply.tool_calls,
             reply.unparsed_tool_calls,
@@ -918,7 +942,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         // stdout stays the answer channel, stderr the verdict channel.
         println!("{}", reply.content);
         if let Some(id) = reply.thread_id {
-            eprintln!("Thread: {id}");
+            if options.resume.as_deref() != Some(id.as_str()) {
+                eprintln!("Thread: {id}");
+            }
         }
         if options.show_tools {
             eprintln!(
@@ -1181,7 +1207,7 @@ mod tests {
     use super::{
         chat_help_text, dispatch_chat_command, dropped_tool_calls_message, handle_help_command,
         resolve_max_tokens, resolve_repl_attachments, tool_firing_verification,
-        ToolFiringExpectation, ToolFiringVerdict, TurnDiagnostics,
+        with_new_thread_hint, ToolFiringExpectation, ToolFiringVerdict, TurnDiagnostics,
     };
     use crate::agent::providers::{FunctionCall, ToolCall};
     use crate::commands::repl::LoopControl;
@@ -1622,5 +1648,24 @@ mod tests {
         assert!(images.is_empty());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].filename, "notes.heic");
+    }
+
+    #[test]
+    fn timeout_on_a_new_thread_points_at_chat_list() {
+        use crate::error::AppError;
+        let timeout = || {
+            AppError::new("Request timed out after 120s. The server may still be processing it; it was not re-sent.")
+        };
+        assert!(with_new_thread_hint(timeout(), true)
+            .to_string()
+            .contains("monocle chat list"));
+        // a resumed thread's id is already known; other errors are left alone
+        assert!(!with_new_thread_hint(timeout(), false)
+            .to_string()
+            .contains("chat list"));
+        assert_eq!(
+            with_new_thread_hint(AppError::new("HTTP 500"), true).to_string(),
+            "HTTP 500"
+        );
     }
 }

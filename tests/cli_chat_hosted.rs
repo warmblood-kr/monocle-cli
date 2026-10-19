@@ -228,3 +228,18 @@ fn show_tools_distinguishes_none_from_unknown() {
     let home = logged_in_home(&unknown);
     assert!(stderr(&run_piped(home.path(), &["chat", "--show-tools"])).contains("Tools: unknown"));
 }
+
+#[test]
+fn resume_prints_the_thread_id_once_up_front() {
+    let (stub, _hits) = counting_stub();
+    let home = logged_in_home(&stub);
+    // Same id as the stub's `x-thread-id`: announced before the request, not repeated after.
+    let o = run_piped(home.path(), &["chat", "--resume", "thread-1b"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stderr(&o).matches("Thread: thread-1b").count(),
+        1,
+        "{}",
+        stderr(&o)
+    );
+}
