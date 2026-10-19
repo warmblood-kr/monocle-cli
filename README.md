@@ -67,6 +67,11 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle knowledge content <collection> <file>` | Print the text the server extracted from the file (to check parsing before testing search) |
 | `monocle knowledge ask <collection> <question> [--model M] [--json]` | Ask one question with the collection attached (one model turn, not saved to your threads). Answer on stdout; the files it was grounded in on stderr (or `{"answer","sources"}` with `--json`). jarvice has no retrieval endpoint, so this is the only way to see whether stored content is used |
 | `monocle knowledge delete <collection>` | Delete a collection **and its files** (kept if any file can't be deleted, so you can retry) |
+| `monocle workspace-model list` | List workspace (custom) models: id, name, base model, active |
+| `monocle workspace-model show <id>` | Print one model as JSON |
+| `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment) |
+| `monocle workspace-model update <id> [same flags]` | Change only the given fields (`--tool`/`--knowledge` replace the lists) |
+| `monocle workspace-model toggle <id>` / `delete <id>` | Flip active/inactive; delete |
 | `monocle router models` | List available models from the router (with modality) |
 | `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat via the router's plain `/v1/chat/completions` (REPL or stdin); no Responses-API options |
 | `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
@@ -290,6 +295,18 @@ monocle knowledge upload my-fixtures ./docs a.pdf    # dirs and/or files; pdf, d
 monocle knowledge list                               # id, name, file count
 monocle knowledge list my-fixtures                   # the collection's files
 monocle knowledge delete my-fixtures                 # collection and its files
+```
+
+### 🧩 Workspace (custom) models
+
+Create, use and clean up the same models as the web UI's Workspace > Models page (needs the `workspace.models` permission; without it jarvice answers 401 and the CLI says so). Named `workspace-model` because `monocle models`/`monocle model` are deprecated aliases of `monocle router ...` (base models):
+
+```bash
+monocle router models                                   # pick a base model id
+monocle workspace-model create e2e-1 --base <base> --system "Answer in one line." \
+  --tool mcp:myserver --knowledge my-fixtures
+monocle chat --model e2e-1 "hello"
+monocle workspace-model delete e2e-1
 ```
 
 `<collection>` is an exact name or id; a name shared by several collections is an error that lists their ids. Uploads index each file on the server before the next one starts, so large PDFs take a while. Data goes to stdout and progress to stderr, so output pipes cleanly. Commands act on the selected `--profile`/`--env` tenant.
