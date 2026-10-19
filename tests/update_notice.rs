@@ -8,8 +8,8 @@ use std::sync::Arc;
 use monocle_cli::credentials::{Credentials, CredentialsData};
 use monocle_cli::net::Client;
 use monocle_cli::update_notice::{
-    check, command_eligible, enabled_for, finish_with, is_stale, notice_message, start_with,
-    suppressed, Env,
+    check, command_eligible, enabled_for, finish_with, is_stale, notice_message, read_cache,
+    start_with, suppressed, write_cache, Cache, Env,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -246,4 +246,74 @@ fn slow_server_does_not_delay_beyond_grace_and_still_backs_off() {
     );
     // Backoff was written before the fetch, so the next run will not retry.
     assert!(home.path().join(".monocle/update-check.json").exists());
+}
+
+fn cache_file(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".monocle/update-check.json")
+}
+
+#[test]
+fn corrupt_cache_is_stale_one_hit_and_rewritten_valid() {
+    let cases: [&[u8]; 3] = [
+        b"\xff\x00garbage{{",
+        b"",
+        br#"{"last_checked":"yesterday","latest_version":5}"#,
+    ];
+    for bytes in cases {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stub = release_stub("v2.5.0", hits.clone());
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".monocle")).unwrap();
+        std::fs::write(cache_file(home.path()), bytes).unwrap();
+        assert!(read_cache(home.path()).is_none());
+        let msg = check(&Client::new(), home.path(), &url(&stub), 9000, "1.0.0");
+        assert!(msg.unwrap().contains("2.5.0"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let c = read_cache(home.path()).unwrap();
+        assert_eq!(c.latest_version.as_deref(), Some("2.5.0"));
+    }
+}
+
+#[test]
+fn write_is_atomic_replaces_and_leaves_no_temp_files() {
+    let home = tempfile::tempdir().unwrap();
+    seed(home.path(), 1, "1.0.0");
+    let c = Cache {
+        last_checked: 42,
+        latest_version: Some("3.0.0".into()),
+    };
+    write_cache(home.path(), &c);
+    assert_eq!(read_cache(home.path()), Some(c));
+    let names: Vec<_> = std::fs::read_dir(home.path().join(".monocle"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["update-check.json"]);
+}
+
+#[test]
+fn concurrent_writers_leave_a_parseable_cache() {
+    let home = tempfile::tempdir().unwrap();
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let h = home.path();
+            s.spawn(move || {
+                for i in 0..50 {
+                    let c = Cache {
+                        last_checked: t * 1000 + i,
+                        latest_version: Some("9.9.9".into()),
+                    };
+                    write_cache(h, &c);
+                    if let Some(r) = read_cache(h) {
+                        assert_eq!(r.latest_version.as_deref(), Some("9.9.9"));
+                    }
+                }
+            });
+        }
+    });
+    assert!(read_cache(home.path()).is_some());
+    let n = std::fs::read_dir(home.path().join(".monocle"))
+        .unwrap()
+        .count();
+    assert_eq!(n, 1);
 }

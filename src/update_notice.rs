@@ -73,17 +73,27 @@ fn cache_path(home: &Path) -> PathBuf {
     home.join(".monocle").join("update-check.json")
 }
 
-fn read_cache(home: &Path) -> Option<Cache> {
+/// Any unreadable/corrupt/partial cache (bad JSON, wrong types, empty file)
+/// is `None`, i.e. stale: never an error or panic.
+pub fn read_cache(home: &Path) -> Option<Cache> {
     serde_json::from_slice(&std::fs::read(cache_path(home)).ok()?).ok()
 }
 
-fn write_cache(home: &Path, cache: &Cache) {
+/// Atomic write: temp file in the same dir (unique per pid+counter), then
+/// `rename`. No lock file: racing processes may occasionally run a duplicate
+/// check, which is acceptable; the cache is never torn.
+pub fn write_cache(home: &Path, cache: &Cache) {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = cache_path(home);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_vec(cache) {
-        let _ = std::fs::write(path, json);
+    let Some(dir) = path.parent() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(json) = serde_json::to_vec(cache) else {
+        return;
+    };
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".update-check.{}.{seq}.tmp", std::process::id()));
+    if std::fs::write(&tmp, json).is_err() || std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
