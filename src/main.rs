@@ -13,6 +13,7 @@ use monocle_cli::commands::chat::{
     chat_command, chat_content_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
+use monocle_cli::commands::craft::{craft_session_command, Lane, SessionCommand};
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::knowledge::{
@@ -65,6 +66,7 @@ Commands:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
+    craft    Inspect and delete Craft sessions (list, show, history, files, download, delete)
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -152,6 +154,14 @@ enum Commands {
     WorkspaceModel {
         #[command(subcommand)]
         command: WorkspaceModelCommand,
+    },
+    /// Inspect and delete Craft sessions (list, show, history, files, download, delete)
+    Craft {
+        /// Craft backend: the Craft server (openworker) or jarvice agent sessions (sdk)
+        #[arg(long, value_enum, default_value = "openworker")]
+        lane: Lane,
+        #[command(subcommand)]
+        command: CraftCommand,
     },
     /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
     Agent {
@@ -392,6 +402,15 @@ enum ChatCommand {
         /// add a structured `tool_calls` list per message
         #[arg(long = "show-tools")]
         show_tools: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CraftCommand {
+    /// Manage sessions
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
     },
 }
 
@@ -932,6 +951,10 @@ fn main() {
                 wm::delete_command(&client, &creds, &selection, &id)
             }
         },
+        Commands::Craft {
+            lane,
+            command: CraftCommand::Session { command },
+        } => craft_session_command(&client, &creds, &selection, lane, &command),
         Commands::Agent {
             prompt,
             workdir,

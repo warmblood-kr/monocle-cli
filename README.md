@@ -72,6 +72,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment) |
 | `monocle workspace-model update <id> [same flags]` | Change only the given fields (`--tool`/`--knowledge` replace the lists) |
 | `monocle workspace-model toggle <id>` / `delete <id>` | Flip active/inactive; delete |
+| `monocle craft [--lane openworker\|sdk] session list\|show <id>\|history <id>\|files <id>\|download <id> <path>\|delete <id>` | Inspect and delete Craft sessions; see [Craft sessions](#-craft-sessions) |
 | `monocle router models` | List available models from the router (with modality) |
 | `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat via the router's plain `/v1/chat/completions` (REPL or stdin); no Responses-API options |
 | `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
@@ -310,6 +311,25 @@ monocle workspace-model delete e2e-1
 ```
 
 `<collection>` is an exact name or id; a name shared by several collections is an error that lists their ids. Uploads index each file on the server before the next one starts, so large PDFs take a while. Data goes to stdout and progress to stderr, so output pipes cleanly. Commands act on the selected `--profile`/`--env` tenant.
+
+### 🗂️ Craft sessions
+
+Inspect and clean up Craft sessions from the terminal, on either backend (`--lane`, default `openworker`):
+
+```bash
+monocle craft session list [--workspace PATH]       # id, messages, updated, title
+monocle craft session show <id>
+monocle craft session history <id> [--all]          # openworker: `role<TAB>text` per message (--all adds system)
+monocle craft session files <id>                    # sdk: [--folder uploads|outputs]
+monocle craft session download <id> <path> [-o FILE]  # bytes to stdout, or to FILE
+monocle craft session delete <id>
+monocle --env stg craft --lane sdk session list     # jarvice agent sessions
+```
+
+- `openworker` talks to the Craft server with your monocle access token. Its URL is `MONOCLE_CRAFT_URL` if set, else `https://craft-stg.monocle-ai.com` for `--env stg` and `https://craft.monocle-ai.com` for `--env prod`; for `local` set `MONOCLE_CRAFT_URL`. An override is refused if it names the other environment's Craft host (your token is never sent across environments) or any host other than loopback. `--workspace` filters `list` (this lane only).
+- `sdk` uses your tenant's jarvice agent sessions (`--folder` on `files` applies here only).
+- `list`, `show`, `history`, `files` and `delete` take `--json` for the raw server data on stdout. Data goes to stdout; the profile banner and confirmations go to stderr.
+- Server error bodies are never printed: you see the HTTP status and, when the server sends one, a short error code. On the openworker lane `files` reports "session files unavailable" if the session is parked or its sandbox is gone.
 
 ### 🧵 Hosted Chat: server-managed threads
 
