@@ -622,3 +622,84 @@ fn content_prints_extracted_text_to_stdout() {
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert_eq!(out(&o), "extracted b.txt");
 }
+
+/// Stub for `ask`: one collection `kb1` ("kb-a"); `/api/chat/completions` answers
+/// with SSE — a `sources` event first (unless the question says "ungrounded"),
+/// then content deltas. Records the chat request body.
+fn ask_stub(seen: &Arc<Mutex<Vec<serde_json::Value>>>) -> common::Stub {
+    let seen = seen.clone();
+    common::stub_with_headers(move |_, method, url, body| match (method, url) {
+        ("GET", "/api/v1/knowledge/") => (
+            200,
+            r#"[{"id":"kb1","name":"kb-a","files":[]}]"#.into(),
+            vec![],
+        ),
+        ("POST", "/api/chat/completions") => {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let grounded = !v["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("ungrounded");
+            seen.lock().unwrap().push(v);
+            let sources = if grounded {
+                "data: {\"sources\":[{\"source\":{\"type\":\"collection\",\"name\":\"kb-a\"},\"document\":[\"x\",\"y\",\"z\",\"q\"],\"metadata\":[{\"name\":\"a.md\"},{\"name\":\"a.md\"},{\"source\":\"b.txt\"},{\"name\":\"\"}]}]}\n\n"
+            } else {
+                ""
+            };
+            let sse = format!(
+                "{sources}data: {{\"choices\":[{{\"delta\":{{\"content\":\"The \"}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{\"content\":\"answer\"}}}}]}}\n\ndata: [DONE]\n\n"
+            );
+            (
+                200,
+                sse,
+                vec![("Content-Type", "text/event-stream".to_string())],
+            )
+        }
+        _ => (404, "{}".into(), vec![]),
+    })
+}
+
+#[test]
+fn ask_attaches_the_collection_and_reports_answer_and_sources() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = ask_stub(&seen);
+    let home = logged_in_home(&stub);
+    let o = run(home.path(), &["knowledge", "ask", "kb-a", "what is x?"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o), "The answer\n");
+    assert!(err(&o).contains("a.md (2 passage(s))"), "{}", err(&o));
+    let body = seen.lock().unwrap()[0].clone();
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["files"][0]["type"], "collection");
+    assert_eq!(body["files"][0]["id"], "kb1");
+    assert!(body.get("chat_id").is_none(), "must stay headless");
+}
+
+#[test]
+fn ask_json_and_ungrounded_answers() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = ask_stub(&seen);
+    let home = logged_in_home(&stub);
+    let o = run(home.path(), &["knowledge", "ask", "kb-a", "q", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["answer"], "The answer");
+    assert_eq!(v["sources"][0]["name"], "a.md");
+    assert_eq!(v["sources"][1]["name"], "b.txt");
+    assert!(
+        v["sources"].as_array().unwrap().len() == 2,
+        "collection name is not a file"
+    );
+    let o = run(home.path(), &["knowledge", "ask", "kb-a", "ungrounded?"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("Sources: none"), "{}", err(&o));
+}
+
+#[test]
+fn ask_unknown_collection_sends_no_chat_turn() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = ask_stub(&seen);
+    let home = logged_in_home(&stub);
+    let o = run(home.path(), &["knowledge", "ask", "nope", "q"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(seen.lock().unwrap().is_empty());
+}

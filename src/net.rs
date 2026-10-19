@@ -267,11 +267,37 @@ impl Client {
         headers: &[(&str, &str)],
         body: &Value,
     ) -> Result<EventStream> {
+        self.stream_inner(url, headers, body, true)
+    }
+
+    /// [`post_json_stream`](Self::post_json_stream) with exactly one attempt: a
+    /// chat turn costs tokens, so a lost response must not be replayed.
+    pub fn post_json_stream_once(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<EventStream> {
+        self.stream_inner(url, headers, body, false)
+    }
+
+    fn stream_inner(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        retry: bool,
+    ) -> Result<EventStream> {
         let mut req = self.inner.post(url).json(body);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let resp = send_with_retry("POST", url, req).map_err(|e| AppError(e.to_string()))?;
+        let sent = if retry {
+            send_with_retry("POST", url, req)
+        } else {
+            req.send()
+        };
+        let resp = sent.map_err(|e| AppError(e.to_string()))?;
         let status = resp.status().as_u16();
         let content_type = resp
             .headers()
