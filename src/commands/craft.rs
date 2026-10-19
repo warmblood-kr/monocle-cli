@@ -1,0 +1,335 @@
+//! `monocle craft session list|show|history|files|download|delete` — inspect and
+//! clean up Craft sessions on either lane: `openworker` (the Craft server) or
+//! `sdk` (jarvice agent sessions). Data goes to stdout; the profile banner and
+//! confirmations go to stderr, so output pipes cleanly.
+
+use std::io::Write;
+
+use clap::{Subcommand, ValueEnum};
+use serde_json::Value;
+
+use crate::auth::get_access_token;
+use crate::commands::chat::resolve_jarvice;
+use crate::commands::knowledge::print_table;
+use crate::craft_server as craft;
+use crate::credentials::Credentials;
+use crate::error::{AppError, Result};
+use crate::jarvice_agent as sdk;
+use crate::net::Client;
+use crate::profiles::Selection;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Lane {
+    Openworker,
+    Sdk,
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// List sessions (id, status/updated, title)
+    List {
+        /// Only sessions in this workspace path (openworker lane only)
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Print the raw sessions as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one session's details
+    Show {
+        id: String,
+        /// Print the raw session as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a session's history (`--json` for the whole server response)
+    History {
+        id: String,
+        /// Include system messages (openworker lane)
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a session's files
+    Files {
+        id: String,
+        /// Folder to list (sdk lane; the server default applies if omitted)
+        #[arg(long, value_parser = ["uploads", "outputs"])]
+        folder: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download one session file to stdout, or to a file with `-o`
+    Download {
+        id: String,
+        /// File path as listed by `files`
+        path: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Delete a session
+    Delete {
+        id: String,
+        /// Print the server's response as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Lane endpoint + bearer, with the same stderr profile banner `knowledge` prints.
+fn connect(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    lane: Lane,
+) -> Result<(String, String)> {
+    let (url, bearer) = match lane {
+        Lane::Sdk => {
+            let (_, url, bearer) = resolve_jarvice(client, creds)?;
+            (url, bearer)
+        }
+        Lane::Openworker => {
+            let url = craft::base_url(&selection.environment)?;
+            (
+                url,
+                format!("Bearer {}", get_access_token(client, creds).token),
+            )
+        }
+    };
+    eprintln!(
+        "Profile: {} ({}) — tenant {}",
+        selection.profile,
+        selection.environment,
+        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+    );
+    Ok((url, bearer))
+}
+
+fn s<'a>(v: &'a Value, key: &str) -> &'a str {
+    v[key].as_str().unwrap_or("")
+}
+
+/// Scalar as plain text, anything else as compact JSON.
+fn text(v: &Value) -> String {
+    match v {
+        Value::String(t) => t.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn one_line(t: &str) -> String {
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn print_json(v: &impl serde::Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+fn unix_time(v: &Value) -> String {
+    v.as_i64()
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| text(v))
+}
+
+pub fn craft_session_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    lane: Lane,
+    command: &SessionCommand,
+) -> Result<()> {
+    // Reject lane-specific flags before touching the network.
+    match command {
+        SessionCommand::List {
+            workspace: Some(_), ..
+        } if lane == Lane::Sdk => {
+            return Err(AppError::new(
+                "--workspace is only supported on the openworker lane.",
+            ))
+        }
+        SessionCommand::Files {
+            folder: Some(_), ..
+        } if lane == Lane::Openworker => {
+            return Err(AppError::new("--folder is only supported on the sdk lane."))
+        }
+        _ => {}
+    }
+    let (url, bearer) = connect(client, creds, selection, lane)?;
+    let (c, u, b) = (client, url.as_str(), bearer.as_str());
+    let sdk_lane = lane == Lane::Sdk;
+    match command {
+        SessionCommand::List { workspace, json } => {
+            let all = if sdk_lane {
+                sdk::list_sessions(c, u, b)?
+            } else {
+                craft::list_sessions(c, u, b, workspace.as_deref())?
+            };
+            if *json {
+                return print_json(&all);
+            }
+            if all.is_empty() {
+                eprintln!("No sessions found.");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = all
+                .iter()
+                .map(|x| {
+                    if sdk_lane {
+                        vec![
+                            s(x, "id").into(),
+                            s(x, "status").into(),
+                            unix_time(&x["updated_at"]),
+                            one_line(s(x, "title")),
+                        ]
+                    } else {
+                        vec![
+                            s(x, "session_id").into(),
+                            text(&x["messages"]),
+                            s(x, "updated_at").into(),
+                            one_line(s(x, "title")),
+                        ]
+                    }
+                })
+                .collect();
+            let headers = if sdk_lane {
+                ["SESSION ID", "STATUS", "UPDATED", "TITLE"]
+            } else {
+                ["SESSION ID", "MSGS", "UPDATED", "TITLE"]
+            };
+            print_table(&headers, &rows);
+        }
+        SessionCommand::Show { id, json } => {
+            let one = if sdk_lane {
+                sdk::get_session(c, u, b, id)?
+            } else {
+                craft::get_session(c, u, b, id)?
+            };
+            if *json {
+                return print_json(&one);
+            }
+            for (k, v) in one.as_object().into_iter().flatten() {
+                let v = if k.ends_with("_at") && sdk_lane {
+                    unix_time(v)
+                } else {
+                    text(v)
+                };
+                println!("{k}: {v}");
+            }
+        }
+        SessionCommand::History { id, all, json } => {
+            let h = if sdk_lane {
+                sdk::history(c, u, b, id)?
+            } else {
+                craft::history(c, u, b, id)?
+            };
+            if *json {
+                return print_json(&h);
+            }
+            let lines: Vec<String> = if sdk_lane {
+                h["entries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.to_string())
+                    .collect()
+            } else {
+                h["messages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|m| *all || s(m, "role") != "system")
+                    .map(|m| {
+                        let body = if m["content"].is_null() {
+                            &m["text"]
+                        } else {
+                            &m["content"]
+                        };
+                        format!("{}\t{}", s(m, "role"), one_line(&text(body)))
+                    })
+                    .collect()
+            };
+            if lines.is_empty() {
+                eprintln!("No history.");
+            }
+            lines.iter().for_each(|l| println!("{l}"));
+        }
+        SessionCommand::Files { id, folder, json } => {
+            let f = if sdk_lane {
+                sdk::files(c, u, b, id, folder.as_deref())?
+            } else {
+                craft::files(c, u, b, id)?
+            };
+            if *json {
+                return print_json(&f);
+            }
+            let list = f["files"].as_array().or(f["artifacts"].as_array());
+            let list = list.map(Vec::as_slice).unwrap_or_default();
+            if list.is_empty() {
+                eprintln!("No files.");
+            }
+            if sdk_lane {
+                let rows: Vec<Vec<String>> = list
+                    .iter()
+                    .map(|x| {
+                        let dir = x["is_directory"].as_bool().unwrap_or(false);
+                        vec![
+                            text(&x["size"]),
+                            s(x, "modified").into(),
+                            format!("{}{}", s(x, "name"), if dir { "/" } else { "" }),
+                        ]
+                    })
+                    .collect();
+                if !rows.is_empty() {
+                    print_table(&["SIZE", "MODIFIED", "NAME"], &rows);
+                }
+            } else {
+                for x in list {
+                    // Artifact shape is not pinned down: known fields, else the raw JSON.
+                    let known: Vec<String> = ["name", "path", "size"]
+                        .iter()
+                        .filter(|k| !x[**k].is_null())
+                        .map(|k| text(&x[*k]))
+                        .collect();
+                    println!(
+                        "{}",
+                        if known.is_empty() {
+                            x.to_string()
+                        } else {
+                            known.join("\t")
+                        }
+                    );
+                }
+            }
+        }
+        SessionCommand::Download { id, path, output } => {
+            let bytes = if sdk_lane {
+                sdk::download(c, u, b, id, path)?
+            } else {
+                craft::download(c, u, b, id, path)?
+            };
+            match output {
+                Some(file) => {
+                    std::fs::write(file, &bytes)?;
+                    eprintln!("Saved {} byte(s) to {file}.", bytes.len());
+                }
+                None => std::io::stdout().write_all(&bytes)?,
+            }
+        }
+        SessionCommand::Delete { id, json } => {
+            let r = if sdk_lane {
+                sdk::delete(c, u, b, id)?
+            } else {
+                craft::delete(c, u, b, id)?
+            };
+            if *json {
+                print_json(&r)?;
+            }
+            eprintln!("Deleted session {id}.");
+        }
+    }
+    Ok(())
+}

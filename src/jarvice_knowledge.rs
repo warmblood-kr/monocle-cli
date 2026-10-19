@@ -74,7 +74,7 @@ impl Knowledge {
 /// Render a failed response without echoing its body: jarvice's file/knowledge
 /// errors carry a stable `detail.code` envelope, which is safe and useful; any
 /// other body (stack text, proxy HTML) is not.
-fn api_error(what: &str, resp: &Resp) -> AppError {
+pub(crate) fn api_error(what: &str, resp: &Resp) -> AppError {
     let code = resp
         .json::<Value>()
         .ok()
