@@ -24,6 +24,8 @@ struct State {
     descs: std::collections::HashMap<String, String>,
     /// last `/update` body
     last_update: Option<serde_json::Value>,
+    /// make `/file/remove` fail with a 500
+    fail_remove: bool,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -123,6 +125,9 @@ fn jarvice(state: &Shared) -> common::Stub {
                 (200, "{}".into())
             }
             ("POST", u) if u.starts_with("/api/v1/knowledge/") && u.ends_with("/file/remove") => {
+                if s.fail_remove {
+                    return (500, "boom".into());
+                }
                 let kid = u.split('/').nth(4).unwrap().to_string();
                 let v: serde_json::Value = serde_json::from_str(body).unwrap();
                 let fid = v["file_id"].as_str().unwrap().to_string();
@@ -642,7 +647,7 @@ fn ask_stub(seen: &Arc<Mutex<Vec<serde_json::Value>>>) -> common::Stub {
                 .contains("ungrounded");
             seen.lock().unwrap().push(v);
             let sources = if grounded {
-                "data: {\"sources\":[{\"source\":{\"type\":\"collection\",\"name\":\"kb-a\"},\"document\":[\"x\",\"y\",\"z\",\"q\"],\"metadata\":[{\"name\":\"a.md\"},{\"name\":\"a.md\"},{\"source\":\"b.txt\"},{\"name\":\"\"}]}]}\n\n"
+                "data: {\"sources\":[{\"source\":{\"type\":\"collection\",\"name\":\"kb-a\"},\"document\":[\"x\",\"y\",\"z\",\"q\"],\"metadata\":[{\"name\":\"a.md\"},{\"name\":\"a.md\"},{\"source\":\"b.txt\"},{\"name\":\"\"}]},{\"source\":{\"type\":\"web\",\"name\":\"https://x\"},\"metadata\":[{\"name\":\"not-a-file\"}]}]}\n\n"
             } else {
                 ""
             };
@@ -702,4 +707,23 @@ fn ask_unknown_collection_sends_no_chat_turn() {
     let o = run(home.path(), &["knowledge", "ask", "nope", "q"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn replace_says_both_versions_are_attached_when_old_removal_fails() {
+    let (state, home, docs) = seeded();
+    state.lock().unwrap().fail_remove = true;
+    let old = state.lock().unwrap().kbs[0].2[0].0.clone();
+    let p = docs.path().join("a.md");
+    let o = run(
+        home.path(),
+        &["knowledge", "replace", "kb-a", p.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let e = err(&o);
+    assert!(
+        e.contains("both versions") && e.contains(&format!("knowledge remove kb-a {old}")),
+        "{e}"
+    );
+    assert_eq!(state.lock().unwrap().kbs[0].2.len(), 3);
 }

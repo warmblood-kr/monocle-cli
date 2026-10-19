@@ -489,6 +489,10 @@ fn absorb(v: &Value, out: &mut Answer) {
     // For a collection, `source` is the collection itself; the cited files are the
     // per-passage `metadata` entries (verified on stg).
     for s in v["sources"].as_array().into_iter().flatten() {
+        // Other source kinds (e.g. URL citations) are not files of the collection.
+        if s["source"]["type"] != "collection" {
+            continue;
+        }
         for m in s["metadata"].as_array().into_iter().flatten() {
             let name = m["name"].as_str().or(m["source"].as_str()).unwrap_or("");
             if name.is_empty() {
@@ -564,5 +568,61 @@ pub fn ask(
         absorb(&v, &mut out);
         return Ok(out);
     }
-    parse_answer(|| stream.next_line())
+    // A blocking read cannot time out on its own, so a reader thread feeds lines
+    // through a channel and silence longer than STREAM_IDLE becomes an error.
+    // ponytail: the reader thread is left blocked on timeout; the CLI exits right after.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || while tx.send(stream.next_line()).is_ok() {});
+    parse_with_idle(&rx, STREAM_IDLE)
+}
+
+/// Longest silence tolerated mid-answer.
+const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn parse_with_idle(
+    rx: &std::sync::mpsc::Receiver<Result<Option<String>>>,
+    idle: std::time::Duration,
+) -> Result<Answer> {
+    parse_answer(|| {
+        match rx.recv_timeout(idle) {
+        Ok(line) => line,
+        Err(_) => Err(AppError::new(format!(
+            "The server went silent for {}s; giving up (the question may still have been processed).",
+            idle.as_secs_f32().round()
+        ))),
+    }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn silent_stream_times_out_instead_of_hanging() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(Some(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}".into(),
+        )))
+        .unwrap();
+        // tx stays alive and silent
+        let err = parse_with_idle(&rx, Duration::from_millis(50)).unwrap_err();
+        assert!(err.to_string().contains("went silent"), "{err}");
+        drop(tx);
+    }
+
+    #[test]
+    fn stream_that_ends_is_parsed() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(Some(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}".into(),
+        )))
+        .unwrap();
+        tx.send(Ok(None)).unwrap();
+        assert_eq!(
+            parse_with_idle(&rx, Duration::from_secs(5)).unwrap().answer,
+            "hi"
+        );
+    }
 }
