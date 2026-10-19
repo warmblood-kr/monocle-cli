@@ -20,19 +20,24 @@ struct State {
     /// every uploaded file: (id, name)
     files: Vec<(String, String)>,
     log: Vec<String>,
+    /// kb id -> description (set by `/update`)
+    descs: std::collections::HashMap<String, String>,
+    /// last `/update` body
+    last_update: Option<serde_json::Value>,
 }
 
 type Shared = Arc<Mutex<State>>;
 
-fn kb_json(kb: &Kb) -> String {
+fn kb_json(kb: &Kb, desc: &str) -> String {
     let files: Vec<String> =
         kb.2.iter()
             .map(|(id, n)| format!(r#"{{"id":"{id}","meta":{{"name":"{n}"}}}}"#))
             .collect();
     format!(
-        r#"{{"id":"{}","name":"{}","description":"","files":[{}]}}"#,
+        r#"{{"id":"{}","name":"{}","description":"{}","access_control":{{"read":{{"user_ids":["u1"]}}}},"data":{{"file_ids":[]}},"files":[{}]}}"#,
         kb.0,
         kb.1,
+        desc,
         files.join(",")
     )
 }
@@ -47,7 +52,11 @@ fn jarvice(state: &Shared) -> common::Stub {
         s.log.push(format!("{method} {url}"));
         match (method, url) {
             ("GET", "/api/v1/knowledge/") | ("GET", "/api/v1/knowledge/list") => {
-                let all: Vec<String> = s.kbs.iter().map(kb_json).collect();
+                let all: Vec<String> = s
+                    .kbs
+                    .iter()
+                    .map(|k| kb_json(k, s.descs.get(&k.0).map_or("", |d| d.as_str())))
+                    .collect();
                 (200, format!("[{}]", all.join(",")))
             }
             ("POST", "/api/v1/knowledge/create") => {
@@ -98,6 +107,50 @@ fn jarvice(state: &Shared) -> common::Stub {
                     .2
                     .push((fid, fname));
                 (200, "{}".into())
+            }
+            ("POST", u)
+                if u.starts_with("/api/v1/knowledge/")
+                    && u.ends_with("/update")
+                    && !u.ends_with("/file/update") =>
+            {
+                let kid = u.split('/').nth(4).unwrap().to_string();
+                let v: serde_json::Value = serde_json::from_str(body).unwrap();
+                let k = s.kbs.iter_mut().find(|k| k.0 == kid).unwrap();
+                k.1 = v["name"].as_str().unwrap().to_string();
+                s.descs
+                    .insert(kid, v["description"].as_str().unwrap().to_string());
+                s.last_update = Some(v);
+                (200, "{}".into())
+            }
+            ("POST", u) if u.starts_with("/api/v1/knowledge/") && u.ends_with("/file/remove") => {
+                let kid = u.split('/').nth(4).unwrap().to_string();
+                let v: serde_json::Value = serde_json::from_str(body).unwrap();
+                let fid = v["file_id"].as_str().unwrap().to_string();
+                s.kbs
+                    .iter_mut()
+                    .find(|k| k.0 == kid)
+                    .unwrap()
+                    .2
+                    .retain(|f| f.0 != fid);
+                s.files.retain(|f| f.0 != fid);
+                (200, "{}".into())
+            }
+            ("POST", u) if u.starts_with("/api/v1/knowledge/") && u.ends_with("/file/update") => {
+                (200, "{}".into())
+            }
+            ("POST", u) if u.starts_with("/api/v1/files/") && u.contains("/reprocess") => {
+                if u.ends_with("force=true") {
+                    (200, "{}".into())
+                } else {
+                    (409, r#"{"detail":"already processed"}"#.into())
+                }
+            }
+            ("GET", u) if u.starts_with("/api/v1/files/") && u.ends_with("/data/content") => {
+                let fid = u.split('/').nth(4).unwrap();
+                match s.files.iter().find(|f| f.0 == fid) {
+                    Some(f) => (200, format!(r#"{{"content":"extracted {}"}}"#, f.1)),
+                    None => (404, "{}".into()),
+                }
             }
             ("DELETE", u) if u.starts_with("/api/v1/files/") => {
                 let fid = u.rsplit('/').next().unwrap().to_string();
@@ -451,4 +504,121 @@ fn shared_post_still_retries_once() {
     let body = serde_json::json!({});
     assert!(Client::new().post_json(&url, &[], &body).is_err());
     assert_eq!(accepts.load(Ordering::SeqCst), 2);
+}
+
+fn seeded() -> (Shared, tempfile::TempDir, tempfile::TempDir) {
+    let (state, home, docs) = setup();
+    write(docs.path(), "a.md");
+    write(docs.path(), "b.txt");
+    run(home.path(), &["knowledge", "create", "kb-a"]);
+    let d = docs.path().to_str().unwrap();
+    run(home.path(), &["knowledge", "upload", "kb-a", d]);
+    (state, home, docs)
+}
+
+#[test]
+fn update_renames_and_keeps_access_control() {
+    let (state, home, _docs) = seeded();
+    let o = run(
+        home.path(),
+        &[
+            "knowledge",
+            "update",
+            "kb-a",
+            "--name",
+            "kb-b",
+            "--description",
+            "d",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let s = state.lock().unwrap();
+    let u = s.last_update.as_ref().expect("update was called");
+    assert_eq!(u["name"], "kb-b");
+    assert_eq!(u["description"], "d");
+    assert_eq!(u["access_control"]["read"]["user_ids"][0], "u1");
+    drop(s);
+    assert!(out(&run(home.path(), &["knowledge", "list"])).contains("kb-b"));
+}
+
+#[test]
+fn update_needs_a_change_and_a_free_name() {
+    let (state, home, _docs) = seeded();
+    run(home.path(), &["knowledge", "create", "kb-c"]);
+    let none = run(home.path(), &["knowledge", "update", "kb-a"]);
+    assert_eq!(none.status.code(), Some(1));
+    let dup = run(
+        home.path(),
+        &["knowledge", "update", "kb-a", "--name", "kb-c"],
+    );
+    assert_eq!(dup.status.code(), Some(1));
+    assert!(err(&dup).contains("already exists"), "{}", err(&dup));
+    assert!(state.lock().unwrap().last_update.is_none());
+}
+
+#[test]
+fn remove_detaches_one_file_and_keeps_collection() {
+    let (state, home, _docs) = seeded();
+    let o = run(home.path(), &["knowledge", "remove", "kb-a", "a.md"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let s = state.lock().unwrap();
+    assert_eq!(s.kbs.len(), 1);
+    let names: Vec<&str> = s.kbs[0].2.iter().map(|f| f.1.as_str()).collect();
+    assert_eq!(names, ["b.txt"]);
+    assert!(s.log.iter().any(|l| l.ends_with("/file/remove")));
+    drop(s);
+    let miss = run(home.path(), &["knowledge", "remove", "kb-a", "nope.md"]);
+    assert_eq!(miss.status.code(), Some(1));
+    assert!(err(&miss).contains("not in collection"), "{}", err(&miss));
+}
+
+#[test]
+fn replace_swaps_the_same_named_file() {
+    let (state, home, docs) = seeded();
+    let old = state.lock().unwrap().kbs[0].2[0].0.clone();
+    let p = docs.path().join("a.md");
+    let o = run(
+        home.path(),
+        &["knowledge", "replace", "kb-a", p.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let s = state.lock().unwrap();
+    let files = &s.kbs[0].2;
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|f| f.0 != old), "old a.md still attached");
+    assert_eq!(files.iter().filter(|f| f.1 == "a.md").count(), 1);
+    drop(s);
+    write(docs.path(), "new.md");
+    let p = docs.path().join("new.md");
+    let miss = run(
+        home.path(),
+        &["knowledge", "replace", "kb-a", p.to_str().unwrap()],
+    );
+    assert_eq!(miss.status.code(), Some(1));
+}
+
+#[test]
+fn reprocess_requires_force_when_already_processed() {
+    let (state, home, _docs) = seeded();
+    let o = run(home.path(), &["knowledge", "reprocess", "kb-a", "a.md"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("--force"), "{}", err(&o));
+    let o = run(
+        home.path(),
+        &["knowledge", "reprocess", "kb-a", "a.md", "--force"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let log = state.lock().unwrap().log.join("\n");
+    assert!(
+        log.contains("/reprocess?force=true") && log.contains("/file/update"),
+        "{log}"
+    );
+}
+
+#[test]
+fn content_prints_extracted_text_to_stdout() {
+    let (_state, home, _docs) = seeded();
+    let o = run(home.path(), &["knowledge", "content", "kb-a", "b.txt"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o), "extracted b.txt");
 }

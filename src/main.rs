@@ -16,8 +16,9 @@ use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::knowledge::{
-    knowledge_create_command, knowledge_delete_command, knowledge_list_command,
-    knowledge_upload_command,
+    knowledge_content_command, knowledge_create_command, knowledge_delete_command,
+    knowledge_list_command, knowledge_remove_command, knowledge_replace_command,
+    knowledge_reprocess_command, knowledge_update_command, knowledge_upload_command,
 };
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
@@ -60,7 +61,7 @@ Commands:
 
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
-    knowledge  Manage knowledge collections (create, upload files, list, delete)
+    knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, delete)
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -139,7 +140,7 @@ enum Commands {
         #[command(flatten)]
         args: ChatArgs,
     },
-    /// Manage knowledge collections (create, upload files, list, delete)
+    /// Manage knowledge collections (create, upload, list, update, remove, replace, content, delete)
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommand,
@@ -407,6 +408,47 @@ enum KnowledgeCommand {
     List {
         /// Collection name or id; omit to list all collections
         collection: Option<String>,
+    },
+    /// Rename and/or re-describe a collection (sharing/access is left unchanged)
+    Update {
+        /// Collection name or id
+        collection: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Remove one file from a collection (the collection is kept). The server
+    /// also deletes the file itself unless another collection or chat still uses it
+    Remove {
+        /// Collection name or id
+        collection: String,
+        /// File name or id within the collection (see `monocle knowledge list COLLECTION`)
+        file: String,
+    },
+    /// Replace the same-named file in a collection with a new local version
+    Replace {
+        /// Collection name or id
+        collection: String,
+        /// Local file (pdf, docx, md, txt); its name selects the file to replace
+        path: String,
+    },
+    /// Re-extract a file's text on the server and re-index it in the collection
+    Reprocess {
+        /// Collection name or id
+        collection: String,
+        /// File name or id within the collection
+        file: String,
+        /// Re-extract even if the file already has text
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the text the server extracted from a file (check parsing before search)
+    Content {
+        /// Collection name or id
+        collection: String,
+        /// File name or id within the collection
+        file: String,
     },
     /// Delete a collection and all of its files
     Delete {
@@ -746,6 +788,34 @@ fn main() {
             }
             KnowledgeCommand::List { collection } => {
                 knowledge_list_command(&client, &creds, &selection, collection.as_deref())
+            }
+            KnowledgeCommand::Update {
+                collection,
+                name,
+                description,
+            } => knowledge_update_command(
+                &client,
+                &creds,
+                &selection,
+                &collection,
+                name.as_deref(),
+                description.as_deref(),
+            ),
+            KnowledgeCommand::Remove { collection, file } => {
+                knowledge_remove_command(&client, &creds, &selection, &collection, &file)
+            }
+            KnowledgeCommand::Replace { collection, path } => {
+                knowledge_replace_command(&client, &creds, &selection, &collection, &path)
+            }
+            KnowledgeCommand::Reprocess {
+                collection,
+                file,
+                force,
+            } => {
+                knowledge_reprocess_command(&client, &creds, &selection, &collection, &file, force)
+            }
+            KnowledgeCommand::Content { collection, file } => {
+                knowledge_content_command(&client, &creds, &selection, &collection, &file)
             }
             KnowledgeCommand::Delete { collection } => {
                 knowledge_delete_command(&client, &creds, &selection, &collection)
