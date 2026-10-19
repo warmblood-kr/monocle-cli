@@ -250,13 +250,111 @@ pub fn render_json(id: &str, title: &str, messages: &[&MessageNode], show_tools:
 /// One `<details type="tool_calls">` block jarvice embeds in an assistant
 /// message's `content`, reduced to what a reader wants: which tool, and for a
 /// sub-agent delegation who it went to and what it reports back.
+///
+/// Tool arguments can carry credentials or personal data, so every value here
+/// is redacted ([`redact_value`]) and length-capped; `truncated` says a cap
+/// cut something, `parse_error` that the block was malformed (the entry is then
+/// best-effort — a bad block is reported, never silently dropped).
 #[derive(Debug, PartialEq)]
 pub struct ToolCallInfo {
     pub name: String,
     pub model_id: Option<String>,
     pub report_to_parent: Option<String>,
-    /// Arguments as compact JSON (or the raw text when not JSON).
+    /// Redacted arguments as compact JSON (or redacted raw text when not JSON).
     pub arguments: String,
+    pub truncated: bool,
+    pub parse_error: Option<String>,
+}
+
+/// Per-field caps (bytes). Arguments get more room than the short identifiers.
+const MAX_ARGUMENTS_BYTES: usize = 2048;
+const MAX_FIELD_BYTES: usize = 500;
+const REDACTED: &str = "[REDACTED]";
+
+/// Cut `s` to at most `max` bytes on a char boundary; the flag says it was cut.
+fn cap(s: String, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s, false);
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}…", &s[..end]), true)
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    [
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "api-key",
+        "bearer",
+        "credential",
+        "cookie",
+        "private_key",
+    ]
+    .iter()
+    .any(|needle| k.contains(needle))
+}
+
+/// A bare word that looks like a credential: `sk-…`, a JWT (`eyJ…`), or a long
+/// opaque token after `Bearer`.
+fn looks_secret(word: &str) -> bool {
+    let w =
+        word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.');
+    (w.starts_with("sk-") && w.len() >= 20) || (w.starts_with("eyJ") && w.len() >= 20)
+}
+
+/// Redact credential-looking text inside a free-form string: `Bearer <x>`,
+/// `sk-…`/JWT words, and `key=value` / `key: value` where the key is sensitive.
+fn redact_str(text: &str) -> String {
+    let words: Vec<&str> = text.split(' ').collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut after_bearer = false;
+    for word in words {
+        let lower = word.to_ascii_lowercase();
+        let kv_secret = word
+            .split_once(['=', ':'])
+            .is_some_and(|(k, v)| !v.is_empty() && is_sensitive_key(k));
+        if after_bearer || looks_secret(word) {
+            out.push(REDACTED.to_string());
+        } else if kv_secret {
+            let (k, _) = word.split_once(['=', ':']).unwrap();
+            out.push(format!("{k}={REDACTED}"));
+        } else {
+            out.push(word.to_string());
+        }
+        after_bearer = lower == "bearer";
+    }
+    out.join(" ")
+}
+
+/// Redact a parsed JSON value: values under sensitive keys are replaced
+/// wholesale; every other string goes through [`redact_str`].
+fn redact_value(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, val)| {
+                    let red = if is_sensitive_key(k) {
+                        Value::String(REDACTED.to_string())
+                    } else {
+                        redact_value(val)
+                    };
+                    (k.clone(), red)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_value).collect()),
+        Value::String(s) => Value::String(redact_str(s)),
+        other => other.clone(),
+    }
 }
 
 impl ToolCallInfo {
@@ -266,6 +364,8 @@ impl ToolCallInfo {
             "model_id": self.model_id.as_deref().map(visible_text),
             "report_to_parent": self.report_to_parent.as_deref().map(visible_text),
             "arguments": visible_text(&self.arguments),
+            "truncated": self.truncated,
+            "parse_error": self.parse_error,
         })
     }
 
@@ -277,8 +377,14 @@ impl ToolCallInfo {
         if let Some(r) = &self.report_to_parent {
             line.push_str(&format!(" report_to_parent={}", visible_text(r)));
         }
-        let args: String = visible_text(&self.arguments).chars().take(200).collect();
+        let (args, cut) = cap(visible_text(&self.arguments), 200);
         line.push_str(&format!(" args={args}"));
+        if self.truncated && !cut {
+            line.push_str(" (truncated)");
+        }
+        if let Some(e) = &self.parse_error {
+            line.push_str(&format!(" [parse_error: {e}]"));
+        }
         line
     }
 }
@@ -336,41 +442,91 @@ fn find_key(v: &Value, key: &str) -> Option<String> {
     }
 }
 
+const OPEN_TAG: &str = "<details";
+const CLOSE_TAG: &str = "</details>";
+
+/// Byte offset just past the `</details>` that balances the `<details` at
+/// `start`, counting nested opens. `None` when the block is never closed.
+fn matching_close(content: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut at = start;
+    loop {
+        let next_open = content[at..].find(OPEN_TAG).map(|i| at + i);
+        let next_close = content[at..].find(CLOSE_TAG).map(|i| at + i);
+        match (next_open, next_close) {
+            (Some(o), Some(c)) if o < c => {
+                depth += 1;
+                at = o + OPEN_TAG.len();
+            }
+            (_, Some(c)) => {
+                depth -= 1;
+                at = c + CLOSE_TAG.len();
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn parse_tool_blocks(content: &str) -> Vec<ToolBlock> {
     const OPEN: &str = "<details type=\"tool_calls\"";
     let mut blocks = Vec::new();
     let mut at = 0;
     while let Some(rel) = content[at..].find(OPEN) {
         let start = at + rel;
-        let Some(tag_len) = content[start..].find('>') else {
-            break;
+        let mut errors: Vec<&str> = Vec::new();
+        // The whole rest of the message is consumed when the block is cut off:
+        // surfacing it as one flagged entry beats leaving half a tag in the text.
+        let end = matching_close(content, start).unwrap_or_else(|| {
+            errors.push("unterminated block");
+            content.len()
+        });
+        let tag_end = match content[start..end].find('>') {
+            Some(i) => start + i,
+            None => {
+                errors.push("unterminated opening tag");
+                end
+            }
         };
-        let tag = &content[start..start + tag_len];
-        let end = content[start..]
-            .find("</details>")
-            .map_or(content.len(), |e| start + e + "</details>".len());
-        let args = tag_attr(tag, "arguments").and_then(parse_json_loose);
+        let tag = &content[start..tag_end];
+        let args_raw = tag_attr(tag, "arguments");
+        let args = args_raw.and_then(parse_json_loose);
         let result = tag_attr(tag, "result").and_then(parse_json_loose);
         let find = |key: &str| {
             args.as_ref()
                 .and_then(|v| find_key(v, key))
                 .or_else(|| result.as_ref().and_then(|v| find_key(v, key)))
         };
-        blocks.push(ToolBlock {
-            start,
-            end,
-            call: ToolCallInfo {
-                name: tag_attr(tag, "name").map(html_unescape).unwrap_or_default(),
-                model_id: find("model_id"),
-                report_to_parent: find("report_to_parent"),
-                arguments: match &args {
-                    Some(v) => v.to_string(),
-                    None => tag_attr(tag, "arguments")
-                        .map(html_unescape)
-                        .unwrap_or_default(),
-                },
-            },
-        });
+        let name = tag_attr(tag, "name").map(html_unescape);
+        if name.is_none() {
+            errors.push("missing name");
+        }
+        let truncated = std::cell::Cell::new(false);
+        let field = |raw: String, max: usize| {
+            let (v, cut) = cap(redact_str(&raw), max);
+            truncated.set(truncated.get() || cut);
+            v
+        };
+        let arguments = match (&args, args_raw) {
+            (Some(v), _) => {
+                let (v, cut) = cap(redact_value(v).to_string(), MAX_ARGUMENTS_BYTES);
+                truncated.set(truncated.get() || cut);
+                v
+            }
+            (None, Some(raw)) => field(html_unescape(raw), MAX_ARGUMENTS_BYTES),
+            (None, None) => String::new(),
+        };
+        let call = ToolCallInfo {
+            name: field(name.unwrap_or_default(), MAX_FIELD_BYTES),
+            model_id: find("model_id").map(|v| field(v, MAX_FIELD_BYTES)),
+            report_to_parent: find("report_to_parent").map(|v| field(v, MAX_FIELD_BYTES)),
+            arguments,
+            truncated: truncated.get(),
+            parse_error: (!errors.is_empty()).then(|| errors.join(", ")),
+        };
+        blocks.push(ToolBlock { start, end, call });
         at = end;
     }
     blocks
@@ -581,5 +737,167 @@ mod tests {
         assert!(ensure_content_limit(&"x".repeat(MAX_TRANSCRIPT_BYTES)).is_ok());
         let err = ensure_content_limit(&"x".repeat(MAX_TRANSCRIPT_BYTES + 1)).unwrap_err();
         assert!(err.to_string().contains("1 MiB"));
+    }
+
+    // ── tool-call block parsing (--show-tools) ──────────────────────────────
+
+    /// A block the way jarvice stores it: attribute values are a JSON string
+    /// holding JSON, then HTML-escaped.
+    fn block(name: &str, args: &Value, result: &Value) -> String {
+        let attr = |v: &Value| {
+            let inner = serde_json::to_string(&v.to_string()).unwrap();
+            inner
+                .replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        format!(
+            "<details type=\"tool_calls\" done=\"true\" id=\"c1\" name=\"{name}\" arguments=\"{}\" result=\"{}\" files=\"\">\n<summary>Tool Executed</summary>\n</details>",
+            attr(args),
+            attr(result)
+        )
+    }
+
+    fn only(content: &str) -> ToolCallInfo {
+        let mut blocks = parse_tool_blocks(content);
+        assert_eq!(blocks.len(), 1, "{content}");
+        blocks.remove(0).call
+    }
+
+    #[test]
+    fn nested_details_stay_inside_their_block() {
+        let inner = "<details><summary>x</summary>inner</details>";
+        let content = format!(
+            "before\n{}after",
+            block("t", &serde_json::json!({}), &serde_json::json!({}))
+                .replace("</details>", &format!("{inner}</details>"))
+        );
+        let blocks = parse_tool_blocks(&content);
+        assert_eq!(blocks.len(), 1);
+        let text = body_text(&content, true);
+        assert_eq!(
+            text,
+            format!("before\n{}\nafter", blocks[0].call.summary_line())
+        );
+        assert!(!text.contains("details>"), "{text}");
+        assert!(blocks[0].call.parse_error.is_none());
+    }
+
+    #[test]
+    fn truncated_block_is_reported_not_dropped() {
+        let full = block(
+            "web_search",
+            &serde_json::json!({"q": "a"}),
+            &serde_json::json!({}),
+        );
+        let cut = &full[..full.len() - "</details>".len() - 5];
+        let content = format!("intro\n{cut}");
+        let call = only(&content);
+        assert_eq!(call.name, "web_search");
+        assert!(call
+            .parse_error
+            .as_deref()
+            .unwrap()
+            .contains("unterminated block"));
+        let text = body_text(&content, true);
+        assert!(text.contains("[parse_error: unterminated block]"), "{text}");
+        assert!(!text.contains("<details"), "{text}");
+    }
+
+    #[test]
+    fn opening_tag_without_close_bracket_is_reported() {
+        let call = only("<details type=\"tool_calls\" name=\"half\"");
+        assert!(call
+            .parse_error
+            .as_deref()
+            .unwrap()
+            .contains("unterminated opening tag"));
+        assert_eq!(call.name, "half");
+    }
+
+    #[test]
+    fn missing_name_is_reported_and_missing_report_to_parent_is_none() {
+        let content = "<details type=\"tool_calls\" done=\"true\">\n</details>";
+        let call = only(content);
+        assert!(call
+            .parse_error
+            .as_deref()
+            .unwrap()
+            .contains("missing name"));
+        assert_eq!(call.report_to_parent, None);
+        assert_eq!(call.to_json()["report_to_parent"], Value::Null);
+    }
+
+    #[test]
+    fn long_arguments_are_capped_and_flagged() {
+        let big = "é".repeat(5000); // multi-byte: the cut must land on a char boundary
+        let call = only(&block(
+            "t",
+            &serde_json::json!({ "q": big }),
+            &serde_json::json!({}),
+        ));
+        assert!(call.truncated);
+        assert!(call.arguments.len() <= MAX_ARGUMENTS_BYTES + "…".len());
+        let j = call.to_json();
+        assert_eq!(j["truncated"], true);
+        let short = only(&block(
+            "t",
+            &serde_json::json!({"q": "x"}),
+            &serde_json::json!({}),
+        ));
+        assert!(!short.truncated);
+        assert_eq!(short.to_json()["truncated"], false);
+    }
+
+    #[test]
+    fn secrets_are_redacted_in_json_and_text() {
+        let args = serde_json::json!({
+            "query": "ok",
+            "api_key": "KEYVALUE1",
+            "headers": {"Authorization": "Bearer HEADERTOKEN"},
+            "note": "call with Bearer FREETOKEN please",
+            "pasted": "sk-abcdefghijklmnopqrstuvwx",
+            "cfg": "password=hunter2 mode=fast",
+        });
+        let content = block("t", &args, &serde_json::json!({}));
+        let call = only(&content);
+        for leaked in [
+            "KEYVALUE1",
+            "HEADERTOKEN",
+            "FREETOKEN",
+            "sk-abcdefghijkl",
+            "hunter2",
+        ] {
+            assert!(
+                !call.arguments.contains(leaked),
+                "{leaked} leaked: {}",
+                call.arguments
+            );
+            assert!(
+                !body_text(&content, true).contains(leaked),
+                "{leaked} leaked in text"
+            );
+        }
+        assert!(
+            call.arguments.contains("\"query\":\"ok\""),
+            "{}",
+            call.arguments
+        );
+        assert!(call.arguments.contains("mode=fast"), "{}", call.arguments);
+    }
+
+    #[test]
+    fn special_characters_survive_and_controls_are_stripped() {
+        let args = serde_json::json!({ "q": "a & b <c> \"d\" 한글 🙂 \u{1b}[31m" });
+        let call = only(&block("name&amp;x", &args, &serde_json::json!({})));
+        assert_eq!(call.name, "name&x");
+        let line = call.summary_line();
+        assert!(line.contains("한글 🙂"), "{line}");
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!call.to_json()["arguments"]
+            .as_str()
+            .unwrap()
+            .contains('\u{1b}'));
     }
 }

@@ -271,6 +271,8 @@ fn show_tools_json_has_structured_tool_calls() {
     let calls = &v["messages"][1]["tool_calls"];
     assert_eq!(calls[0]["name"], "web_search");
     assert_eq!(calls[0]["model_id"], serde_json::Value::Null);
+    assert_eq!(calls[0]["truncated"], false);
+    assert_eq!(calls[0]["parse_error"], serde_json::Value::Null);
     assert_eq!(calls[1]["name"], "model_designer__delegate_model");
     assert_eq!(calls[1]["model_id"], "law-search");
     assert_eq!(calls[1]["report_to_parent"], "found 3 items");
