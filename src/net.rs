@@ -8,6 +8,7 @@
 //! types from leaking past this boundary.
 
 use std::io::{BufRead, BufReader, Read};
+use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -63,8 +64,13 @@ pub struct FilePart {
     pub data: Vec<u8>,
 }
 
+/// Called after a 401 to a `Bearer` request with the rejected token; returns a
+/// replacement token, or `None` to let the caller see the 401.
+pub type UnauthorizedRefresher = Arc<dyn Fn(&Client, &str) -> Option<String> + Send + Sync>;
+
 pub struct Client {
     inner: reqwest::blocking::Client,
+    refresher: Mutex<Option<UnauthorizedRefresher>>,
 }
 
 impl Default for Client {
@@ -99,7 +105,40 @@ impl Client {
             .pool_idle_timeout(std::time::Duration::from_secs(50))
             .build()
             .expect("failed to build HTTP client");
-        Self { inner }
+        Self {
+            inner,
+            refresher: Mutex::new(None),
+        }
+    }
+
+    /// Install the hook used to replay a request once after a 401 (see
+    /// [`UnauthorizedRefresher`]). Installed by `auth::ensure_fresh_token`.
+    pub fn set_unauthorized_refresher(&self, hook: UnauthorizedRefresher) {
+        *self.refresher.lock().unwrap() = Some(hook);
+    }
+
+    /// After a 401: if the request carried `Authorization: Bearer X` and the
+    /// hook yields a new token, replay it once with the header replaced. This
+    /// is the only extra attempt — a single try, never a transport retry.
+    fn replay_after_401(
+        &self,
+        replay: Option<reqwest::blocking::RequestBuilder>,
+    ) -> Option<reqwest::Result<reqwest::blocking::Response>> {
+        let hook = self.refresher.lock().unwrap().clone()?;
+        let mut request = replay?.build().ok()?;
+        let rejected = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)?
+            .to_str()
+            .ok()?
+            .strip_prefix("Bearer ")?
+            .to_string();
+        let fresh = hook(self, &rejected)?;
+        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {fresh}")).ok()?;
+        request
+            .headers_mut()
+            .insert(reqwest::header::AUTHORIZATION, value);
+        Some(self.inner.execute(request))
     }
 
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Resp> {
@@ -107,7 +146,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send("GET", url, req)
+        self.send("GET", url, req)
     }
 
     /// DELETE (no body). Goes through the shared `send()`, so — like every call
@@ -118,7 +157,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send("DELETE", url, req)
+        self.send("DELETE", url, req)
     }
 
     /// [`delete`](Self::delete) making exactly one attempt — no transport retry.
@@ -129,7 +168,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send_opt("DELETE", url, req, false)
+        self.send_opt("DELETE", url, req, false)
     }
 
     /// GET a large file download (e.g. the `monocle upgrade` release binary).
@@ -173,7 +212,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send("POST", url, req)
+        self.send("POST", url, req)
     }
 
     /// POST `application/json`.
@@ -182,7 +221,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send("POST", url, req)
+        self.send("POST", url, req)
     }
 
     /// POST `multipart/form-data` with one or more binary file parts plus text
@@ -232,7 +271,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send_opt("POST", url, req, retry)
+        self.send_opt("POST", url, req, retry)
     }
 
     /// [`post_json`](Self::post_json) making exactly one attempt — no transport
@@ -248,7 +287,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send_opt("POST", url, req, false)
+        self.send_opt("POST", url, req, false)
     }
 
     /// POST a raw body with an explicit `Content-Type` (Azure SSML).
@@ -267,7 +306,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        send("POST", url, req)
+        self.send("POST", url, req)
     }
 
     /// POST `application/json` and return a streaming line reader over the (SSE)
@@ -303,12 +342,18 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
+        let replay = req.try_clone();
         let sent = if retry {
             send_with_retry("POST", url, req)
         } else {
             req.send()
         };
-        let resp = sent.map_err(|e| AppError(e.to_string()))?;
+        let mut resp = sent.map_err(|e| AppError(e.to_string()))?;
+        if resp.status().as_u16() == 401 {
+            if let Some(again) = self.replay_after_401(replay) {
+                resp = again.map_err(|e| AppError(e.to_string()))?;
+            }
+        }
         let status = resp.status().as_u16();
         let content_type = resp
             .headers()
@@ -322,6 +367,46 @@ impl Client {
             reader: BufReader::new(resp),
             request_url: url.to_string(),
         })
+    }
+}
+
+impl Client {
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        req: reqwest::blocking::RequestBuilder,
+    ) -> Result<Resp> {
+        self.send_opt(method, url, req, true)
+    }
+
+    /// `send` with the transport retry switchable: `retry = false` makes exactly
+    /// one transport attempt (for non-idempotent writes where a lost response
+    /// after server-side success must not be replayed). A 401 may still be
+    /// replayed once with a refreshed bearer (see `replay_after_401`).
+    fn send_opt(
+        &self,
+        method: &str,
+        url: &str,
+        req: reqwest::blocking::RequestBuilder,
+        retry: bool,
+    ) -> Result<Resp> {
+        // Total request timeout — non-streaming only (see `Client::new`).
+        let req = req.timeout(std::time::Duration::from_secs(120));
+        let replay = req.try_clone();
+        let sent = if retry {
+            send_with_retry(method, url, req)
+        } else {
+            req.send()
+        };
+        let first = finish(method, url, sent)?;
+        if first.status != 401 {
+            return Ok(first);
+        }
+        match self.replay_after_401(replay) {
+            Some(sent) => finish(method, url, sent),
+            None => Ok(first),
+        }
     }
 }
 
@@ -375,28 +460,12 @@ fn send_with_retry(
     }
 }
 
-fn send(method: &str, url: &str, req: reqwest::blocking::RequestBuilder) -> Result<Resp> {
-    send_opt(method, url, req, true)
-}
-
-/// [`send`] with the transport retry switchable: `retry = false` makes exactly
-/// one attempt (for non-idempotent writes where a lost response after
-/// server-side success must not be replayed).
-fn send_opt(
+/// Read a sent request's response fully into a [`Resp`].
+fn finish(
     method: &str,
     url: &str,
-    req: reqwest::blocking::RequestBuilder,
-    retry: bool,
+    sent: reqwest::Result<reqwest::blocking::Response>,
 ) -> Result<Resp> {
-    // Total request timeout — non-streaming only (see `Client::new`). Streaming
-    // (`post_json_stream`) builds and sends its own request without this, so a
-    // long generation is never cut short.
-    let req = req.timeout(std::time::Duration::from_secs(120));
-    let sent = if retry {
-        send_with_retry(method, url, req)
-    } else {
-        req.send()
-    };
     let resp = sent.map_err(|e| {
         let msg = e.to_string();
         crate::diag::log_network_error(method, url, &msg);
