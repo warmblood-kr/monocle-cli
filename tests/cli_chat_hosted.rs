@@ -243,3 +243,32 @@ fn resume_prints_the_thread_id_once_up_front() {
         stderr(&o)
     );
 }
+
+#[test]
+fn malformed_resume_ids_are_rejected_without_echo_or_requests() {
+    let (stub, hits_map) = counting_stub();
+    let home = logged_in_home(&stub);
+    for bad in [
+        "a\nThread: forged",
+        "x\x1b[2Jy",
+        "a\rb",
+        "../x",
+        "t?x=1",
+        "",
+    ] {
+        let o = run_piped(home.path(), &["chat", "--resume", bad]);
+        assert_eq!(o.status.code(), Some(1), "{bad:?}");
+        let err = stderr(&o);
+        assert!(
+            err.contains("Error: Invalid chat thread ID."),
+            "{bad:?}: {err}"
+        );
+        assert!(
+            !err.contains("forged") && !err.contains('\x1b') && !err.contains('\r'),
+            "{bad:?}: {err:?}"
+        );
+        assert!(!err.contains("Thread:"), "{bad:?}: {err}");
+        assert!(stdout(&o).is_empty());
+    }
+    assert_eq!(hits(&hits_map, "/api/responses"), 0, "a request was sent");
+}

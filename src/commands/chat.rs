@@ -635,9 +635,7 @@ pub fn chat_content_command(
         creds.read().map(|c| c.tenant_domain).unwrap_or_default()
     );
     // Only a well-formed id is echoed (invalid ones are rejected without being printed).
-    if crate::jarvice_chats::is_valid_chat_id(id) {
-        eprintln!("Thread: {id}");
-    }
+    announce_thread(id);
     let output =
         crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format, show_tools)?;
     print!("{output}");
@@ -656,6 +654,15 @@ pub fn chat_content_command(
 /// field at all. Shared by both `run_responses_chat` and `run_completions_chat`
 /// so plain `monocle chat` gets the same non-silent behavior, not just
 /// `--responses` mode (monocle-cli#101 code review).
+/// Print `Thread: <id>` to stderr, only for a well-formed id: an id that came
+/// from the command line (or a server header) must never reach the terminal
+/// unchecked — a newline/ESC in it could forge or hide other output lines.
+fn announce_thread(id: &str) {
+    if crate::jarvice_chats::is_valid_chat_id(id) {
+        eprintln!("Thread: {id}");
+    }
+}
+
 /// jarvice creates a new thread inside the same request and reports its id only
 /// in the response, so after a timeout the id is unknown — say where to look
 /// instead of leaving it a mystery.
@@ -892,6 +899,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         }
     }
 
+    // Validate before anything is printed or sent; never echo the raw value.
+    if let Some(id) = &options.resume {
+        if !crate::jarvice_chats::is_valid_chat_id(id) {
+            return Err(crate::error::AppError::new("Invalid chat thread ID."));
+        }
+    }
+
     let stdin_is_tty = std::io::stdin().is_terminal();
     if !options.files.is_empty() && stdin_is_tty {
         eprintln!(
@@ -919,7 +933,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         // A resumed thread's id is known up front — print it before the (possibly
         // long) request so it is on screen even if the request later times out.
         if let Some(id) = &options.resume {
-            eprintln!("Thread: {id}");
+            announce_thread(id);
         }
         let reply = rc
             .respond(
@@ -943,7 +957,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         println!("{}", reply.content);
         if let Some(id) = reply.thread_id {
             if options.resume.as_deref() != Some(id.as_str()) {
-                eprintln!("Thread: {id}");
+                announce_thread(&id);
             }
         }
         if options.show_tools {
@@ -1110,7 +1124,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                 if reply.thread_id.is_some() && thread_id != reply.thread_id {
                     thread_id = reply.thread_id;
                     if let Some(id) = &thread_id {
-                        eprintln!("Thread: {id}");
+                        announce_thread(id);
                     }
                 }
                 if options.show_tools {
