@@ -16,3 +16,4 @@ pub mod status;
 pub mod token;
 pub mod unset;
 pub mod upgrade;
+pub mod workspace_model;

@@ -28,6 +28,7 @@ use monocle_cli::commands::status::status_command;
 use monocle_cli::commands::token::token_command;
 use monocle_cli::commands::unset::unset_command;
 use monocle_cli::commands::upgrade::upgrade_command;
+use monocle_cli::commands::workspace_model::{self as wm, WriteArgs};
 use monocle_cli::config::Config;
 use monocle_cli::credentials::Credentials;
 use monocle_cli::diag;
@@ -63,6 +64,7 @@ Commands:
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
+    workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -145,6 +147,11 @@ enum Commands {
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommand,
+    },
+    /// Manage workspace (custom) models: system prompt, tools, knowledge (then `chat --model <id>`)
+    WorkspaceModel {
+        #[command(subcommand)]
+        command: WorkspaceModelCommand,
     },
     /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
     Agent {
@@ -470,6 +477,63 @@ enum KnowledgeCommand {
         /// Collection name or id
         collection: String,
     },
+}
+
+#[derive(Args)]
+struct ModelWriteArgs {
+    /// Model id (what `monocle chat --model` takes)
+    id: String,
+    /// JSON file with ModelForm fields (base_model_id, name, meta, params, ...); flags override it
+    #[arg(long, value_name = "PATH")]
+    file: Option<String>,
+    /// Display name (default for create: the id)
+    #[arg(long)]
+    name: Option<String>,
+    /// Base model id (see `monocle router models`); required for create unless in --file
+    #[arg(long)]
+    base: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    /// System prompt
+    #[arg(long)]
+    system: Option<String>,
+    /// Tool id, e.g. `mcp:server` (repeatable; replaces the model's tool list)
+    #[arg(long = "tool", value_name = "TOOL_ID")]
+    tools: Vec<String>,
+    /// Knowledge collection name or id (repeatable; replaces the model's collections)
+    #[arg(long = "knowledge", value_name = "COLLECTION")]
+    knowledge: Vec<String>,
+}
+
+impl From<ModelWriteArgs> for WriteArgs {
+    fn from(a: ModelWriteArgs) -> Self {
+        WriteArgs {
+            id: a.id,
+            file: a.file,
+            name: a.name,
+            base: a.base,
+            description: a.description,
+            system: a.system,
+            tools: a.tools,
+            knowledge: a.knowledge,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum WorkspaceModelCommand {
+    /// List workspace models (id, name, base, active)
+    List,
+    /// Print one model as JSON
+    Show { id: String },
+    /// Create a private, active model; prints its id to stdout
+    Create(ModelWriteArgs),
+    /// Change a model: only the given flags/--file fields change
+    Update(ModelWriteArgs),
+    /// Flip a model between active and inactive
+    Toggle { id: String },
+    /// Delete a model
+    Delete { id: String },
 }
 
 #[derive(Args)]
@@ -848,6 +912,24 @@ fn main() {
             ),
             KnowledgeCommand::Delete { collection } => {
                 knowledge_delete_command(&client, &creds, &selection, &collection)
+            }
+        },
+        Commands::WorkspaceModel { command } => match command {
+            WorkspaceModelCommand::List => wm::list_command(&client, &creds, &selection),
+            WorkspaceModelCommand::Show { id } => {
+                wm::show_command(&client, &creds, &selection, &id)
+            }
+            WorkspaceModelCommand::Create(a) => {
+                wm::create_command(&client, &creds, &selection, &a.into())
+            }
+            WorkspaceModelCommand::Update(a) => {
+                wm::update_command(&client, &creds, &selection, &a.into())
+            }
+            WorkspaceModelCommand::Toggle { id } => {
+                wm::toggle_command(&client, &creds, &selection, &id)
+            }
+            WorkspaceModelCommand::Delete { id } => {
+                wm::delete_command(&client, &creds, &selection, &id)
             }
         },
         Commands::Agent {

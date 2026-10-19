@@ -14,7 +14,7 @@ use crate::net::Client;
 use crate::profiles::Selection;
 
 /// Auth + jarvice host, with the same stderr profile banner `chat list` prints.
-fn connect(
+pub(crate) fn connect(
     client: &Client,
     creds: &Credentials,
     selection: &Selection,
@@ -31,7 +31,7 @@ fn connect(
 }
 
 /// Left-aligned table on stdout; the last column is left unpadded.
-fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+pub(crate) fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     let widths: Vec<usize> = (0..headers.len())
         .map(|c| {
             rows.iter()

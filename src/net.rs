@@ -121,6 +121,17 @@ impl Client {
         send("DELETE", url, req)
     }
 
+    /// [`delete`](Self::delete) making exactly one attempt — no transport retry.
+    /// For deletes whose replay is not harmless (jarvice answers a second delete
+    /// of the same model with an error, so a retry would mask the first success).
+    pub fn delete_once(&self, url: &str, headers: &[(&str, &str)]) -> Result<Resp> {
+        let mut req = self.inner.delete(url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        send_opt("DELETE", url, req, false)
+    }
+
     /// GET a large file download (e.g. the `monocle upgrade` release binary).
     ///
     /// This deliberately does NOT route through the shared `send()`: a multi-MB
