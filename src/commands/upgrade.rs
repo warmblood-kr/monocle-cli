@@ -74,7 +74,7 @@ fn find_checksum<'a>(sums: &'a str, asset: &str) -> Option<&'a str> {
 /// is a hard error.
 fn verify_checksum(client: &Client, tag: &str, asset: &str, bytes: &[u8]) -> Result<()> {
     let url = download_url(tag, "SHA256SUMS");
-    let resp = match client.get(&url, &[("User-Agent", "monocle-cli")]) {
+    let resp = match client.get(&url, &[]) {
         Ok(r) if r.ok() => r,
         _ => {
             eprintln!("⚠ SHA256SUMS not available, skipping checksum verification");
@@ -211,10 +211,7 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
 
     let resp = client.get(
         &format!("https://api.github.com/repos/{REPO}/releases/latest"),
-        &[
-            ("User-Agent", "monocle-cli"),
-            ("Accept", "application/vnd.github+json"),
-        ],
+        &[("Accept", "application/vnd.github+json")],
     )?;
     if !resp.ok() {
         return Err(AppError::new(format!(
@@ -284,7 +281,7 @@ pub fn upgrade_command(client: &Client, check_only: bool) -> Result<()> {
 
     // Use the dedicated download path: a multi-MB binary on a slow link must not
     // inherit the shared `send()`'s short total API timeout.
-    let resp = client.get_download(&url, &[("User-Agent", "monocle-cli")])?;
+    let resp = client.get_download(&url, &[])?;
     if !resp.ok() {
         return Err(AppError::new(format!(
             "download failed {}: {}",
