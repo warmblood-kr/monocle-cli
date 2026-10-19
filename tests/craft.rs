@@ -417,11 +417,14 @@ fn missing_craft_url_names_the_environment() {
         "{}",
         err(&o)
     );
-    let o = run(
-        home.path(),
-        None,
-        &["--env", "prod", "craft", "session", "list"],
+    // Hosts are derived per environment (the test process has no override set).
+    assert_eq!(
+        monocle_cli::craft_server::base_url("prod").unwrap(),
+        "https://craft.monocle-ai.com"
     );
-    assert!(err(&o).contains("unknown for env 'prod'"), "{}", err(&o));
+    assert_eq!(
+        monocle_cli::craft_server::base_url("stg").unwrap(),
+        "https://craft-stg.monocle-ai.com"
+    );
     assert!(requests(&log).is_empty());
 }

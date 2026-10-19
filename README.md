@@ -326,7 +326,7 @@ monocle craft session delete <id>
 monocle --env stg craft --lane sdk session list     # jarvice agent sessions
 ```
 
-- `openworker` talks to the Craft server with your monocle access token. Its URL is `MONOCLE_CRAFT_URL` if set, else `https://craft-stg.monocle-ai.com` for `--env stg`; for other environments set `MONOCLE_CRAFT_URL`. `--workspace` filters `list` (this lane only).
+- `openworker` talks to the Craft server with your monocle access token. Its URL is `MONOCLE_CRAFT_URL` if set, else `https://craft-stg.monocle-ai.com` for `--env stg` and `https://craft.monocle-ai.com` for `--env prod`; for `local` set `MONOCLE_CRAFT_URL`. `--workspace` filters `list` (this lane only).
 - `sdk` uses your tenant's jarvice agent sessions (`--folder` on `files` applies here only).
 - `list`, `show`, `history`, `files` and `delete` take `--json` for the raw server data on stdout. Data goes to stdout; the profile banner and confirmations go to stderr.
 - Server error bodies are never printed: you see the HTTP status and, when the server sends one, a short error code. On the openworker lane `files` reports "session files unavailable" if the session is parked or its sandbox is gone.

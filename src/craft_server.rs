@@ -20,6 +20,7 @@ pub fn base_url(environment: &str) -> Result<String> {
     }
     match environment {
         "stg" => Ok("https://craft-stg.monocle-ai.com".to_string()),
+        "prod" | "prd" => Ok("https://craft.monocle-ai.com".to_string()),
         env => Err(AppError::new(format!(
             "Craft server URL unknown for env '{env}'; set MONOCLE_CRAFT_URL."
         ))),
