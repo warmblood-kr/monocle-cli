@@ -14,10 +14,14 @@ use crate::origin::auth_headers;
 
 #[derive(Deserialize)]
 struct ModelInfo {
+    #[serde(deserialize_with = "crate::util::de_plain")]
     id: String,
+    #[serde(default, deserialize_with = "crate::util::de_plain_opt")]
     name: Option<String>,
+    #[serde(default, deserialize_with = "crate::util::de_plain_opt")]
     owned_by: Option<String>,
     context_window: Option<f64>,
+    #[serde(default, deserialize_with = "crate::util::de_plain_opt")]
     modality: Option<String>,
 }
 
@@ -117,10 +121,13 @@ pub fn handle_model_command(trimmed: &str, model: &mut String) -> bool {
     match parse_model_command(trimmed) {
         ModelCommand::NotModel => false,
         ModelCommand::Show => {
-            eprintln!("{}", crate::colors::dim(&format!("model: {model}")));
+            let shown = crate::util::plain(model);
+            eprintln!("{}", crate::colors::dim(&format!("model: {shown}")));
             true
         }
         ModelCommand::Switch(id) => {
+            // Strip control chars so what is shown is what is sent.
+            let id = crate::util::plain(&id);
             eprintln!("{}", crate::colors::dim(&format!("model → {id}")));
             *model = id;
             true
@@ -225,6 +232,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_switch_strips_control_chars() {
+        let mut m = "a".to_string();
+        assert!(handle_model_command("/model x\u{1b}[2Jy", &mut m));
+        assert_eq!(m, "x[2Jy");
+    }
+
+    #[test]
     fn parse_model_command_variants() {
         // Not a /model command.
         assert_eq!(parse_model_command("hello"), ModelCommand::NotModel);
@@ -310,5 +324,16 @@ mod tests {
         let models = model_ids(&["claude-sonnet-4-6"]);
         let got = fuzzy_model_candidates(&models, "CLAUDE");
         assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn model_fields_are_stripped_of_control_characters_on_parse() {
+        let body = r#"{"data":[{"id":"m\u001b[2J1","name":"n\nforged","owned_by":"o\r","modality":"t\u0007"}]}"#;
+        let parsed: ModelsResponse = serde_json::from_str(body).unwrap();
+        let m = &parsed.data[0];
+        assert_eq!(m.id, "m[2J1");
+        assert_eq!(m.name.as_deref(), Some("nforged"));
+        assert_eq!(m.owned_by.as_deref(), Some("o"));
+        assert_eq!(m.modality.as_deref(), Some("t"));
     }
 }

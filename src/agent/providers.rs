@@ -71,6 +71,7 @@ impl Message {
 /// A tool call requested by the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    #[serde(deserialize_with = "crate::util::de_plain")]
     pub id: String,
     #[serde(rename = "type", default = "function_kind")]
     pub kind: String,
@@ -83,6 +84,7 @@ fn function_kind() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
+    #[serde(deserialize_with = "crate::util::de_plain")]
     pub name: String,
     /// JSON-encoded arguments (a string, per the OpenAI wire format).
     pub arguments: String,
@@ -239,11 +241,11 @@ fn parse_response_value(data: &Value) -> Result<ChatResponse> {
         )));
     }
     let message = &data["choices"][0]["message"];
-    let content = message["content"].as_str().unwrap_or_default().to_string();
+    let content = crate::util::body(message["content"].as_str().unwrap_or_default());
     let mut tool_calls: Vec<ToolCall> =
         serde_json::from_value(message["tool_calls"].clone()).unwrap_or_default();
     ensure_tool_call_ids(&mut tool_calls);
-    let model = data["model"].as_str().map(String::from);
+    let model = data["model"].as_str().map(crate::util::plain);
     let finish_reason = data["choices"][0]["finish_reason"]
         .as_str()
         .map(String::from);
@@ -348,9 +350,11 @@ fn assemble_sse_stream(
         }
         let delta = &choice["delta"];
         if let Some(c) = delta["content"].as_str() {
+            // Stripping per delta also kills an escape sequence split across deltas.
+            let c = crate::util::body(c);
             if !c.is_empty() {
-                content.push_str(c);
-                on_delta(c);
+                content.push_str(&c);
+                on_delta(&c);
             }
         }
         if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -885,5 +889,22 @@ mod tests {
         };
         let err = provider.build_body(&req, false).unwrap_err().to_string();
         assert_eq!(err, "non-image file attachments require --responses");
+    }
+
+    #[test]
+    fn completion_content_and_stream_deltas_are_stripped() {
+        let data = serde_json::json!({"model":"m\u{1b}[2J","choices":[{"message":{"role":"assistant","content":"a\u{1b}[31mb\nc\r"}}]});
+        let resp = parse_response_value(&data).unwrap();
+        assert_eq!(resp.content, "a[31mb\nc");
+        assert_eq!(resp.model.as_deref(), Some("m[2J"));
+
+        let (resp, deltas) = run_stream(vec![
+            Ok(Some(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\\u001b[2J\\ny\"}}]}".to_string(),
+            )),
+            Ok(Some("data: [DONE]".to_string())),
+        ]);
+        assert_eq!(deltas, vec!["x[2J\ny".to_string()]);
+        assert_eq!(resp.unwrap().content, "x[2J\ny");
     }
 }

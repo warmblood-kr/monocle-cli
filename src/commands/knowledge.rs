@@ -25,7 +25,10 @@ fn connect(
         "Profile: {} ({}) — tenant {}",
         selection.profile,
         selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+        creds
+            .read()
+            .map(|c| crate::util::plain(&c.tenant_domain))
+            .unwrap_or_default()
     );
     Ok((jarvice_url, bearer))
 }
@@ -102,8 +105,8 @@ pub fn knowledge_upload_command(
             .path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
+            .map(crate::util::plain)
+            .unwrap_or_else(|| "file".to_string());
         let tag = format!("[{}/{total}] {name}", i + 1);
         // Re-running an upload must not pile up duplicates of the same document.
         if target.files().iter().any(|f| f.meta.name == name) {

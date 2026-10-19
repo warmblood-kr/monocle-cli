@@ -100,7 +100,7 @@ pub fn resolve_audio_input(
 
 /// Print an API error (status + body) to stderr and exit 1.
 pub fn write_api_error_and_exit(resp: &Resp) -> ! {
-    let body = resp.text();
+    let body = crate::util::body(&resp.text());
     eprintln!("API error {} {}", resp.status, resp.status_text);
     eprint!("{body}");
     if !body.ends_with('\n') {

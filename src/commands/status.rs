@@ -47,8 +47,12 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
 
     let now = now_ms();
 
-    eprintln!("Tenant: {} ({})", creds.tenant_domain, creds.tenant_name);
-    eprintln!("User: {}", creds.email);
+    eprintln!(
+        "Tenant: {} ({})",
+        crate::util::plain(&creds.tenant_domain),
+        crate::util::plain(&creds.tenant_name)
+    );
+    eprintln!("User: {}", crate::util::plain(&creds.email));
 
     // Access token.
     match parse_iso_ms(&creds.access_token_expires_at) {

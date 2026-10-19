@@ -16,7 +16,10 @@ impl AppError {
 
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        // Error text can embed server bodies, ids and user input: strip terminal
+        // control characters (keeping newlines/tabs) at the single place all of
+        // it is rendered.
+        f.write_str(&crate::util::body(&self.0))
     }
 }
 
@@ -35,3 +38,14 @@ impl From<std::io::Error> for AppError {
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+
+    #[test]
+    fn display_strips_terminal_controls_but_keeps_lines() {
+        let e = AppError::new("bad\x1b[2J body\nsecond\r line");
+        assert_eq!(e.to_string(), "bad[2J body\nsecond line");
+    }
+}

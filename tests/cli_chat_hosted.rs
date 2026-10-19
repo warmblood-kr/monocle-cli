@@ -228,3 +228,67 @@ fn show_tools_distinguishes_none_from_unknown() {
     let home = logged_in_home(&unknown);
     assert!(stderr(&run_piped(home.path(), &["chat", "--show-tools"])).contains("Tools: unknown"));
 }
+
+#[test]
+fn resume_prints_the_thread_id_once_up_front() {
+    let (stub, _hits) = counting_stub();
+    let home = logged_in_home(&stub);
+    // Same id as the stub's `x-thread-id`: announced before the request, not repeated after.
+    let o = run_piped(home.path(), &["chat", "--resume", "thread-1b"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        stderr(&o).matches("Thread: thread-1b").count(),
+        1,
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn malformed_resume_ids_are_rejected_without_echo_or_requests() {
+    let (stub, hits_map) = counting_stub();
+    let home = logged_in_home(&stub);
+    for bad in [
+        "a\nThread: forged",
+        "x\x1b[2Jy",
+        "a\rb",
+        "../x",
+        "t?x=1",
+        "",
+    ] {
+        let o = run_piped(home.path(), &["chat", "--resume", bad]);
+        assert_eq!(o.status.code(), Some(1), "{bad:?}");
+        let err = stderr(&o);
+        assert!(
+            err.contains("Error: Invalid chat thread ID."),
+            "{bad:?}: {err}"
+        );
+        assert!(
+            !err.contains("forged") && !err.contains('\x1b') && !err.contains('\r'),
+            "{bad:?}: {err:?}"
+        );
+        assert!(!err.contains("Thread:"), "{bad:?}: {err}");
+        assert!(stdout(&o).is_empty());
+    }
+    assert_eq!(hits(&hits_map, "/api/responses"), 0, "a request was sent");
+}
+
+#[test]
+fn reply_text_cannot_inject_terminal_escapes() {
+    let body = serde_json::json!({"choices":[{"message":{"role":"assistant",
+        "content":"안녕\u{1b}[2J\u{1b}]0;pwned\u{7}\nsecond\rline"}}]})
+    .to_string();
+    let stub = common::stub_with_headers(move |_, _, _, _| {
+        (200, body.clone(), vec![("x-thread-id", "t1".to_string())])
+    });
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        !out.contains('\u{1b}') && !out.contains('\r') && !out.contains('\u{7}'),
+        "{out:?}"
+    );
+    // newline and Korean survive
+    assert_eq!(out, "안녕[2J]0;pwned\nsecondline\n");
+}

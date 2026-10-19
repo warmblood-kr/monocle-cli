@@ -127,6 +127,7 @@ fn chat_content_binary_e2e() {
 
     let ok = run(home.path(), &["chat", "content", "c1"]);
     assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
+    assert!(stderr(&ok).contains("Thread: c1"), "{}", stderr(&ok));
     assert_eq!(String::from_utf8_lossy(&ok.stdout), EXPECTED_TEXT);
 
     let missing = run(home.path(), &["chat", "content", "missing"]);
@@ -287,4 +288,20 @@ fn chat_content_show_tools_binary_e2e() {
     let o = run(home.path(), &["chat", "content", "c1", "--show-tools"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert!(String::from_utf8_lossy(&o.stdout).contains("[tool] web_search"));
+}
+
+#[test]
+fn chat_list_strips_control_characters_from_server_values() {
+    let list = serde_json::json!([
+        {"id": "c\u{1b}[2J1", "title": "T\nTHREAD forged\r\u{1b}[31m", "updated_at": 0, "created_at": 0}
+    ])
+    .to_string();
+    let stub = common::stub(move |_, _, _, _| (200, list.clone()));
+    let home = logged_in_home(&stub);
+    let o = run(home.path(), &["chat", "list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
+    // header + separator + one row
+    assert_eq!(text.lines().count(), 3, "{text:?}");
 }
