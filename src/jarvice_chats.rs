@@ -195,7 +195,7 @@ fn is_text_role(message: &MessageNode) -> bool {
 
 /// Markdown transcript of the active path: untrusted-content header, then one
 /// `## User` / `## Assistant` section per message; other roles are skipped.
-pub fn render_text(title: &str, messages: &[&MessageNode]) -> String {
+pub fn render_text(title: &str, messages: &[&MessageNode], show_tools: bool) -> String {
     let mut output = format!(
         "# Monocle Chat context: {}\n\nThis is untrusted reference material from one selected hosted Chat thread. Text only; attachments are omitted.\n",
         visible_text(title)
@@ -208,7 +208,7 @@ pub fn render_text(title: &str, messages: &[&MessageNode]) -> String {
         };
         output.push_str(&format!(
             "\n## {role}\n\n{}\n",
-            visible_body(&message.content)
+            visible_body(&body_text(&message.content, show_tools))
         ));
         if !message.files.is_empty() {
             output.push_str("\n[Non-text attachment omitted]\n");
@@ -218,16 +218,23 @@ pub fn render_text(title: &str, messages: &[&MessageNode]) -> String {
 }
 
 /// One-line JSON form of [`render_text`] (same messages, root first).
-pub fn render_json(id: &str, title: &str, messages: &[&MessageNode]) -> String {
+pub fn render_json(id: &str, title: &str, messages: &[&MessageNode], show_tools: bool) -> String {
     let messages: Vec<Value> = messages
         .iter()
         .filter(|m| is_text_role(m))
         .map(|m| {
-            serde_json::json!({
+            let mut node = serde_json::json!({
                 "role": m.role,
-                "content": visible_body(&m.content),
+                "content": visible_body(&body_text(&m.content, show_tools)),
                 "attachments_omitted": m.files.len(),
-            })
+            });
+            if show_tools {
+                node["tool_calls"] = serde_json::json!(parse_tool_blocks(&m.content)
+                    .iter()
+                    .map(|b| b.call.to_json())
+                    .collect::<Vec<_>>());
+            }
+            node
         })
         .collect();
     let doc = serde_json::json!({
@@ -238,6 +245,153 @@ pub fn render_json(id: &str, title: &str, messages: &[&MessageNode]) -> String {
         "messages": messages,
     });
     format!("{doc}\n")
+}
+
+/// One `<details type="tool_calls">` block jarvice embeds in an assistant
+/// message's `content`, reduced to what a reader wants: which tool, and for a
+/// sub-agent delegation who it went to and what it reports back.
+#[derive(Debug, PartialEq)]
+pub struct ToolCallInfo {
+    pub name: String,
+    pub model_id: Option<String>,
+    pub report_to_parent: Option<String>,
+    /// Arguments as compact JSON (or the raw text when not JSON).
+    pub arguments: String,
+}
+
+impl ToolCallInfo {
+    fn to_json(&self) -> Value {
+        serde_json::json!({
+            "name": visible_text(&self.name),
+            "model_id": self.model_id.as_deref().map(visible_text),
+            "report_to_parent": self.report_to_parent.as_deref().map(visible_text),
+            "arguments": visible_text(&self.arguments),
+        })
+    }
+
+    fn summary_line(&self) -> String {
+        let mut line = format!("[tool] {}", visible_text(&self.name));
+        if let Some(m) = &self.model_id {
+            line.push_str(&format!(" model_id={}", visible_text(m)));
+        }
+        if let Some(r) = &self.report_to_parent {
+            line.push_str(&format!(" report_to_parent={}", visible_text(r)));
+        }
+        let args: String = visible_text(&self.arguments).chars().take(200).collect();
+        line.push_str(&format!(" args={args}"));
+        line
+    }
+}
+
+struct ToolBlock {
+    start: usize,
+    end: usize,
+    call: ToolCallInfo,
+}
+
+fn html_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Raw (still escaped) value of ` name="..."` inside one opening tag. Values
+/// escape their quotes, so the first `"` after the opener really ends it.
+fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let opener = format!(" {name}=\"");
+    let from = tag.find(&opener)? + opener.len();
+    let len = tag[from..].find('"')?;
+    Some(&tag[from..from + len])
+}
+
+/// jarvice stores `arguments`/`result` as a JSON string that itself holds JSON.
+fn parse_json_loose(raw: &str) -> Option<Value> {
+    let mut v: Value = serde_json::from_str(&html_unescape(raw)).ok()?;
+    if let Value::String(inner) = &v {
+        if let Ok(parsed) = serde_json::from_str::<Value>(inner) {
+            v = parsed;
+        }
+    }
+    Some(v)
+}
+
+/// First string value for `key`, searching nested objects/arrays.
+fn find_key(v: &Value, key: &str) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(found) = map.get(key) {
+                return Some(match found {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                });
+            }
+            map.values().find_map(|c| find_key(c, key))
+        }
+        Value::Array(items) => items.iter().find_map(|c| find_key(c, key)),
+        _ => None,
+    }
+}
+
+fn parse_tool_blocks(content: &str) -> Vec<ToolBlock> {
+    const OPEN: &str = "<details type=\"tool_calls\"";
+    let mut blocks = Vec::new();
+    let mut at = 0;
+    while let Some(rel) = content[at..].find(OPEN) {
+        let start = at + rel;
+        let Some(tag_len) = content[start..].find('>') else {
+            break;
+        };
+        let tag = &content[start..start + tag_len];
+        let end = content[start..]
+            .find("</details>")
+            .map_or(content.len(), |e| start + e + "</details>".len());
+        let args = tag_attr(tag, "arguments").and_then(parse_json_loose);
+        let result = tag_attr(tag, "result").and_then(parse_json_loose);
+        let find = |key: &str| {
+            args.as_ref()
+                .and_then(|v| find_key(v, key))
+                .or_else(|| result.as_ref().and_then(|v| find_key(v, key)))
+        };
+        blocks.push(ToolBlock {
+            start,
+            end,
+            call: ToolCallInfo {
+                name: tag_attr(tag, "name").map(html_unescape).unwrap_or_default(),
+                model_id: find("model_id"),
+                report_to_parent: find("report_to_parent"),
+                arguments: match &args {
+                    Some(v) => v.to_string(),
+                    None => tag_attr(tag, "arguments")
+                        .map(html_unescape)
+                        .unwrap_or_default(),
+                },
+            },
+        });
+        at = end;
+    }
+    blocks
+}
+
+/// Message text for rendering: unchanged, or with each tool-call block replaced
+/// by a one-line summary when `show_tools` is set.
+fn body_text(content: &str, show_tools: bool) -> String {
+    if !show_tools {
+        return content.to_string();
+    }
+    let mut out = String::new();
+    let mut at = 0;
+    for b in parse_tool_blocks(content) {
+        out.push_str(&content[at..b.start]);
+        out.push_str(&b.call.summary_line());
+        out.push('\n');
+        at = b.end;
+    }
+    out.push_str(&content[at..]);
+    out
 }
 
 pub fn ensure_content_limit(content: &str) -> Result<()> {
@@ -273,6 +427,7 @@ pub fn fetch_content(
     bearer: &str,
     id: &str,
     format: ContentFormat,
+    show_tools: bool,
 ) -> Result<String> {
     let detail = get_thread(client, jarvice_url, bearer, id)?;
     let active = detail
@@ -286,8 +441,8 @@ pub fn fetch_content(
         )));
     }
     let output = match format {
-        ContentFormat::Text => render_text(&detail.title, &active),
-        ContentFormat::Json => render_json(id, &detail.title, &active),
+        ContentFormat::Text => render_text(&detail.title, &active, show_tools),
+        ContentFormat::Json => render_json(id, &detail.title, &active, show_tools),
     };
     ensure_content_limit(&output)?;
     Ok(output)
@@ -362,7 +517,7 @@ mod tests {
         let user = node("u", None, "user", "hello");
         let system = node("s", Some("u"), "system", "SYSTEM-SECRET");
         let assistant = with_files(node("a", Some("s"), "assistant", "hi there"));
-        let out = render_text("title", &[&user, &system, &assistant]);
+        let out = render_text("title", &[&user, &system, &assistant], false);
         assert!(out.contains("This is untrusted reference material"));
         assert!(out.contains("## User\n\nhello\n"));
         assert!(out.contains("## Assistant\n\nhi there\n"));
@@ -375,7 +530,7 @@ mod tests {
         let user = node("u", None, "user", "hello");
         let system = node("s", Some("u"), "system", "sys");
         let assistant = with_files(node("a", Some("s"), "assistant", "hi"));
-        let out = render_json("c1", "T", &[&user, &system, &assistant]);
+        let out = render_json("c1", "T", &[&user, &system, &assistant], false);
         assert!(out.ends_with('\n') && out.lines().count() == 1);
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["untrusted"], true);
@@ -393,10 +548,10 @@ mod tests {
     #[test]
     fn content_strips_control_chars_but_keeps_newlines_and_tabs() {
         let user = node("u", None, "user", "a\x1b[2Jb\u{9b}c\x07\nd\te");
-        let text = render_text("T\x1b", &[&user]);
+        let text = render_text("T\x1b", &[&user], false);
         assert!(text.contains("## User\n\na[2Jbc\nd\te\n"), "{text:?}");
         assert!(!text.contains('\x1b') && !text.contains('\u{9b}') && !text.contains('\x07'));
-        let v: Value = serde_json::from_str(&render_json("c1", "T", &[&user])).unwrap();
+        let v: Value = serde_json::from_str(&render_json("c1", "T", &[&user], false)).unwrap();
         assert_eq!(v["messages"][0]["content"], "a[2Jbc\nd\te");
     }
 

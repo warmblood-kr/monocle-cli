@@ -245,6 +245,10 @@ struct ChatArgs {
     /// regardless of the verdict.
     #[arg(long = "verify-tool-firing", num_args = 0..=1)]
     verify_tool_firing: Option<Option<String>>,
+    /// After each reply, print the tools the server reports it ran
+    /// (`tools_used`) to stderr, e.g. `Tools: web_search, model_designer__delegate_model`.
+    #[arg(long = "show-tools")]
+    show_tools: bool,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -263,6 +267,7 @@ impl From<ChatArgs> for ChatOptions {
                 Some(name) => ToolFiringExpectation::Named(name),
                 None => ToolFiringExpectation::Any,
             }),
+            show_tools: a.show_tools,
         }
     }
 }
@@ -301,6 +306,7 @@ impl From<RouterChatArgs> for ChatOptions {
             resume: None,
             tool_ids: Vec::new(),
             verify_tool_firing: None,
+            show_tools: false,
         }
     }
 }
@@ -372,6 +378,11 @@ enum ChatCommand {
         id: String,
         #[arg(long, value_enum, default_value = "text")]
         format: ContentFormat,
+        /// Replace each tool-call block with a one-line summary (tool name,
+        /// sub-agent `model_id`, `report_to_parent`); with `--format json`,
+        /// add a structured `tool_calls` list per message
+        #[arg(long = "show-tools")]
+        show_tools: bool,
     },
 }
 
@@ -719,9 +730,11 @@ fn main() {
         Commands::Acp => monocle_cli::acp::serve_with_credentials(creds.clone()),
         Commands::Chat { command, args } => match command {
             Some(ChatCommand::List) => chat_list_command(&client, &creds, &selection),
-            Some(ChatCommand::Content { id, format }) => {
-                chat_content_command(&client, &creds, &selection, &id, format)
-            }
+            Some(ChatCommand::Content {
+                id,
+                format,
+                show_tools,
+            }) => chat_content_command(&client, &creds, &selection, &id, format, show_tools),
             None => chat_command(&client, &creds, args.into()),
         },
         Commands::Knowledge { command } => match command {
@@ -946,7 +959,7 @@ mod tests {
         let cli = Cli::parse_from(["monocle", "chat", "content", "c1"]);
         match cli.command {
             Commands::Chat {
-                command: Some(ChatCommand::Content { id, format }),
+                command: Some(ChatCommand::Content { id, format, .. }),
                 ..
             } => {
                 assert_eq!(id, "c1");

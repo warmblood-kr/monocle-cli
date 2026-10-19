@@ -31,8 +31,15 @@ fn jarvice_stub() -> common::Stub {
 }
 
 fn fetch(stub: &common::Stub, id: &str, format: ContentFormat) -> Result<String, String> {
-    fetch_content(&Client::new(), &stub.router_url(), "Bearer tok", id, format)
-        .map_err(|e| e.to_string())
+    fetch_content(
+        &Client::new(),
+        &stub.router_url(),
+        "Bearer tok",
+        id,
+        format,
+        false,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[test]
@@ -178,4 +185,104 @@ fn invalid_chat_ids_are_rejected_before_any_request() {
         assert!(!err.contains(bad), "raw id echoed: {err}");
     }
     assert_eq!(hits.load(Ordering::SeqCst), 0, "stub received requests");
+}
+
+// ── --show-tools ─────────────────────────────────────────────────────────────
+
+/// Shape jarvice really stores: attribute values HTML-escaped, `arguments` and
+/// `result` a JSON string that itself holds JSON.
+const TOOL_BLOCKS: &str = r#"Looking it up.
+<details type="tool_calls" done="true" id="call_1" name="web_search" arguments="&quot;{\&quot;query\&quot;:\&quot;a &amp; b\&quot;}&quot;" result="&quot;{}&quot;" files="">
+<summary>Tool Executed</summary>
+</details>
+<details type="tool_calls" done="true" id="call_2" name="model_designer__delegate_model" arguments="&quot;{\&quot;model_id\&quot;:\&quot;law-search\&quot;,\&quot;task\&quot;:\&quot;find it\&quot;}&quot;" result="&quot;{\&quot;report_to_parent\&quot;:\&quot;found 3 items\&quot;}&quot;" files="">
+<summary>Tool Executed</summary>
+</details>
+Done."#;
+
+fn tools_stub() -> common::Stub {
+    let chat = serde_json::json!({
+        "id": "c1", "title": "T",
+        "chat": {"history": {"currentId": "m2", "messages": {
+            "m1": {"id": "m1", "parentId": null, "role": "user", "content": "hi"},
+            "m2": {"id": "m2", "parentId": "m1", "role": "assistant", "content": TOOL_BLOCKS},
+        }}}
+    })
+    .to_string();
+    common::stub(move |_, method, url, _| match (method, url) {
+        ("GET", "/api/v1/chats/c1") => (200, chat.clone()),
+        _ => (401, NOT_FOUND_BODY.into()),
+    })
+}
+
+#[test]
+fn show_tools_summarizes_tool_calls_in_text() {
+    let stub = tools_stub();
+    let out = fetch_content(
+        &Client::new(),
+        &stub.router_url(),
+        "Bearer tok",
+        "c1",
+        ContentFormat::Text,
+        true,
+    )
+    .unwrap();
+    assert!(!out.contains("<details"), "{out}");
+    assert!(
+        out.contains("Looking it up.\n[tool] web_search args={\"query\":\"a & b\"}\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("[tool] model_designer__delegate_model model_id=law-search report_to_parent=found 3 items args="),
+        "{out}"
+    );
+    assert!(out.trim_end().ends_with("Done."), "{out}");
+}
+
+#[test]
+fn default_output_is_unchanged_without_show_tools() {
+    let stub = tools_stub();
+    let out = fetch_content(
+        &Client::new(),
+        &stub.router_url(),
+        "Bearer tok",
+        "c1",
+        ContentFormat::Text,
+        false,
+    )
+    .unwrap();
+    assert!(out.contains("<details type=\"tool_calls\""), "{out}");
+    assert!(!out.contains("[tool]"), "{out}");
+}
+
+#[test]
+fn show_tools_json_has_structured_tool_calls() {
+    let stub = tools_stub();
+    let out = fetch_content(
+        &Client::new(),
+        &stub.router_url(),
+        "Bearer tok",
+        "c1",
+        ContentFormat::Json,
+        true,
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let calls = &v["messages"][1]["tool_calls"];
+    assert_eq!(calls[0]["name"], "web_search");
+    assert_eq!(calls[0]["model_id"], serde_json::Value::Null);
+    assert_eq!(calls[1]["name"], "model_designer__delegate_model");
+    assert_eq!(calls[1]["model_id"], "law-search");
+    assert_eq!(calls[1]["report_to_parent"], "found 3 items");
+    // user message has none
+    assert_eq!(v["messages"][0]["tool_calls"], serde_json::json!([]));
+}
+
+#[test]
+fn chat_content_show_tools_binary_e2e() {
+    let stub = tools_stub();
+    let home = logged_in_home(&stub);
+    let o = run(home.path(), &["chat", "content", "c1", "--show-tools"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("[tool] web_search"));
 }

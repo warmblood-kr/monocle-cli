@@ -184,3 +184,47 @@ fn root_help_chat_line() {
         stdout(&out)
     );
 }
+
+// ── --show-tools ─────────────────────────────────────────────────────────────
+
+fn tools_stub(body: &'static str) -> common::Stub {
+    common::stub_with_headers(move |_, _, _, _| {
+        (
+            200,
+            body.into(),
+            vec![("x-thread-id", "thread-t".to_string())],
+        )
+    })
+}
+
+const WITH_TOOLS: &str = r#"{"choices":[{"message":{"role":"assistant","content":"hosted answer"}}],"tools_used":[{"name":"web_search"},{"name":"model_designer__delegate_model"}]}"#;
+const EMPTY_TOOLS: &str =
+    r#"{"choices":[{"message":{"role":"assistant","content":"hosted answer"}}],"tools_used":[]}"#;
+
+#[test]
+fn show_tools_prints_tool_names_to_stderr_only() {
+    let stub = tools_stub(WITH_TOOLS);
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat", "--show-tools"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{ANSWER}\n"));
+    assert!(
+        stderr(&o).contains("Tools: web_search, model_designer__delegate_model"),
+        "{}",
+        stderr(&o)
+    );
+    // without the flag nothing is added
+    let plain = run_piped(home.path(), &["chat"]);
+    assert!(!stderr(&plain).contains("Tools:"), "{}", stderr(&plain));
+}
+
+#[test]
+fn show_tools_distinguishes_none_from_unknown() {
+    let none = tools_stub(EMPTY_TOOLS);
+    let home = logged_in_home(&none);
+    assert!(stderr(&run_piped(home.path(), &["chat", "--show-tools"])).contains("Tools: none"));
+
+    let unknown = tools_stub(RESPONSES_REPLY);
+    let home = logged_in_home(&unknown);
+    assert!(stderr(&run_piped(home.path(), &["chat", "--show-tools"])).contains("Tools: unknown"));
+}
