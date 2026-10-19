@@ -328,7 +328,11 @@ pub fn craft_session_command(
             if *json {
                 print_json(&r)?;
             }
-            eprintln!("Deleted session {id}.");
+            if r["recovered"].as_bool() == Some(true) {
+                eprintln!("Session {id} is gone (the server answered HTTP 500 but the session no longer exists).");
+            } else {
+                eprintln!("Deleted session {id}.");
+            }
         }
     }
     Ok(())

@@ -13,18 +13,66 @@ use crate::jarvice_chats::is_valid_chat_id;
 use crate::net::{Client, Resp};
 use crate::util::percent_encode;
 
-/// Craft server for the selected environment: `MONOCLE_CRAFT_URL` wins.
-pub fn base_url(environment: &str) -> Result<String> {
-    if let Ok(url) = std::env::var("MONOCLE_CRAFT_URL") {
-        return Ok(url.trim_end_matches('/').to_string());
-    }
+const STG_HOST: &str = "craft-stg.monocle-ai.com";
+const PRD_HOST: &str = "craft.monocle-ai.com";
+
+fn env_host(environment: &str) -> Option<&'static str> {
     match environment {
-        "stg" => Ok("https://craft-stg.monocle-ai.com".to_string()),
-        "prod" | "prd" => Ok("https://craft.monocle-ai.com".to_string()),
-        env => Err(AppError::new(format!(
-            "Craft server URL unknown for env '{env}'; set MONOCLE_CRAFT_URL."
-        ))),
+        "stg" => Some(STG_HOST),
+        "prod" | "prd" => Some(PRD_HOST),
+        _ => None,
     }
+}
+
+/// Host part of an `http(s)://host[:port]/...` URL (no userinfo allowed).
+fn url_host(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains('@') {
+        return None;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next()?,
+        None => authority.split(':').next()?,
+    };
+    Some((scheme, host))
+}
+
+/// Craft server for the selected environment. `MONOCLE_CRAFT_URL` overrides it,
+/// but the bearer must never cross environments: a known craft host has to match
+/// the selected env, and any other host must be http(s) loopback (tests/local dev).
+pub fn base_url(environment: &str) -> Result<String> {
+    let Ok(url) = std::env::var("MONOCLE_CRAFT_URL") else {
+        return env_host(environment)
+            .map(|h| format!("https://{h}"))
+            .ok_or_else(|| {
+                AppError::new(format!(
+                    "Craft server URL unknown for env '{environment}'; set MONOCLE_CRAFT_URL."
+                ))
+            });
+    };
+    let url = url.trim_end_matches('/').to_string();
+    let refuse = |why: &str| AppError::new(format!("Refusing MONOCLE_CRAFT_URL: {why}."));
+    let (scheme, host) = url_host(&url).ok_or_else(|| refuse("not a valid http(s) URL"))?;
+    match host {
+        STG_HOST | PRD_HOST => {
+            if env_host(environment) != Some(host) {
+                return Err(refuse(&format!(
+                    "host {host} does not belong to env '{environment}'"
+                )));
+            }
+            if scheme != "https" {
+                return Err(refuse("known Craft hosts require https"));
+            }
+        }
+        "localhost" | "127.0.0.1" | "::1" if scheme == "http" || scheme == "https" => {}
+        _ => {
+            return Err(refuse(
+                "only the env's Craft host or a loopback address is allowed",
+            ))
+        }
+    }
+    Ok(url)
 }
 
 fn checked_id(id: &str) -> Result<&str> {
@@ -124,8 +172,31 @@ pub fn download(
     Ok(check("Downloading file", resp)?.bytes().to_vec())
 }
 
+/// `DELETE /v1/sessions/{id}`. `{"ok":false}` is a failure, and on HTTP 500 the
+/// list is re-checked: a session that is gone anyway counts as deleted
+/// (`"recovered": true` in the returned value), one still present is an error.
 pub fn delete(client: &Client, base: &str, bearer: &str, id: &str) -> Result<Value> {
     let url = format!("{base}/v1/sessions/{}", checked_id(id)?);
-    let resp = check("Deleting session", client.delete(&url, &auth(bearer))?)?;
-    Ok(resp.json().unwrap_or(Value::Null))
+    let resp = client.delete(&url, &auth(bearer))?;
+    if resp.status == 500 {
+        let present = list_sessions(client, base, bearer, None)?
+            .iter()
+            .any(|v| v["session_id"].as_str() == Some(id));
+        return if present {
+            Err(AppError::new(
+                "Deleting session failed: HTTP 500; the session is still present.",
+            ))
+        } else {
+            Ok(serde_json::json!({"ok": true, "recovered": true}))
+        };
+    }
+    let v: Value = check("Deleting session", resp)?
+        .json()
+        .unwrap_or(Value::Null);
+    if v["ok"].as_bool() == Some(false) {
+        return Err(AppError::new(
+            "Deleting session failed: the server reported ok=false.",
+        ));
+    }
+    Ok(v)
 }

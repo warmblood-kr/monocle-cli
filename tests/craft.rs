@@ -32,7 +32,7 @@ fn reply(method: &str, url: &str) -> (u16, Vec<u8>) {
         (_, u, _) if u.starts_with("/api/") => (404, json(r#"{"detail":"SECRET"}"#)),
         // ── openworker lane (craft server) ──
         ("GET", "/v1/sessions", _) => (200, json(
-            r#"{"sessions":[{"session_id":"cli-stg-enforce-t1792437390","title":"Craft one","workspace":"/w","updated_at":"2024-05-01T10:00:00Z","messages":3}]}"#)),
+            r#"{"sessions":[{"session_id":"cli-stg-enforce-t1792437390","title":"Craft one","workspace":"/w","updated_at":"2024-05-01T10:00:00Z","messages":3},{"session_id":"stuck","title":"S","workspace":"/w","updated_at":"2024-05-01T11:00:00Z","messages":0}]}"#)),
         ("GET", "/v1/sessions?workspace=%2Fmy%20ws", _) => (200, json(r#"{"sessions":[]}"#)),
         ("GET", "/v1/sessions/cli-stg-enforce-t1792437390/messages", _) => (200, json(
             r#"{"messages":[{"role":"system","content":"SYS"},{"role":"user","content":"hello\nthere"},{"role":"assistant","text":"hi"},{"role":"tool","kind":"x"}]}"#)),
@@ -44,6 +44,9 @@ fn reply(method: &str, url: &str) -> (u16, Vec<u8>) {
         ("GET", "/v1/sessions/quota/messages", _) => (429, json(r#"{"error":"quota_exceeded"}"#)),
         ("GET", "/v1/sessions/nope/artifacts/read?path=x&download=1", _) => (404, json(r#"{"error":"SECRET"}"#)),
         ("DELETE", "/v1/sessions/cli-stg-enforce-t1792437390", _) => (200, json(r#"{"ok":true}"#)),
+        ("DELETE", "/v1/sessions/del-false", _) => (200, json(r#"{"ok":false}"#)),
+        ("DELETE", "/v1/sessions/del-gone", _) => (500, json(r#"{"error":"SECRET"}"#)),
+        ("DELETE", "/v1/sessions/stuck", _) => (500, json(r#"{"error":"SECRET"}"#)),
         _ => (404, json(r#"{"error":"SECRET"}"#)),
     }
 }
@@ -426,5 +429,75 @@ fn missing_craft_url_names_the_environment() {
         monocle_cli::craft_server::base_url("stg").unwrap(),
         "https://craft-stg.monocle-ai.com"
     );
+    assert!(requests(&log).is_empty());
+}
+
+#[test]
+fn openworker_delete_failure_modes() {
+    let (addr, log, home) = setup();
+    let o = ow(&addr, home.path(), &["delete", "del-false"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        err(&o).contains("ok=false") && !err(&o).contains("Deleted"),
+        "{}",
+        err(&o)
+    );
+
+    // 500 + not in the list afterwards → reported as gone, exit 0.
+    let o = ow(&addr, home.path(), &["delete", "del-gone"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        err(&o).contains("is gone") && !err(&o).contains("SECRET"),
+        "{}",
+        err(&o)
+    );
+    assert!(requests(&log)
+        .iter()
+        .any(|r| r.starts_with("GET /v1/sessions ")));
+
+    // 500 + still in the list → error naming the actual state.
+    let o = ow(&addr, home.path(), &["delete", "stuck"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        err(&o).contains("still present") && !err(&o).contains("SECRET"),
+        "{}",
+        err(&o)
+    );
+}
+
+#[test]
+fn craft_url_override_must_match_env() {
+    let (_, log, home) = setup();
+    for (env, url, want) in [
+        (
+            "stg",
+            "https://craft.monocle-ai.com",
+            "does not belong to env 'stg'",
+        ),
+        (
+            "prod",
+            "https://craft-stg.monocle-ai.com",
+            "does not belong to env 'prod'",
+        ),
+        ("stg", "http://craft-stg.monocle-ai.com", "require https"),
+        (
+            "stg",
+            "https://evil.example.com",
+            "only the env's Craft host",
+        ),
+        (
+            "stg",
+            "https://craft-stg.monocle-ai.com@evil.example.com",
+            "not a valid",
+        ),
+    ] {
+        let o = run(
+            home.path(),
+            Some(url),
+            &["--env", env, "craft", "session", "list"],
+        );
+        assert_eq!(o.status.code(), Some(1), "{url}");
+        assert!(err(&o).contains(want), "{url}: {}", err(&o));
+    }
     assert!(requests(&log).is_empty());
 }
