@@ -275,7 +275,12 @@ pub fn knowledge_replace_command(
         let _ = kb::delete_file(client, &url, &bearer, &new);
         return Err(e);
     }
-    kb::remove_file(client, &url, &bearer, &kid, &old)?;
+    kb::remove_file(client, &url, &bearer, &kid, &old).map_err(|e| {
+        AppError::new(format!(
+            "{e} The new '{name}' ({new}) is attached, but the old one ({old}) is still attached too, \
+             so the collection now holds both versions. Run `monocle knowledge remove {collection} {old}` to drop the old one."
+        ))
+    })?;
     println!("{new}\t{name}");
     eprintln!("Replaced '{name}' ({old} -> {new}).");
     Ok(())
