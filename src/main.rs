@@ -16,9 +16,10 @@ use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::knowledge::{
-    knowledge_content_command, knowledge_create_command, knowledge_delete_command,
-    knowledge_list_command, knowledge_remove_command, knowledge_replace_command,
-    knowledge_reprocess_command, knowledge_update_command, knowledge_upload_command,
+    knowledge_ask_command, knowledge_content_command, knowledge_create_command,
+    knowledge_delete_command, knowledge_list_command, knowledge_remove_command,
+    knowledge_replace_command, knowledge_reprocess_command, knowledge_update_command,
+    knowledge_upload_command,
 };
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::model_list::model_list_command;
@@ -61,7 +62,7 @@ Commands:
 
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
-    knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, delete)
+    knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -140,7 +141,7 @@ enum Commands {
         #[command(flatten)]
         args: ChatArgs,
     },
-    /// Manage knowledge collections (create, upload, list, update, remove, replace, content, delete)
+    /// Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommand,
@@ -449,6 +450,20 @@ enum KnowledgeCommand {
         collection: String,
         /// File name or id within the collection
         file: String,
+    },
+    /// Ask a question with a collection attached; prints the answer (stdout) and
+    /// the files its retrieved passages came from (stderr). Costs one model turn; not saved to your threads
+    Ask {
+        /// Collection name or id
+        collection: String,
+        /// The question
+        question: String,
+        /// Model ID to use
+        #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
+        model: String,
+        /// Print {"answer", "sources"} as JSON on stdout
+        #[arg(long)]
+        json: bool,
     },
     /// Delete a collection and all of its files
     Delete {
@@ -817,6 +832,20 @@ fn main() {
             KnowledgeCommand::Content { collection, file } => {
                 knowledge_content_command(&client, &creds, &selection, &collection, &file)
             }
+            KnowledgeCommand::Ask {
+                collection,
+                question,
+                model,
+                json,
+            } => knowledge_ask_command(
+                &client,
+                &creds,
+                &selection,
+                &collection,
+                &question,
+                &model,
+                json,
+            ),
             KnowledgeCommand::Delete { collection } => {
                 knowledge_delete_command(&client, &creds, &selection, &collection)
             }

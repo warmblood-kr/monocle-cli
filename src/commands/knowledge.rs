@@ -312,3 +312,34 @@ pub fn knowledge_content_command(
     let _ = write!(std::io::stdout(), "{text}");
     Ok(())
 }
+
+/// `monocle knowledge ask COLLECTION QUESTION` — the answer on stdout, the files it
+/// was grounded in on stderr (or both as JSON with `--json`).
+pub fn knowledge_ask_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    collection: &str,
+    question: &str,
+    model: &str,
+    json: bool,
+) -> Result<()> {
+    let (url, bearer) = connect(client, creds, selection)?;
+    let all = kb::list_knowledge(client, &url, &bearer, false)?;
+    let target = kb::find(&all, collection)?;
+    let a = kb::ask(client, &url, &bearer, model, target, question)?;
+    if json {
+        println!("{}", serde_json::to_string(&a)?);
+        return Ok(());
+    }
+    println!("{}", a.answer.trim_end());
+    if a.sources.is_empty() {
+        eprintln!("Sources: none (the answer was not grounded in the collection).");
+    } else {
+        eprintln!("Sources:");
+        for c in &a.sources {
+            eprintln!("  {} ({} passage(s))", c.name, c.passages);
+        }
+    }
+    Ok(())
+}

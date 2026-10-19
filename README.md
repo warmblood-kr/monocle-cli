@@ -65,6 +65,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle knowledge replace <collection> <file>` | Replace the same-named file with a new local version (new one is attached before the old one is removed). Prints `file-id<TAB>name` |
 | `monocle knowledge reprocess <collection> <file> [--force]` | Re-extract the file's text on the server and re-index it in the collection |
 | `monocle knowledge content <collection> <file>` | Print the text the server extracted from the file (to check parsing before testing search) |
+| `monocle knowledge ask <collection> <question> [--model M] [--json]` | Ask one question with the collection attached (one model turn, not saved to your threads). Answer on stdout; the files it was grounded in on stderr (or `{"answer","sources"}` with `--json`). jarvice has no retrieval endpoint, so this is the only way to see whether stored content is used |
 | `monocle knowledge delete <collection>` | Delete a collection **and its files** (kept if any file can't be deleted, so you can retry) |
 | `monocle router models` | List available models from the router (with modality) |
 | `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat via the router's plain `/v1/chat/completions` (REPL or stdin); no Responses-API options |

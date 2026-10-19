@@ -461,3 +461,108 @@ pub fn delete_knowledge_and_files(
     }
     Ok(kb.files().len())
 }
+
+/// One retrieved source the server cited for an answer.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct Cited {
+    pub name: String,
+    /// How many retrieved passages came from it.
+    pub passages: usize,
+}
+
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+pub struct Answer {
+    pub answer: String,
+    pub sources: Vec<Cited>,
+}
+
+/// Fold one decoded SSE/JSON payload into `out`: content deltas append to the
+/// answer, a top-level `sources` event (jarvice emits it before the first token)
+/// adds the files the retrieved passages came from.
+fn absorb(v: &Value, out: &mut Answer) {
+    if let Some(text) = v["choices"][0]["delta"]["content"]
+        .as_str()
+        .or_else(|| v["choices"][0]["message"]["content"].as_str())
+    {
+        out.answer.push_str(text);
+    }
+    // For a collection, `source` is the collection itself; the cited files are the
+    // per-passage `metadata` entries (verified on stg).
+    for s in v["sources"].as_array().into_iter().flatten() {
+        for m in s["metadata"].as_array().into_iter().flatten() {
+            let name = m["name"].as_str().or(m["source"].as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            match out.sources.iter_mut().find(|c| c.name == name) {
+                Some(c) => c.passages += 1,
+                None => out.sources.push(Cited {
+                    name: name.to_string(),
+                    passages: 1,
+                }),
+            }
+        }
+    }
+}
+
+/// Parse a chat-completions SSE body line by line.
+pub fn parse_answer(mut next_line: impl FnMut() -> Result<Option<String>>) -> Result<Answer> {
+    let mut out = Answer::default();
+    while let Some(line) = next_line()? {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(data) {
+            absorb(&v, &mut out);
+        }
+    }
+    Ok(out)
+}
+
+/// Ask `model` a question with the collection attached
+/// (`POST /api/chat/completions`, `files: [{type: "collection"}]`, streamed).
+/// jarvice has no retrieval REST, so this chat turn is the only place a
+/// collection's content is observable: the answer plus the files it was grounded
+/// in. Headless (no `chat_id`), so nothing is saved to the user's thread list.
+/// One attempt only — the turn costs tokens.
+pub fn ask(
+    client: &Client,
+    jarvice_url: &str,
+    bearer: &str,
+    model: &str,
+    kb: &Knowledge,
+    question: &str,
+) -> Result<Answer> {
+    let body = json!({
+        "model": model,
+        "stream": true,
+        "messages": [{ "role": "user", "content": question }],
+        "files": [{ "type": "collection", "id": checked_id(&kb.id)?, "name": kb.name }],
+    });
+    let mut stream = client.post_json_stream_once(
+        &format!("{jarvice_url}/api/chat/completions"),
+        &auth_headers(bearer),
+        &body,
+    )?;
+    if !stream.ok() {
+        let status = stream.status;
+        let code = serde_json::from_str::<Value>(&stream.read_all())
+            .ok()
+            .and_then(|v| v["detail"]["code"].as_str().map(str::to_string));
+        return Err(AppError::new(match code {
+            Some(c) => format!("Asking the collection failed: HTTP {status} ({c})."),
+            None => format!("Asking the collection failed: HTTP {status}."),
+        }));
+    }
+    if !stream.is_event_stream() {
+        let v: Value = serde_json::from_str(&stream.read_all())?;
+        let mut out = Answer::default();
+        absorb(&v, &mut out);
+        return Ok(out);
+    }
+    parse_answer(|| stream.next_line())
+}
