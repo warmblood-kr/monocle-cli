@@ -1033,7 +1033,7 @@ fn timings_line_has_ordered_fields_and_leaves_stdout_alone() {
     n("connect_ms");
     assert!(t["delegation_ms"].is_null(), "--no-delegation: {t}");
     assert!(t["session_create_ms"].is_null());
-    assert_eq!(t["run_id"].as_str().unwrap().len(), 16);
+    assert_eq!(t["run_id"].as_str().unwrap().len(), 32);
     assert!(t["started_at"].as_str().unwrap().ends_with('Z'));
     // Only numbers/ids/lane: no token, prompt or answer text.
     let line = err(&timed);

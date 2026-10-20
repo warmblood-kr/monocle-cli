@@ -29,7 +29,16 @@ fn scheme_for_host(host: &str) -> &'static str {
     }
 }
 
+/// Allow `traceparent` to this env's Monocle hosts (tenant + router).
+fn register_trace_hosts(creds: &CredentialsData) {
+    crate::trace::register_host(&creds.tenant_domain);
+    if let Some(url) = &creds.router_url {
+        crate::trace::register_host(url);
+    }
+}
+
 pub fn router_url_for(creds: &CredentialsData) -> String {
+    register_trace_hosts(creds);
     if let Some(url) = &creds.router_url {
         return url.clone();
     }
@@ -46,6 +55,7 @@ pub fn router_url_for(creds: &CredentialsData) -> String {
 /// Deliberately ignores `creds.router_url` (that's chat-proxy's address, a
 /// different host — conflating the two has been a recurring trap here).
 pub fn jarvice_url_for(creds: &CredentialsData) -> String {
+    register_trace_hosts(creds);
     format!(
         "{}://{}",
         scheme_for_host(&creds.tenant_domain),
