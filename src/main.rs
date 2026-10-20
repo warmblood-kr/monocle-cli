@@ -197,9 +197,10 @@ enum Commands {
         command: WorkspaceModelCommand,
     },
     /// Inspect Craft sessions, workspaces and agents (session, workspace, agent)
+    #[command(after_long_help = CRAFT_EXAMPLES)]
     Craft {
         /// Craft backend: the Craft server (openworker) or jarvice agent sessions (sdk)
-        #[arg(long, value_enum, default_value = "openworker")]
+        #[arg(long, value_enum, default_value = "openworker", global = true)]
         lane: Lane,
         #[command(subcommand)]
         command: CraftCommand,
@@ -471,6 +472,23 @@ enum ChatCommand {
     },
 }
 
+const CRAFT_EXAMPLES: &str = "\
+Examples:
+  monocle craft turn \"summarize this repo\"           # default lane: Craft server (OpenWorker)
+  monocle craft --lane sdk turn \"hello\"              # Claude-SDK lane (jarvice agent sandbox)
+  monocle craft turn --lane sdk --session ID \"more\"  # --lane works before or after the subcommand
+  monocle craft session list                          # sessions on the chosen lane";
+
+const TURN_EXAMPLES: &str = "\
+Examples:
+  Choose the lane with --lane (before or after `turn`):
+    monocle craft turn \"hello\"                  # openworker (default): Craft server
+    monocle craft turn --lane sdk \"hello\"       # sdk: Claude-SDK lane via the jarvice agent sandbox
+
+  Continue a conversation with --session ID (the ID is printed on stderr after each turn):
+    monocle craft turn --session ID \"and then?\"
+    monocle craft turn --lane sdk --session ID \"and then?\"";
+
 #[derive(Subcommand)]
 enum CraftCommand {
     /// Manage sessions
@@ -489,6 +507,7 @@ enum CraftCommand {
         command: AgentCommand,
     },
     /// Send one message to a Craft agent and print its answer (both lanes; --workspace, --agent, --approve and --no-delegation apply to openworker only)
+    #[command(after_long_help = TURN_EXAMPLES)]
     Turn {
         /// The message to send
         text: String,
@@ -1163,6 +1182,7 @@ fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), 
 
 fn main() {
     let cli = Cli::parse();
+    let (explicit_profile, explicit_env) = (cli.profile.clone(), cli.env.clone());
     let client = Client::new();
     let home = util::home_dir();
     let config = Config::new();
@@ -1466,6 +1486,11 @@ fn main() {
                 no_delegation,
                 title,
                 TurnOpts {
+                    hint_prefix: monocle_cli::commands::craft_turn::hint_prefix(
+                        lane == Lane::Sdk,
+                        explicit_profile.as_deref(),
+                        explicit_env.as_deref(),
+                    ),
                     text,
                     session,
                     workspace,
@@ -1665,6 +1690,22 @@ fn run_image(client: &Client, creds: &Credentials, command: ImageCommands) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn craft_lane_parses_in_every_position() {
+        let lane = |args: &[&str]| match Cli::parse_from(args).command {
+            Commands::Craft { lane, .. } => lane,
+            _ => panic!("expected Craft command"),
+        };
+        for args in [
+            &["monocle", "craft", "--lane", "sdk", "turn", "x"][..],
+            &["monocle", "craft", "turn", "--lane", "sdk", "x"][..],
+            &["monocle", "craft", "session", "list", "--lane", "sdk"][..],
+        ] {
+            assert_eq!(lane(args), Lane::Sdk, "{args:?}");
+        }
+        assert_eq!(lane(&["monocle", "craft", "turn", "x"]), Lane::Openworker);
+    }
 
     #[test]
     fn chat_file_flag_repeats_into_vec() {
