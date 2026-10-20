@@ -8,7 +8,7 @@ use crate::net::Client;
 use crate::profiles::Selection;
 use crate::util::{now_ms, parse_iso_ms};
 
-fn format_remaining(ms: i64) -> String {
+pub(crate) fn format_remaining(ms: i64) -> String {
     let total_minutes = ms / (1000 * 60);
     let days = total_minutes / (60 * 24);
     let hours = (total_minutes % (60 * 24)) / 60;
