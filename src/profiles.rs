@@ -27,6 +27,11 @@ impl Selection {
     }
 }
 
+/// Shared wording for a profile name that was never logged in.
+pub fn unknown_profile_message(profile: &str) -> String {
+    format!("Unknown profile '{profile}'. Log in first: monocle login --profile {profile}")
+}
+
 pub fn validate_profile(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
@@ -204,9 +209,7 @@ pub fn use_profile(config: &Config, profile: &str) -> Result<()> {
     validate_profile(profile)?;
     let mut data = config.read_strict()?;
     if profile != DEFAULT_PROFILE && !data.profiles.contains_key(profile) {
-        return Err(AppError::new(format!(
-            "Unknown profile '{profile}'. Log in with --profile {profile} first."
-        )));
+        return Err(AppError::new(unknown_profile_message(profile)));
     }
     data.default_profile = Some(profile.to_string());
     config.write(&data)

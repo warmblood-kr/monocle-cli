@@ -163,7 +163,7 @@ fn read_one_shot_input(stdin_is_tty: bool, files: &[String]) -> Result<Option<Re
     // Image-only/file-only messages are valid — only bail when text AND
     // every kind of attachment are empty.
     if cleaned_text.is_empty() && images.is_empty() && file_attachments.is_empty() {
-        eprintln!("No input provided via stdin.");
+        eprintln!("No input provided via stdin. {PIPE_HINT}");
         std::process::exit(1);
     }
 
@@ -462,13 +462,11 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     let mut provider = MonocleProvider::new(token, router_url.clone());
 
     // Interactive REPL.
-    eprintln!("Monocle Chat (model: {model})");
+    eprintln!("{}", repl_banner(&model));
     eprintln!("Router: {router_url}");
     if let Some(sp) = &system_prompt {
         eprintln!("System prompt loaded ({} chars)", sp.chars().count());
     }
-    eprintln!("{}", chat_help_text());
-    eprintln!("---");
     eprintln!("{}", mode_banner("chat", crate::colors::cyan));
 
     // Separate history file from `monocle agent`'s — the two REPLs' histories
@@ -617,9 +615,9 @@ pub(crate) fn resolve_jarvice(
     creds: &Credentials,
 ) -> Result<(AuthSession, String, String)> {
     let session = get_access_token(client, creds);
-    let stored = creds.read().ok_or_else(|| {
-        crate::error::AppError::new("Not logged in. Run `monocle login --tenant <domain>` first.")
-    })?;
+    let stored = creds
+        .read()
+        .ok_or_else(|| crate::error::AppError::new(creds.not_logged_in()))?;
     let jarvice_url = jarvice_url_for(&stored);
     let bearer = format!("Bearer {}", session.token);
     Ok((session, jarvice_url, bearer))
@@ -833,7 +831,7 @@ pub(crate) fn tool_firing_verification(
 
     if !tools_used_present {
         return ToolFiringVerdict::CannotVerify(
-            "? tool-firing verification: CANNOT VERIFY — this jarvice did not report `tools_used`, so it predates the field (jarvice#1441). Absence is not evidence that no tool ran; deploy the server side first, then re-run."
+            "? tool-firing verification: CANNOT VERIFY — this server did not report `tools_used`, so it predates the field. Absence is not evidence that no tool ran; deploy the server side first, then re-run."
                 .to_string(),
         );
     }
@@ -958,7 +956,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
 
     if let Some((text, images, files)) = one_shot_input {
         eprintln!("Using model: {model}");
-        eprintln!("jarvice: {jarvice_url}");
+        eprintln!("Tenant: {}", tenant_host(&jarvice_url));
         let mut redactor = crate::commands::redact::Redactor::new(&[]);
         redactor.add_secret(&session.token);
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
@@ -1030,6 +1028,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         }
         if let Some(id) = reply.thread_id {
             eprintln!("Thread: {id}");
+            eprintln!("{}", resume_hint(&id));
         }
         if options.show_tools {
             eprintln!(
@@ -1061,11 +1060,8 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     }
 
     // Interactive REPL.
-    eprintln!("Monocle Chat — Responses API (model: {model})");
-    eprintln!("jarvice: {jarvice_url}");
-    eprintln!("{}", chat_help_text());
-    eprintln!("The server owns this conversation's thread — no local history is resent.");
-    eprintln!("---");
+    eprintln!("{}", repl_banner(&model));
+    eprintln!("Tenant: {}", tenant_host(&jarvice_url));
 
     let history_path = home_dir().join(".monocle").join("chat_history");
     // Not a `Vec<Message>` like `run_completions_chat`'s `convo` — the server
@@ -1123,7 +1119,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
 
     eprintln!("{}", mode_banner("chat", crate::colors::cyan));
 
-    run_repl(helper, history_path, PROMPT, |trimmed| {
+    let repl_result = run_repl(helper, history_path, PROMPT, |trimmed| {
         if let Some(control) =
             dispatch_chat_command(trimmed, &mut model, &diagnostics, &mut diag_always_on, &cfg)
         {
@@ -1229,7 +1225,29 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
             }
         }
         Ok(LoopControl::Continue)
-    })
+    });
+    if let Some(id) = &thread_id {
+        eprintln!("{}", resume_hint(id));
+    }
+    repl_result
+}
+
+pub const PIPE_HINT: &str = "Pipe the prompt: echo \"hi\" | monocle chat";
+
+/// First REPL line: what this is, how to get help, how to leave.
+fn repl_banner(model: &str) -> String {
+    format!("Monocle Chat ({model}) · /help for commands · Ctrl+D to exit")
+}
+
+/// `https://host[:port]/` -> `host[:port]`: the tenant, not the URL.
+fn tenant_host(url: &str) -> &str {
+    url.split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .trim_end_matches('/')
+}
+
+fn resume_hint(id: &str) -> String {
+    format!("Resume: monocle chat --resume {id}")
 }
 
 /// Render `monocle chat list`'s table to stdout — this is a terminal

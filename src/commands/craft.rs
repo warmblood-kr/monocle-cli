@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::auth::get_access_token;
 use crate::commands::chat::resolve_jarvice;
 use crate::commands::craft_sdk_turn::{self, SdkTurn};
-use crate::commands::craft_turn::{continue_hint, is_queue_full, run_turn_id, Target, TurnOpts};
+use crate::commands::craft_turn::{is_queue_full, run_turn_id, Target, TurnOpts};
 use crate::commands::knowledge::print_table;
 use crate::craft_server as craft;
 use crate::craft_state::LastSession;
@@ -40,6 +40,7 @@ pub enum SessionCommand {
     },
     /// Show one session's details
     Show {
+        /// Session ID (see `monocle craft session list`)
         id: String,
         /// Print the raw session as JSON
         #[arg(long)]
@@ -47,6 +48,7 @@ pub enum SessionCommand {
     },
     /// Print a session's history (`--json` for the whole server response)
     History {
+        /// Session ID (see `monocle craft session list`)
         id: String,
         /// Include system messages (openworker lane)
         #[arg(long)]
@@ -56,6 +58,7 @@ pub enum SessionCommand {
     },
     /// List a session's files
     Files {
+        /// Session ID (see `monocle craft session list`)
         id: String,
         /// Folder to list (sdk lane; the server default applies if omitted)
         #[arg(long, value_parser = ["uploads", "outputs"])]
@@ -65,6 +68,7 @@ pub enum SessionCommand {
     },
     /// Download one session file to stdout, or to a file with `-o`
     Download {
+        /// Session ID (see `monocle craft session list`)
         id: String,
         /// File path as listed by `files`
         path: String,
@@ -73,14 +77,17 @@ pub enum SessionCommand {
     },
     /// Delete a session
     Delete {
+        /// Session ID (see `monocle craft session list`)
         id: String,
         /// Print the server's response as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Attach your Stark delegation to a session so Craft can call the model
-    /// gateway (openworker lane; stg/prod Craft hosts only)
+    /// Attach your delegation to a session (openworker lane)
+    ///
+    /// Lets Craft call the model gateway on your behalf; stg/prod Craft hosts only.
     Delegate {
+        /// Session ID (see `monocle craft session list`)
         id: String,
         /// Print {"ok","expires_at"} as JSON
         #[arg(long)]
@@ -98,6 +105,7 @@ pub enum WorkspaceCommand {
     },
     /// Open a workspace folder (prints the server's response as JSON)
     Open {
+        /// Workspace folder path (see `monocle craft workspace list`)
         path: String,
         /// Create the folder if it does not exist
         #[arg(long)]
@@ -166,6 +174,14 @@ fn print_json(v: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
+/// A delegation expiry (epoch seconds) as a UTC date; anything else as plain text.
+fn expiry_date(v: &Value) -> String {
+    v.as_i64()
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| text(v))
+}
+
 fn unix_time(v: &Value) -> String {
     v.as_i64()
         .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
@@ -197,7 +213,7 @@ pub fn craft_session_command(
         _ => {}
     }
     if let SessionCommand::Delegate { id, json } = command {
-        return delegate(client, creds, selection, lane, id, *json);
+        return delegate(client, creds, selection, lane, id, *json, true);
     }
     let (url, bearer) = connect(client, creds, selection, lane)?;
     let (c, u, b) = (client, url.as_str(), bearer.as_str());
@@ -367,10 +383,9 @@ pub fn craft_session_command(
             if *json {
                 print_json(&r)?;
             }
-            if r["recovered"].as_bool() == Some(true) {
-                eprintln!("Session {id} is gone (the server answered HTTP 500 but the session no longer exists).");
-            } else {
-                eprintln!("Deleted session {id}.");
+            eprintln!("Deleted session {id}.");
+            if r["recovered"].as_bool() == Some(true) && crate::util::verbose() {
+                eprintln!("(the server answered HTTP 500 but the session no longer exists)");
             }
         }
     }
@@ -396,6 +411,7 @@ fn delegate(
     lane: Lane,
     id: &str,
     json: bool,
+    announce: bool,
 ) -> Result<()> {
     openworker_only(lane, "`session delegate`")?;
     let base = craft::delegation_base(&selection.environment)?;
@@ -411,10 +427,13 @@ fn delegate(
     if json {
         print_json(&serde_json::json!({"ok": true, "expires_at": r["expires_at"]}))?;
     }
-    eprintln!(
-        "Delegation attached (expires_at {})",
-        text(&r["expires_at"])
-    );
+    // Per-turn delegation is plumbing (`-v` only); the explicit command confirms itself.
+    if announce || crate::util::verbose() {
+        eprintln!(
+            "Delegation attached (expires {})",
+            expiry_date(&r["expires_at"])
+        );
+    }
     Ok(())
 }
 
@@ -473,6 +492,10 @@ pub fn craft_turn_command(
         },
     );
     opts.last = Some(last.clone());
+    if let Some(id) = &opts.session {
+        crate::commands::craft_turn::note_session(id);
+    }
+    crate::commands::craft_turn::install_interrupt_notice();
     // Read the state file before any auth/connect so "none stored" costs no request.
     let stored = if opts.continue_last {
         Some(stored_continue(&last, selection, lane)?)
@@ -490,13 +513,14 @@ pub fn craft_turn_command(
             opts.session = Some(check_continue(&last, id, |id| {
                 sdk::session_exists(client, &base, &bearer, id)
             })?);
+            opts.follow_up = true; // "Continuing session" already named it
         }
         return turn_loop(&opts, |o| {
             craft_sdk_turn::run_id(&SdkTurn {
                 interactive: o.interactive,
                 follow_up: o.follow_up,
                 last: Some(&last),
-                hint_prefix: &o.hint_prefix,
+                hint_prefix: o.hint_prefix.as_deref(),
                 client,
                 base: &base,
                 bearer: &bearer,
@@ -525,13 +549,14 @@ pub fn craft_turn_command(
         opts.session = Some(check_continue(&last, id, |id| {
             craft::session_exists(client, &base, &bearer, id)
         })?);
+        opts.follow_up = true; // "Continuing session" already named it
     }
     turn_loop(&opts, |o| {
         run_turn_id(&target, o, |id| {
             if no_delegation {
                 return Ok(());
             }
-            delegate(client, creds, selection, lane, id, false)
+            delegate(client, creds, selection, lane, id, false, false)
         })
     })
 }
@@ -623,9 +648,6 @@ fn lines_loop(
             }
         }
         first = false;
-    }
-    if let Some(id) = &sid {
-        eprintln!("{}", continue_hint(&opts.hint_prefix, id));
     }
     outcome
 }

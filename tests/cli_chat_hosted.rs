@@ -177,9 +177,8 @@ fn root_help_chat_line() {
         .output()
         .unwrap();
     assert!(
-        stdout(&out).contains(
-            "chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)"
-        ),
+        stdout(&out)
+            .contains("chat             Chat with a model (REPL, or pipe a prompt on stdin)"),
         "{}",
         stdout(&out)
     );
