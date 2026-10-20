@@ -252,3 +252,24 @@ fn chat_timings_line_on_stderr_only() {
     assert!(n("ttfe_ms") <= n("ttft_ms") && n("ttft_ms") <= n("total_ms"));
     assert!(!l.contains(ANSWER) && !l.contains("Bearer"));
 }
+
+#[test]
+fn chat_diagnostics_file_has_no_content() {
+    let (stub, _) = counting_stub();
+    let home = logged_in_home(&stub);
+    let path = home.path().join("d.jsonl");
+    let o = run_piped(
+        home.path(),
+        &["chat", "--diagnostics-file", path.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains(ANSWER) && !raw.contains("Bearer"), "{raw}");
+    let ev: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let names: Vec<_> = ev.iter().map(|e| e["event"].as_str().unwrap()).collect();
+    assert_eq!(names, ["first_event", "first_text", "done"]);
+    assert_eq!(ev[0]["lane"], "chat");
+}

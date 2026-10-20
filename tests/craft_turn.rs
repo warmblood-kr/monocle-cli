@@ -536,6 +536,7 @@ fn opts() -> TurnOpts {
         poll_every: Duration::from_millis(50),
         timings: false,
         delegates: true,
+        diagnostics_file: None,
     }
 }
 
@@ -1064,4 +1065,34 @@ fn timings_does_not_change_json_stdout() {
     assert!(a.status.success() && b.status.success());
     assert_eq!(a.stdout, b.stdout);
     assert!(timings_line(&b).is_some());
+
+fn diagnostics_file_records_phases_without_token_or_content() {
+    let (addr, _) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let path = home.path().join("d.jsonl");
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &[
+            "hi there",
+            "--no-delegation",
+            "--diagnostics-file",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let raw = std::fs::read_to_string(&path).unwrap();
+    for bad in [TOKEN, "hi there", "Hello", "/ws", "?"] {
+        assert!(!raw.contains(bad), "{bad} in {raw}");
+    }
+    let names: Vec<String> = raw
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(names, ["connect", "first_event", "first_text", "done"]);
 }

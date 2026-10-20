@@ -21,7 +21,7 @@ use crate::config::{Config, ConfigData};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
-use crate::instrument::{Lane, Timings};
+use crate::instrument::{ErrorKind, Lane, Timings};
 use crate::net::Client;
 use crate::origin::auth_headers;
 use crate::responses_api::ResponsesClient;
@@ -52,6 +52,8 @@ pub struct ChatOptions {
     pub show_tools: bool,
     /// `--timings`: one-shot hosted Chat only; one JSON line to stderr.
     pub timings: bool,
+    /// `--diagnostics-file` / `MONOCLE_DIAGNOSTICS_FILE` (one-shot hosted Chat only).
+    pub diagnostics_file: Option<std::path::PathBuf>,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -925,6 +927,10 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
+        tm = tm.with_diagnostics(
+            crate::instrument::diagnostics_path(options.diagnostics_file.clone()),
+            crate::instrument::host_of(&jarvice_url),
+        );
         tm.sent();
         let res = rc.respond(
             &model,
@@ -942,7 +948,11 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                 tm.text();
             }
         }
-        tm.finish();
+        tm.finish(
+            res.as_ref()
+                .err()
+                .map(|e| ErrorKind::classify(&e.to_string())),
+        );
         if options.timings {
             eprintln!("{}", tm.line());
         }

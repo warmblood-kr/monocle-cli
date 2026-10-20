@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::commands::redact::Redactor;
 use crate::craft_server as craft;
 use crate::error::{AppError, Result};
-use crate::instrument::{Lane, Timings};
+use crate::instrument::{ErrorKind, Lane, Timings};
 use crate::jarvice_chats::is_valid_chat_id;
 use crate::net::Client;
 use crate::util::percent_encode;
@@ -40,6 +40,8 @@ pub struct TurnOpts {
     pub timings: bool,
     /// Whether `delegate` does real work (false = `--no-delegation`); only affects `delegation_ms`.
     pub delegates: bool,
+    /// Diagnostics JSONL file (already resolved from flag/env), if any.
+    pub diagnostics_file: Option<std::path::PathBuf>,
 }
 
 /// Where the turn talks. `ws_base` must come from [`craft::ws_base`].
@@ -165,10 +167,17 @@ pub fn run_turn(
     let deadline = Instant::now() + opts.timeout;
     let token = t.bearer.strip_prefix("Bearer ").unwrap_or(t.bearer);
     let r = Redactor::new(&[token]);
-    let mut tm = Timings::new(Lane::Openworker);
+    let mut tm = Timings::new(Lane::Openworker).with_diagnostics(
+        opts.diagnostics_file.clone(),
+        crate::instrument::host_of(t.base),
+    );
     let res = run_inner(t, opts, delegate, &r, deadline, &mut tm);
     t.client.set_request_cap(None);
-    tm.finish();
+    tm.finish(
+        res.as_ref()
+            .err()
+            .map(|e| ErrorKind::classify(&e.to_string())),
+    );
     if opts.timings {
         eprintln!("{}", tm.line());
     }

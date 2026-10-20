@@ -289,6 +289,10 @@ struct ChatArgs {
     /// streaming). Includes a random run_id and started_at (UTC); never tokens, prompts or text
     #[arg(long)]
     timings: bool,
+    /// One-shot only: append one JSON line per phase to this file (also MONOCLE_DIAGNOSTICS_FILE);
+    /// off by default; fixed fields only, never tokens/prompts/text/headers/URLs; 0600; rotates at 1 MiB
+    #[arg(long = "diagnostics-file", value_name = "PATH")]
+    diagnostics_file: Option<std::path::PathBuf>,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -309,6 +313,7 @@ impl From<ChatArgs> for ChatOptions {
             }),
             show_tools: a.show_tools,
             timings: a.timings,
+            diagnostics_file: a.diagnostics_file,
         }
     }
 }
@@ -349,6 +354,7 @@ impl From<RouterChatArgs> for ChatOptions {
             verify_tool_firing: None,
             show_tools: false,
             timings: false,
+            diagnostics_file: None,
         }
     }
 }
@@ -492,6 +498,12 @@ enum CraftCommand {
         /// started_at (UTC); never tokens, prompts or text. If the answer is polled, ttft is accurate to the 2 s poll interval
         #[arg(long)]
         timings: bool,
+        /// Append one JSON line per phase (connect, delegation, session_create, first_event,
+        /// first_text, done/error) to this file; also set by MONOCLE_DIAGNOSTICS_FILE. Off by
+        /// default. Fixed fields only (ts, run_id, event, lane, host, error_kind, duration_ms): never
+        /// tokens, prompts, text, headers or URLs. Created 0600; rotated to PATH.1 at 1 MiB
+        #[arg(long = "diagnostics-file", value_name = "PATH")]
+        diagnostics_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -1266,6 +1278,7 @@ fn main() {
                 approve,
                 json,
                 timings,
+                diagnostics_file,
             } => craft_turn_command(
                 &client,
                 &creds,
@@ -1285,6 +1298,7 @@ fn main() {
                     poll_every: std::time::Duration::from_secs(2),
                     timings,
                     delegates: !no_delegation,
+                    diagnostics_file: monocle_cli::instrument::diagnostics_path(diagnostics_file),
                 },
             ),
         },

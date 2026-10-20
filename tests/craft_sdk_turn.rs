@@ -703,4 +703,118 @@ fn timings_does_not_change_json_stdout() {
     assert!(a.status.success() && b.status.success());
     assert_eq!(a.stdout, b.stdout);
     assert!(err(&b).contains(r#"{"timings""#));
+
+fn diag_events(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn diagnostics_file_has_ordered_fixed_fields_and_no_secrets_even_on_error() {
+    for secret in [SOCKTOK, ACCESS] {
+        let (addr, _) = start(reflect_script(secret));
+        let home = setup(&addr);
+        let path = home.path().join("diag.jsonl");
+        let o = turn(
+            home.path(),
+            &[
+                "prompt-SECRETTEXT",
+                "--diagnostics-file",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(!o.status.success());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for bad in [
+            SOCKTOK,
+            ACCESS,
+            "boom",
+            "prompt-SECRETTEXT",
+            "Bearer",
+            "http",
+            "?",
+        ] {
+            assert!(!raw.contains(bad), "{bad} in {raw}");
+        }
+        let ev = diag_events(&path);
+        let names: Vec<_> = ev.iter().map(|e| e["event"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "session_create",
+                "connect",
+                "first_event",
+                "first_text",
+                "error"
+            ]
+        );
+        let last = ev.last().unwrap();
+        assert_eq!(last["error_kind"], "server");
+        assert_eq!(last["lane"], "sdk");
+        assert_eq!(last["host"], "127.0.0.1");
+        assert!(ev
+            .iter()
+            .all(|e| e["run_id"] == ev[0]["run_id"] && e["ts"].as_str().unwrap().ends_with('Z')));
+        for e in &ev {
+            let mut k: Vec<_> = e.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            assert_eq!(
+                k,
+                [
+                    "duration_ms",
+                    "error_kind",
+                    "event",
+                    "host",
+                    "lane",
+                    "run_id",
+                    "ts"
+                ]
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn diagnostics_is_off_by_default_and_env_var_enables_it() {
+    let (addr, _) = start(happy());
+    let home = setup(&addr);
+    let o = turn(home.path(), &["hi"]);
+    assert!(o.status.success());
+    assert_eq!(
+        std::fs::read_dir(home.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
+            .count(),
+        0
+    );
+    let (addr, _) = start(happy());
+    let home = setup(&addr);
+    let path = home.path().join("env.jsonl");
+    let o = Command::new(env!("CARGO_BIN_EXE_monocle"))
+        .args(["craft", "--lane", "sdk", "turn", "hi"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("MONOCLE_DIAGNOSTICS_FILE", &path)
+        .env_remove("MONOCLE_PROFILE")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let names: Vec<_> = diag_events(&path)
+        .iter()
+        .map(|e| e["event"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names.last().map(String::as_str), Some("done"));
 }
