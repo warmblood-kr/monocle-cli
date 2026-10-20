@@ -37,6 +37,10 @@ fn stub(seen: &Seen, status: u16, error_body: &str) -> String {
             } else {
                 match (m.as_str(), u.as_str()) {
                     ("GET", "/api/v1/mcp/servers") => (200, LIST.to_string()),
+                    ("GET" | "PUT", u) if u.ends_with("/mcp-servers") => (
+                        200,
+                        r#"{"server_ids":["github","uuid-1"],"ever_set":true}"#.into(),
+                    ),
                     ("GET", "/api/v1/mcp/servers/attention") => (200, r#"{"count":2}"#.into()),
                     ("GET", u) if u.starts_with("/api/v1/mcp/servers/") => (
                         200,
@@ -225,4 +229,64 @@ fn errors_show_status_and_code_but_never_the_body() {
     let addr = stub(&seen, 500, "SECRET_MARKER stack");
     let (o, _s, _h) = run(&addr, &["mcp", "disable", "x"]);
     assert!(err(&o).contains("HTTP 500") && !err(&o).contains("SECRET_MARKER"));
+}
+
+#[test]
+fn thread_get_reads_chat_servers() {
+    let (o, seen, _h) = run("", &["mcp", "thread", "get", "c/1"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_calls(&seen, &[("GET", "/api/v1/chats/c%2F1/mcp-servers", "")]);
+    assert_eq!(out(&o), "github\nuuid-1\n");
+    let (o, _s, _h) = run("", &["mcp", "thread", "get", "c1", "--json"]);
+    assert!(out(&o).contains("\"ever_set\": true"), "{}", out(&o));
+}
+
+#[test]
+fn thread_set_puts_whole_set_once_and_prints_result() {
+    let (o, seen, _h) = run("", &["mcp", "thread", "set", "c1", "--servers", "a,b", "c"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_calls(
+        &seen,
+        &[(
+            "PUT",
+            "/api/v1/chats/c1/mcp-servers",
+            r#"{"server_ids":["c","a","b"]}"#,
+        )],
+    );
+    assert_eq!(out(&o), "github\nuuid-1\n");
+    let (o, seen, _h) = run("", &["mcp", "thread", "set", "c1", "--none"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_calls(
+        &seen,
+        &[(
+            "PUT",
+            "/api/v1/chats/c1/mcp-servers",
+            r#"{"server_ids":[]}"#,
+        )],
+    );
+}
+
+#[test]
+fn thread_set_without_servers_or_none_errors_before_any_request() {
+    let (o, seen, _h) = run("", &["mcp", "thread", "set", "c1"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("--none"), "{}", err(&o));
+    assert!(seen.lock().unwrap().is_empty());
+    let (o, seen, _h) = run("", &["mcp", "thread", "set", "c1", "a", "--none"]);
+    assert_ne!(o.status.code(), Some(0));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn thread_errors_never_echo_the_body() {
+    for args in [
+        &["mcp", "thread", "get", "c1"][..],
+        &["mcp", "thread", "set", "c1", "a"],
+    ] {
+        let seen = Seen::default();
+        let addr = stub(&seen, 401, r#"{"detail":"SECRET_MARKER"}"#);
+        let (o, _s, _h) = run(&addr, args);
+        assert_eq!(o.status.code(), Some(1));
+        assert!(err(&o).contains("HTTP 401") && !err(&o).contains("SECRET_MARKER"));
+    }
 }

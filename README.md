@@ -72,6 +72,8 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle mcp attention [--json]` | Print how many servers need re-authentication |
 | `monocle mcp enable <server>` / `disable <server>` | Turn a server on or off for your account |
 | `monocle mcp tool <server> <tool> enable\|disable` | Switch one tool of an enabled server on or off (only flips the setting; never runs the tool) |
+| `monocle mcp thread get <chat-id> [--json]` | Print the MCP server ids set on one chat. **A display mirror only** (jarvice's `ChatMcpEnabled` table): it does not prove the tool is called. To confirm firing, run a chat turn with `monocle chat --tool-ids mcp:SERVER --verify-tool-firing` |
+| `monocle mcp thread set <chat-id> (<server>... \| --servers a,b \| --none) [--json]` | **Replace the whole** MCP server set of a chat and print the resulting set. Ids are catalog ids from `mcp ls`; jarvice does not reject unknown ids. Giving no servers is an error: clearing needs an explicit `--none`. Same display-mirror caveat as `get` (it does not guarantee the tool is called; verify with `chat --tool-ids mcp:SERVER --verify-tool-firing`) |
 | `monocle workspace-model list` | List workspace (custom) models: id, name, base model, active |
 | `monocle workspace-model show <id>` | Print one model as JSON |
 | `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment). Access: `--access private\|public`, or `--read-group/--write-group/--read-user/--write-user ID` (repeatable) to share |
