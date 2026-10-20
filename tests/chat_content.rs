@@ -38,6 +38,7 @@ fn fetch(stub: &common::Stub, id: &str, format: ContentFormat) -> Result<String,
         id,
         format,
         false,
+        false,
     )
     .map_err(|e| e.to_string())
 }
@@ -225,6 +226,7 @@ fn show_tools_summarizes_tool_calls_in_text() {
         "c1",
         ContentFormat::Text,
         true,
+        false,
     )
     .unwrap();
     assert!(!out.contains("<details"), "{out}");
@@ -249,6 +251,7 @@ fn default_output_is_unchanged_without_show_tools() {
         "c1",
         ContentFormat::Text,
         false,
+        false,
     )
     .unwrap();
     assert!(out.contains("<details type=\"tool_calls\""), "{out}");
@@ -265,6 +268,7 @@ fn show_tools_json_has_structured_tool_calls() {
         "c1",
         ContentFormat::Json,
         true,
+        false,
     )
     .unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -287,4 +291,43 @@ fn chat_content_show_tools_binary_e2e() {
     let o = run(home.path(), &["chat", "content", "c1", "--show-tools"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert!(String::from_utf8_lossy(&o.stdout).contains("[tool] web_search"));
+}
+
+// ── <user_memory> ────────────────────────────────────────────────────────────
+
+const MEMORY_FIXTURE: &str = r#"{"id":"c1","title":"T","chat":{"history":{"currentId":"m2","messages":{"m1":{"id":"m1","parentId":null,"role":"user","content":"<past_conversations>\nPERSONAL-PAST-SNIPPET\n</past_conversations>\n<user_memory>\n1. [2026-01-01]. PERSONAL-FACT-ONE\n2. PERSONAL-FACT-TWO\n</user_memory>\n\nhi"},"m2":{"id":"m2","parentId":"m1","role":"assistant","content":"hello"}}}}}"#;
+
+fn memory_stub() -> common::Stub {
+    common::stub(|_, method, url, _| match (method, url) {
+        ("GET", "/api/v1/chats/c1") => (200, MEMORY_FIXTURE.into()),
+        _ => (401, NOT_FOUND_BODY.into()),
+    })
+}
+
+#[test]
+fn chat_content_strips_user_memory_by_default_and_include_memory_restores_it() {
+    let stub = memory_stub();
+    let home = logged_in_home(&stub);
+
+    for args in [
+        &["chat", "content", "c1"][..],
+        &["chat", "content", "c1", "--format", "json"][..],
+    ] {
+        let out = run(home.path(), args);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!text.contains("PERSONAL-FACT"), "{args:?}: {text}");
+        assert!(!text.contains("user_memory"), "{args:?}: {text}");
+        assert!(!text.contains("past_conversations"), "{args:?}: {text}");
+        assert!(!text.contains("PERSONAL-PAST"), "{args:?}: {text}");
+        assert!(text.contains("hi") && text.contains("hello"), "{text}");
+    }
+
+    let out = run(home.path(), &["chat", "content", "c1", "--include-memory"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("PERSONAL-FACT-ONE") && text.contains("</user_memory>"),
+        "{text}"
+    );
 }

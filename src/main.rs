@@ -466,6 +466,11 @@ enum ChatCommand {
         /// add a structured `tool_calls` list per message
         #[arg(long = "show-tools")]
         show_tools: bool,
+        /// Keep the `<user_memory>` and `<past_conversations>` blocks jarvice
+        /// injects into user messages (removed by default: they are your stored
+        /// personal memory and past-chat snippets, not part of the conversation)
+        #[arg(long = "include-memory")]
+        include_memory: bool,
     },
     /// Permanently delete one hosted Chat thread (not undoable, never retried).
     /// Note: jarvice answers HTTP 401 (not 404) for a chat id that does not
@@ -1300,7 +1305,16 @@ fn main() {
                 id,
                 format,
                 show_tools,
-            }) => chat_content_command(&client, &creds, &selection, &id, format, show_tools),
+                include_memory,
+            }) => chat_content_command(
+                &client,
+                &creds,
+                &selection,
+                &id,
+                format,
+                show_tools,
+                include_memory,
+            ),
             Some(ChatCommand::Delete { id }) => {
                 chat_delete_command(&client, &creds, &selection, &id)
             }

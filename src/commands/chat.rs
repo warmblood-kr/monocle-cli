@@ -676,6 +676,7 @@ pub fn chat_content_command(
     id: &str,
     format: crate::jarvice_chats::ContentFormat,
     show_tools: bool,
+    include_memory: bool,
 ) -> Result<()> {
     let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
     eprintln!(
@@ -684,8 +685,15 @@ pub fn chat_content_command(
         selection.environment,
         creds.read().map(|c| c.tenant_domain).unwrap_or_default()
     );
-    let output =
-        crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format, show_tools)?;
+    let output = crate::jarvice_chats::fetch_content(
+        client,
+        &jarvice_url,
+        &bearer,
+        id,
+        format,
+        show_tools,
+        include_memory,
+    )?;
     print!("{output}");
     Ok(())
 }
@@ -1107,7 +1115,10 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                     eprintln!("--- prior history ---");
                     for node in turns {
                         match node.role.as_str() {
-                            "user" => eprintln!("> {}", node.content),
+                            "user" => eprintln!(
+                                "> {}",
+                                crate::jarvice_chats::strip_injected_context(&node.content)
+                            ),
                             "assistant" => eprintln!("{}", node.content),
                             _ => {}
                         }
