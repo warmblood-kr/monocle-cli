@@ -10,6 +10,7 @@ pub mod colors;
 pub mod commands;
 pub mod config;
 pub mod craft_server;
+pub mod craft_state;
 pub mod credentials;
 pub mod diag;
 pub mod endpoints;

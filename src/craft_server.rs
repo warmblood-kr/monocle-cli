@@ -137,6 +137,14 @@ pub fn get_session(client: &Client, base: &str, bearer: &str, id: &str) -> Resul
         .ok_or_else(|| AppError::new(format!("Session '{id}' was not found.")))
 }
 
+/// Whether the session is still listed (the cheapest existing probe: no get-one route).
+pub fn session_exists(client: &Client, base: &str, bearer: &str, id: &str) -> Result<bool> {
+    checked_id(id)?;
+    Ok(list_sessions(client, base, bearer, None)?
+        .iter()
+        .any(|s| s["session_id"].as_str() == Some(id)))
+}
+
 pub fn history(client: &Client, base: &str, bearer: &str, id: &str) -> Result<Value> {
     let url = format!("{base}/v1/sessions/{}/messages", checked_id(id)?);
     check("Reading session history", client.get(&url, &auth(bearer))?)?.json()

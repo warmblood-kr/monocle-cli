@@ -514,6 +514,9 @@ enum CraftCommand {
         /// Continue this session (default: a fresh `cli-<time>-<hex>` id, printed to stderr)
         #[arg(long)]
         session: Option<String>,
+        /// Continue the most recent session of this lane + profile + env (conflicts with --session)
+        #[arg(long = "continue", conflicts_with = "session")]
+        continue_last: bool,
         /// Workspace folder to run in (opened first). Default: your most recent existing one
         #[arg(long)]
         workspace: Option<String>,
@@ -1468,6 +1471,7 @@ fn main() {
             CraftCommand::Turn {
                 text,
                 session,
+                continue_last,
                 workspace,
                 create_workspace,
                 agent,
@@ -1486,6 +1490,8 @@ fn main() {
                 no_delegation,
                 title,
                 TurnOpts {
+                    continue_last,
+                    last: None,
                     hint_prefix: monocle_cli::commands::craft_turn::hint_prefix(
                         lane == Lane::Sdk,
                         explicit_profile.as_deref(),

@@ -542,6 +542,8 @@ fn sdk_lane_refuses_workspace_flag() {
 
 fn opts() -> TurnOpts {
     TurnOpts {
+        last: None,
+        continue_last: false,
         hint_prefix: "monocle craft turn".into(),
         text: "hi there".into(),
         session: Some("sess-1".into()),
@@ -1150,4 +1152,131 @@ fn diagnostics_records_ws_close_code_but_not_server_text() {
     assert_eq!(last["event"], "error");
     assert_eq!(last["ws_close_code"], 1011);
     assert!(last["status"].is_null());
+}
+
+fn state_file(home: &Path) -> std::path::PathBuf {
+    home.join(".monocle/craft-last-session.json")
+}
+
+fn seed(home: &Path, lane: &str, id: &str) {
+    std::fs::create_dir_all(home.join(".monocle")).unwrap();
+    std::fs::write(
+        state_file(home),
+        format!(
+            r#"{{"default/local/{lane}":{{"session_id":"{id}","updated_at":"2026-01-01T00:00:00Z"}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+fn rest_with_sessions(ids: &'static str) -> Rest {
+    Arc::new(move |p, n| match p {
+        "GET /v1/sessions" => (200, format!(r#"{{"sessions":[{ids}]}}"#)),
+        _ => rest_default(p, n),
+    })
+}
+
+#[test]
+fn turn_records_session_and_continue_reuses_it() {
+    let (addr, log) = start(
+        happy(),
+        rest_with_sessions(r#"{"session_id":"cli-1-abcd"}"#),
+    );
+    let home = setup(&addr);
+    let url = format!("http://{addr}");
+    let creds = home.path().join(".monocle/credentials.json");
+    let before = std::fs::read(&creds).unwrap();
+    let o = turn(home.path(), &url, &["hi there", "--no-delegation"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let st = std::fs::read_to_string(state_file(home.path())).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&st).unwrap();
+    let (k, e) = v.as_object().unwrap().iter().next().unwrap();
+    assert!(k.ends_with("/openworker"), "{k}");
+    assert!(e["session_id"].as_str().unwrap().starts_with("cli-"));
+    assert!(!st.contains(TOKEN));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(state_file(home.path())).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+    // Continue a known (listed) session.
+    seed(home.path(), "openworker", "cli-1-abcd");
+    log.lock().unwrap().clear();
+    let o = turn(
+        home.path(),
+        &url,
+        &["--continue", "hi there", "--no-delegation"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        err(&o).contains("Continuing session cli-1-abcd"),
+        "{}",
+        err(&o)
+    );
+    let l = lines(&log);
+    assert!(
+        l.iter().any(|x| x.contains("/ws/session/cli-1-abcd")),
+        "{l:?}"
+    );
+    assert_eq!(before, std::fs::read(&creds).unwrap());
+}
+
+#[test]
+fn continue_without_stored_session_errors_before_any_request() {
+    let (addr, log) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let url = format!("http://{addr}");
+    let o = turn(home.path(), &url, &["--continue", "hi", "--no-delegation"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("No previous craft session for lane openworker (profile default, env "),
+        "{}",
+        err(&o)
+    );
+    // Other lane's entry and a corrupt file count as none.
+    seed(home.path(), "sdk", "cli-1-abcd");
+    let o = turn(home.path(), &url, &["--continue", "hi", "--no-delegation"]);
+    assert!(err(&o).contains("No previous craft session"), "{}", err(&o));
+    std::fs::write(state_file(home.path()), "{not json").unwrap();
+    let o = turn(home.path(), &url, &["--continue", "hi", "--no-delegation"]);
+    assert!(err(&o).contains("No previous craft session"), "{}", err(&o));
+    assert!(lines(&log).is_empty(), "{:?}", lines(&log));
+}
+
+#[test]
+fn continue_on_a_gone_session_errors_and_drops_the_entry() {
+    let (addr, log) = start(happy(), rest_with_sessions(""));
+    let home = setup(&addr);
+    seed(home.path(), "openworker", "cli-1-gone");
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["--continue", "hi", "--no-delegation"],
+    );
+    assert!(!o.status.success());
+    assert!(
+        err(&o)
+            .contains("Session cli-1-gone no longer exists. Start a new one without --continue."),
+        "{}",
+        err(&o)
+    );
+    assert!(!std::fs::read_to_string(state_file(home.path()))
+        .unwrap()
+        .contains("cli-1-gone"));
+    assert!(!lines(&log).iter().any(|x| x.starts_with("WS")));
+}
+
+#[test]
+fn continue_conflicts_with_session() {
+    let (addr, log) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["--continue", "--session", "cli-1-a", "hi"],
+    );
+    assert!(!o.status.success());
+    assert!(err(&o).contains("cannot be used with"), "{}", err(&o));
+    assert!(lines(&log).is_empty());
 }

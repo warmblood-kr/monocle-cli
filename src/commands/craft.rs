@@ -14,6 +14,7 @@ use crate::commands::craft_sdk_turn::{self, SdkTurn};
 use crate::commands::craft_turn::{run_turn, Target, TurnOpts};
 use crate::commands::knowledge::print_table;
 use crate::craft_server as craft;
+use crate::craft_state::LastSession;
 use crate::credentials::Credentials;
 use crate::error::{AppError, Result};
 use crate::jarvice_agent as sdk;
@@ -417,6 +418,36 @@ fn delegate(
     Ok(())
 }
 
+/// `--continue`: the stored id for this profile/env/lane, checked to still exist
+/// (a gone session drops its entry). No stored id or a failed check makes no turn.
+fn resolve_continue(
+    last: &LastSession,
+    selection: &Selection,
+    lane: Lane,
+    exists: impl FnOnce(&str) -> Result<bool>,
+) -> Result<String> {
+    let lane_name = if lane == Lane::Sdk {
+        "sdk"
+    } else {
+        "openworker"
+    };
+    let Some(id) = last.get() else {
+        let flag = if lane == Lane::Sdk { " --lane sdk" } else { "" };
+        return Err(AppError::new(format!(
+            "No previous craft session for lane {lane_name} (profile {}, env {}). Start one with: monocle craft{flag} turn \"...\"",
+            selection.profile, selection.environment
+        )));
+    };
+    if !exists(&id)? {
+        last.clear();
+        return Err(AppError::new(format!(
+            "Session {id} no longer exists. Start a new one without --continue."
+        )));
+    }
+    eprintln!("Continuing session {id}");
+    Ok(id)
+}
+
 /// `craft turn`: hosts are vetted (REST base and WS origin) before anything is
 /// sent; delegation (unless skipped) goes first, then the socket.
 pub fn craft_turn_command(
@@ -426,8 +457,18 @@ pub fn craft_turn_command(
     lane: Lane,
     no_delegation: bool,
     title: Option<String>,
-    opts: TurnOpts,
+    mut opts: TurnOpts,
 ) -> Result<()> {
+    let last = LastSession::new(
+        &selection.profile,
+        &selection.environment,
+        if lane == Lane::Sdk {
+            "sdk"
+        } else {
+            "openworker"
+        },
+    );
+    opts.last = Some(last.clone());
     if lane == Lane::Sdk {
         if opts.workspace.is_some() {
             return Err(AppError::new(
@@ -435,7 +476,13 @@ pub fn craft_turn_command(
             ));
         }
         let (base, bearer) = connect(client, creds, selection, lane)?;
+        if opts.continue_last {
+            opts.session = Some(resolve_continue(&last, selection, lane, |id| {
+                sdk::session_exists(client, &base, &bearer, id)
+            })?);
+        }
         return craft_sdk_turn::run(&SdkTurn {
+            last: Some(&last),
             hint_prefix: &opts.hint_prefix,
             client,
             base: &base,
@@ -460,6 +507,11 @@ pub fn craft_turn_command(
         ws_base: &ws_base,
         bearer: &bearer,
     };
+    if opts.continue_last {
+        opts.session = Some(resolve_continue(&last, selection, lane, |id| {
+            craft::session_exists(client, &base, &bearer, id)
+        })?);
+    }
     run_turn(&target, &opts, |id| {
         if no_delegation {
             return Ok(());
