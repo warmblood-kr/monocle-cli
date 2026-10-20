@@ -7,7 +7,17 @@
 use std::env;
 use std::io::IsTerminal;
 
+static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Global `--no-color`: same effect as `NO_COLOR`.
+pub fn disable() {
+    DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn color_enabled() -> bool {
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     if env::var_os("NO_COLOR").is_some() {
         return false;
     }

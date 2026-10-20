@@ -29,6 +29,41 @@ pub struct CredentialsData {
     pub router_url: Option<String>,
 }
 
+/// The one "not logged in" text: `--profile` appears only when non-default.
+pub fn not_logged_in_message(profile: &str, env: &str) -> String {
+    let flag = if profile == "default" {
+        String::new()
+    } else {
+        format!(" --profile {profile}")
+    };
+    format!("Not logged in (profile {profile}, env {env}). Run: monocle login{flag} --env {env}")
+}
+
+#[cfg(test)]
+mod not_logged_in_tests {
+    use super::*;
+
+    #[test]
+    fn profile_flag_only_when_non_default() {
+        assert_eq!(
+            not_logged_in_message("default", "stg"),
+            "Not logged in (profile default, env stg). Run: monocle login --env stg"
+        );
+        assert_eq!(
+            not_logged_in_message("work", "prod"),
+            "Not logged in (profile work, env prod). Run: monocle login --profile work --env prod"
+        );
+    }
+
+    #[test]
+    fn unset_slot_means_default_prod() {
+        assert_eq!(
+            Credentials::with_home("/nonexistent").not_logged_in(),
+            not_logged_in_message("default", "prod")
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct Credentials {
     home: PathBuf,
@@ -77,6 +112,14 @@ impl Credentials {
             environment: Some(environment.into()),
             legacy_path,
         }
+    }
+
+    /// [`not_logged_in_message`] for this slot (unset profile/env mean default/prod).
+    pub fn not_logged_in(&self) -> String {
+        not_logged_in_message(
+            self.profile.as_deref().unwrap_or("default"),
+            self.environment.as_deref().unwrap_or("prod"),
+        )
     }
 
     pub fn dir(&self) -> PathBuf {

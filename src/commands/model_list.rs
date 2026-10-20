@@ -27,14 +27,7 @@ struct ModelsResponse {
     data: Vec<ModelInfo>,
 }
 
-pub(crate) fn pad(s: &str, width: usize) -> String {
-    let len = s.chars().count();
-    if len >= width {
-        s.to_string()
-    } else {
-        format!("{s}{}", " ".repeat(width - len))
-    }
-}
+pub(crate) use crate::table::pad;
 
 /// Fetch the full model listing from the router (`GET /v1/models`) given an
 /// already-resolved session, with no printing — the pure data path shared by
@@ -152,30 +145,44 @@ pub fn fuzzy_model_candidates(models: &[String], query: &str) -> Vec<Pair> {
     scored.into_iter().map(|(_, id)| to_pair(id)).collect()
 }
 
-pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
+pub fn model_list_command(client: &Client, creds: &Credentials, json: bool) -> Result<()> {
     let session = get_access_token(client, creds);
     let models = fetch_models_with_session(client, &session)?;
 
+    if json {
+        let v: Vec<serde_json::Value> = models
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id, "name": m.name, "modality": m.modality,
+                    "owned_by": m.owned_by, "context_window": m.context_window,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(());
+    }
+
     if models.is_empty() {
-        eprintln!("No models available.");
+        crate::note!("No models available.");
         return Ok(());
     }
 
     let id_width = models
         .iter()
-        .map(|m| m.id.chars().count())
+        .map(|m| crate::table::display_width(&m.id))
         .chain([8])
         .max()
         .unwrap();
     let name_width = models
         .iter()
-        .map(|m| m.name.as_deref().unwrap_or("").chars().count())
+        .map(|m| crate::table::display_width(m.name.as_deref().unwrap_or("")))
         .chain([4])
         .max()
         .unwrap();
     let modality_width = models
         .iter()
-        .map(|m| m.modality.as_deref().unwrap_or("").chars().count())
+        .map(|m| crate::table::display_width(m.modality.as_deref().unwrap_or("")))
         .chain([8])
         .max()
         .unwrap();
@@ -184,7 +191,7 @@ pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
     writeln!(
         out,
         "{}  {}  {}  {}  CONTEXT",
-        pad("MODEL ID", id_width),
+        pad("ID", id_width),
         pad("NAME", name_width),
         pad("MODALITY", modality_width),
         pad("OWNER", 10)
@@ -215,7 +222,7 @@ pub fn model_list_command(client: &Client, creds: &Credentials) -> Result<()> {
         )?;
     }
 
-    eprintln!("\n{} model(s) available.", models.len());
+    crate::note!("\n{} model(s) available.", models.len());
     Ok(())
 }
 

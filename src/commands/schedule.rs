@@ -6,6 +6,7 @@
 use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 
+use crate::commands::cells::{time_from_unix, yes_no};
 use crate::commands::chat::{tool_firing_verification, ToolFiringExpectation, ToolFiringVerdict};
 use crate::commands::knowledge::{connect, print_table};
 use crate::credentials::Credentials;
@@ -24,6 +25,11 @@ fn when(v: &Value) -> String {
     v.as_i64()
         .and_then(|s| Utc.timestamp_opt(s, 0).single())
         .map_or("-".into(), |t| t.format("%Y-%m-%d %H:%M:%SZ").to_string())
+}
+
+/// Table-cell form of [`when`]: `YYYY-MM-DD HH:MM` (UTC) like every other list.
+fn when_cell(v: &Value) -> String {
+    v.as_i64().map_or("-".into(), time_from_unix)
 }
 
 /// Text field on one line (server strings are data, not trusted for the terminal).
@@ -74,7 +80,7 @@ pub fn schedule_list_command(
         .as_array()
         .ok_or_else(|| AppError::new("Unexpected schedule list from the server."))?;
     if all.is_empty() {
-        eprintln!("No schedules found.");
+        crate::note!("No schedules found.");
         return Ok(());
     }
     let rows: Vec<Vec<String>> = all
@@ -84,8 +90,10 @@ pub fn schedule_list_command(
                 text(&s["public_id"]),
                 text(&s["name"]),
                 text(&s["kind"]),
-                s["enabled"].to_string(),
-                when(&s["next_fire_at"]),
+                s["enabled"]
+                    .as_bool()
+                    .map_or_else(|| s["enabled"].to_string(), |b| yes_no(b).into()),
+                when_cell(&s["next_fire_at"]),
             ]
         })
         .collect();
@@ -248,7 +256,7 @@ pub fn schedule_runs_command(
             .map(|r| {
                 vec![
                     text(&r["public_id"]),
-                    when(&r["scheduled_for"]),
+                    when_cell(&r["scheduled_for"]),
                     text(&r["status"]),
                     r["attempt"].to_string(),
                     text(&r["error"]),

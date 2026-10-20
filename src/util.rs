@@ -4,6 +4,46 @@ use std::path::PathBuf;
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Global `-v/--verbose`: set once in `main`, read where protocol detail is printed.
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn verbose() -> bool {
+    VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Global `-q/--quiet`: set once in `main`; silences [`note!`] (hints, banners, counts).
+pub fn set_quiet(on: bool) {
+    QUIET.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn quiet() -> bool {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `eprintln!` for non-essential stderr (banners, hints, counts, guidance). Silenced
+/// by `-q`; errors and warnings that matter keep using `eprintln!`.
+#[macro_export]
+macro_rules! note {
+    ($($arg:tt)*) => {
+        if !$crate::util::quiet() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+/// F2: the `Profile: … — tenant …` line is noise for the default profile on prod,
+/// so show it only for a non-default connection, or with `-v`. Never under `-q`
+/// (unless `-v` asks for detail).
+pub fn show_profile_line(profile: &str, env: &str, verbose: bool, quiet: bool) -> bool {
+    verbose || (!quiet && (profile != "default" || env != "prod"))
+}
+
 /// JS `new Date(...).toISOString()` — UTC, millisecond precision, trailing `Z`.
 pub fn to_iso(ts_ms: i64) -> String {
     Utc.timestamp_millis_opt(ts_ms)
@@ -119,4 +159,19 @@ pub fn home_dir() -> PathBuf {
     #[cfg(not(windows))]
     let key = "HOME";
     PathBuf::from(std::env::var_os(key).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod dx_tests {
+    use super::show_profile_line;
+
+    #[test]
+    fn profile_line_only_for_non_default_or_verbose() {
+        assert!(!show_profile_line("default", "prod", false, false));
+        assert!(show_profile_line("work", "prod", false, false));
+        assert!(show_profile_line("default", "stg", false, false));
+        assert!(show_profile_line("default", "prod", true, false));
+        assert!(!show_profile_line("work", "stg", false, true));
+        assert!(show_profile_line("work", "stg", true, true));
+    }
 }

@@ -56,7 +56,10 @@ fn delete_false_body_is_failure() {
 fn delete_error_never_echoes_body() {
     let (url, _rx) = once(500, "SECRET-STACK");
     let err = del(&url, "c1").unwrap_err();
-    assert_eq!(err, "Deleting the chat failed: HTTP 500.");
+    assert_eq!(
+        err,
+        "Deleting the chat failed (HTTP 500); the chat may not exist or may not be yours."
+    );
 
     let (url, _rx) = once(401, r#"{"detail":{"code":"NOT_FOUND","msg":"SECRET"}}"#);
     let err = del(&url, "c1").unwrap_err();

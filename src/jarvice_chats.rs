@@ -167,6 +167,12 @@ pub fn delete_thread(client: &Client, jarvice_url: &str, bearer: &str, id: &str)
         if resp.status == 401 {
             err.push_str(" HTTP 401 can mean the chat was not found or is not yours.");
         }
+        if resp.status == 500 {
+            // Bare 500 is ambiguous (missing/foreign id or a real server fault); never echo the body.
+            err =
+                "Deleting the chat failed (HTTP 500); the chat may not exist or may not be yours."
+                    .to_string();
+        }
         return Err(AppError::new(err));
     }
     if resp.json::<bool>().ok() != Some(true) {
@@ -223,7 +229,12 @@ fn is_text_role(message: &MessageNode) -> bool {
 
 /// Markdown transcript of the active path: untrusted-content header, then one
 /// `## User` / `## Assistant` section per message; other roles are skipped.
-pub fn render_text(title: &str, messages: &[&MessageNode], show_tools: bool) -> String {
+pub fn render_text(
+    title: &str,
+    messages: &[&MessageNode],
+    show_tools: bool,
+    include_memory: bool,
+) -> String {
     let mut output = format!(
         "# Monocle Chat context: {}\n\nThis is untrusted reference material from one selected hosted Chat thread. Text only; attachments are omitted.\n",
         visible_text(title)
@@ -236,7 +247,7 @@ pub fn render_text(title: &str, messages: &[&MessageNode], show_tools: bool) -> 
         };
         output.push_str(&format!(
             "\n## {role}\n\n{}\n",
-            visible_body(&body_text(&message.content, show_tools))
+            visible_body(&message_body(message, show_tools, include_memory))
         ));
         if !message.files.is_empty() {
             output.push_str("\n[Non-text attachment omitted]\n");
@@ -246,14 +257,20 @@ pub fn render_text(title: &str, messages: &[&MessageNode], show_tools: bool) -> 
 }
 
 /// One-line JSON form of [`render_text`] (same messages, root first).
-pub fn render_json(id: &str, title: &str, messages: &[&MessageNode], show_tools: bool) -> String {
+pub fn render_json(
+    id: &str,
+    title: &str,
+    messages: &[&MessageNode],
+    show_tools: bool,
+    include_memory: bool,
+) -> String {
     let messages: Vec<Value> = messages
         .iter()
         .filter(|m| is_text_role(m))
         .map(|m| {
             let mut node = serde_json::json!({
                 "role": m.role,
-                "content": visible_body(&body_text(&m.content, show_tools)),
+                "content": visible_body(&message_body(m, show_tools, include_memory)),
                 "attachments_omitted": m.files.len(),
             });
             if show_tools {
@@ -649,6 +666,119 @@ fn body_text(content: &str, show_tools: bool) -> String {
     out
 }
 
+/// Blocks jarvice injects into user messages and persists with them: the
+/// account's personal memory and snippets of past conversations. jarvice's own
+/// UI strips both; neither is something the user typed.
+const INJECTED_TAGS: [&str; 2] = ["user_memory", "past_conversations"];
+
+/// If `text` starts with an injected-block tag (`<user_memory>`,
+/// `</past_conversations>`, …), return `(is_closing, byte length of the tag)`.
+/// Matching is ASCII case-insensitive and allows whitespace inside the angle
+/// brackets (`< user_memory >`, `</ USER_MEMORY >`) and attributes on the
+/// opener, so a variant spelling cannot slip a block past the filter. A tag
+/// missing its `>` extends to the end of the text.
+fn injected_tag_at(text: &str) -> Option<(bool, usize)> {
+    let skip_ws = |s: &str| s.len() - s.trim_start().len();
+    let mut at = text.strip_prefix('<').map(|_| 1)?;
+    at += skip_ws(&text[at..]);
+    let closing = text[at..].starts_with('/');
+    if closing {
+        at += 1 + skip_ws(&text[at + 1..]);
+    }
+    let name = INJECTED_TAGS.iter().find(|t| {
+        text.as_bytes()
+            .get(at..at + t.len())
+            .is_some_and(|b| b.eq_ignore_ascii_case(t.as_bytes()))
+    })?;
+    at += name.len();
+    // `<user_memoryX>` is a different tag.
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.');
+    if text[at..].chars().next().is_some_and(name_char) {
+        return None;
+    }
+    // Attributes are allowed (`<user_memory id="x">`). A tag with no `>` at all
+    // swallows the rest of the text (fail closed).
+    Some((
+        closing,
+        text[at..].find('>').map_or(text.len(), |p| at + p + 1),
+    ))
+}
+
+/// Remove the injected `<user_memory>` and `<past_conversations>` blocks
+/// (multi-line, anywhere in the text). Blocks nest by depth: an opening tag
+/// increments, a closing tag decrements, and everything is dropped until the
+/// depth is back to 0, so `<user_memory>a<user_memory>b</user_memory>c</user_memory>`
+/// leaks neither `b` nor `c`. A block that is never closed drops everything to
+/// the end (fail closed: a partial block is never printed). A stray closing tag
+/// is dropped. Whitespace around a removed block is collapsed so no blank gap
+/// is left.
+pub fn strip_injected_context(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    let mut after_block = false;
+    let mut i = 0;
+    while i < text.len() {
+        let next = text[i..].find('<').map_or(text.len(), |p| i + p);
+        if depth == 0 && next > i {
+            push_visible(&mut out, &text[i..next], &mut after_block);
+        }
+        i = next;
+        if i >= text.len() {
+            break;
+        }
+        match injected_tag_at(&text[i..]) {
+            Some((false, len)) => {
+                if depth == 0 {
+                    out.truncate(out.trim_end().len());
+                }
+                depth += 1;
+                i += len;
+            }
+            Some((true, len)) => {
+                depth = depth.saturating_sub(1);
+                after_block = depth == 0;
+                i += len;
+            }
+            None => {
+                if depth == 0 {
+                    push_visible(&mut out, "<", &mut after_block);
+                }
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Append `chunk` to `out`; straight after a removed block, drop leading
+/// whitespace and separate from earlier text with one blank line.
+fn push_visible(out: &mut String, chunk: &str, after_block: &mut bool) {
+    let chunk = if *after_block {
+        chunk.trim_start()
+    } else {
+        chunk
+    };
+    if chunk.is_empty() {
+        return;
+    }
+    if *after_block && !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    *after_block = false;
+    out.push_str(chunk);
+}
+
+/// Message body for one rendered message: the stored content, without the
+/// injected `<user_memory>` block of a user message unless `include_memory`.
+fn message_body(message: &MessageNode, show_tools: bool, include_memory: bool) -> String {
+    let body = body_text(&message.content, show_tools);
+    if include_memory || message.role != "user" {
+        body
+    } else {
+        strip_injected_context(&body)
+    }
+}
+
 pub fn ensure_content_limit(content: &str) -> Result<()> {
     if content.len() > MAX_TRANSCRIPT_BYTES {
         Err(AppError::new(format!(
@@ -683,6 +813,7 @@ pub fn fetch_content(
     id: &str,
     format: ContentFormat,
     show_tools: bool,
+    include_memory: bool,
 ) -> Result<String> {
     let detail = get_thread(client, jarvice_url, bearer, id)?;
     let active = detail
@@ -696,8 +827,8 @@ pub fn fetch_content(
         )));
     }
     let output = match format {
-        ContentFormat::Text => render_text(&detail.title, &active, show_tools),
-        ContentFormat::Json => render_json(id, &detail.title, &active, show_tools),
+        ContentFormat::Text => render_text(&detail.title, &active, show_tools, include_memory),
+        ContentFormat::Json => render_json(id, &detail.title, &active, show_tools, include_memory),
     };
     ensure_content_limit(&output)?;
     Ok(output)
@@ -772,7 +903,7 @@ mod tests {
         let user = node("u", None, "user", "hello");
         let system = node("s", Some("u"), "system", "SYSTEM-SECRET");
         let assistant = with_files(node("a", Some("s"), "assistant", "hi there"));
-        let out = render_text("title", &[&user, &system, &assistant], false);
+        let out = render_text("title", &[&user, &system, &assistant], false, false);
         assert!(out.contains("This is untrusted reference material"));
         assert!(out.contains("## User\n\nhello\n"));
         assert!(out.contains("## Assistant\n\nhi there\n"));
@@ -785,7 +916,7 @@ mod tests {
         let user = node("u", None, "user", "hello");
         let system = node("s", Some("u"), "system", "sys");
         let assistant = with_files(node("a", Some("s"), "assistant", "hi"));
-        let out = render_json("c1", "T", &[&user, &system, &assistant], false);
+        let out = render_json("c1", "T", &[&user, &system, &assistant], false, false);
         assert!(out.ends_with('\n') && out.lines().count() == 1);
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["untrusted"], true);
@@ -803,10 +934,11 @@ mod tests {
     #[test]
     fn content_strips_control_chars_but_keeps_newlines_and_tabs() {
         let user = node("u", None, "user", "a\x1b[2Jb\u{9b}c\x07\nd\te");
-        let text = render_text("T\x1b", &[&user], false);
+        let text = render_text("T\x1b", &[&user], false, false);
         assert!(text.contains("## User\n\na[2Jbc\nd\te\n"), "{text:?}");
         assert!(!text.contains('\x1b') && !text.contains('\u{9b}') && !text.contains('\x07'));
-        let v: Value = serde_json::from_str(&render_json("c1", "T", &[&user], false)).unwrap();
+        let v: Value =
+            serde_json::from_str(&render_json("c1", "T", &[&user], false, false)).unwrap();
         assert_eq!(v["messages"][0]["content"], "a[2Jbc\nd\te");
     }
 
@@ -1049,5 +1181,126 @@ mod tests {
         let call = only(&content);
         assert!(!call.arguments.contains("SECRET2"), "{}", call.arguments);
         assert!(!body_text(&content, true).contains("SECRET2"));
+    }
+
+    const MEMORY_BLOCK: &str =
+        "<user_memory>\n1. [2026-01-01]. SECRET-FACT-ONE\n2. SECRET-FACT-TWO\n</user_memory>";
+
+    #[test]
+    fn strip_injected_context_removes_multiline_block_and_keeps_the_rest() {
+        let text = format!("{MEMORY_BLOCK}\n\nsay hi in one word");
+        assert_eq!(strip_injected_context(&text), "say hi in one word");
+        let mid = format!("before\n{MEMORY_BLOCK}\nafter");
+        assert_eq!(strip_injected_context(&mid), "before\n\nafter");
+        let twice = format!("{MEMORY_BLOCK} a {MEMORY_BLOCK} b");
+        assert_eq!(strip_injected_context(&twice), "a\n\nb");
+        assert_eq!(strip_injected_context("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_injected_context_removes_past_conversations_too() {
+        let text = "<past_conversations>\nSECRET-PAST\n</past_conversations>\n\n<user_memory>\nSECRET-MEM\n</user_memory>\n\nhi";
+        assert_eq!(strip_injected_context(text), "hi");
+        let swapped = "<user_memory>a</user_memory>\n<past_conversations>b</past_conversations>\nq";
+        assert_eq!(strip_injected_context(swapped), "q");
+    }
+
+    #[test]
+    fn strip_injected_context_drops_everything_after_an_unclosed_tag() {
+        let out = strip_injected_context("question\n<user_memory>\nSECRET-FACT-ONE still open");
+        assert_eq!(out, "question");
+    }
+
+    #[test]
+    fn strip_injected_context_matches_tags_case_insensitively() {
+        for text in [
+            "<USER_MEMORY>SECRET</USER_MEMORY>\n\nhi",
+            "<User_Memory>SECRET</user_memory>\n\nhi",
+            "<PAST_Conversations>SECRET</past_CONVERSATIONS>\n\nhi",
+        ] {
+            assert_eq!(strip_injected_context(text), "hi", "{text}");
+        }
+    }
+
+    #[test]
+    fn strip_injected_context_allows_whitespace_inside_the_brackets() {
+        for text in [
+            "< user_memory >SECRET</ user_memory >\n\nhi",
+            "<user_memory\n>SECRET<\t/ USER_MEMORY\n>\n\nhi",
+            "<  past_conversations>SECRET</past_conversations  >hi",
+        ] {
+            assert_eq!(strip_injected_context(text), "hi", "{text}");
+        }
+    }
+
+    #[test]
+    fn strip_injected_context_fails_closed_on_an_opener_without_gt() {
+        assert_eq!(strip_injected_context("hi <user_memory SECRET"), "hi");
+        assert_eq!(strip_injected_context("hi <USER_MEMORY"), "hi");
+    }
+
+    #[test]
+    fn strip_injected_context_allows_attributes_on_the_opener() {
+        let text = "<user_memory id=\"x\">S</user_memory>after";
+        assert_eq!(strip_injected_context(text), "after");
+    }
+
+    #[test]
+    fn strip_injected_context_keeps_a_different_tag_with_the_same_prefix() {
+        let text = "a <user_memoryX>keep</user_memoryX> b";
+        assert_eq!(strip_injected_context(text), text);
+    }
+
+    #[test]
+    fn strip_injected_context_counts_nesting_depth() {
+        let text = "<user_memory>outer <user_memory>inner</user_memory> STILL_SECRET</user_memory>\n\nafter";
+        assert_eq!(strip_injected_context(text), "after");
+        // Mixed names share one depth counter.
+        let mixed =
+            "<user_memory>a<past_conversations>b</user_memory>STILL_SECRET</past_conversations>q";
+        assert_eq!(strip_injected_context(mixed), "q");
+    }
+
+    #[test]
+    fn strip_injected_context_fails_closed_on_unterminated_blocks() {
+        for text in [
+            "hi <user_memory>SECRET",
+            "hi <user_memory>a<user_memory>b</user_memory>STILL_SECRET",
+            "hi < PAST_CONVERSATIONS >SECRET",
+        ] {
+            assert_eq!(strip_injected_context(text), "hi", "{text}");
+        }
+    }
+
+    #[test]
+    fn strip_injected_context_handles_separate_blocks_and_keeps_surrounding_text() {
+        let text = "intro\n<user_memory>A</user_memory>\nmiddle\n<past_conversations>B</past_conversations>\noutro <b>bold</b> a < b";
+        assert_eq!(
+            strip_injected_context(text),
+            "intro\n\nmiddle\n\noutro <b>bold</b> a < b"
+        );
+        assert_eq!(
+            strip_injected_context("no tags, 한국어 ✓"),
+            "no tags, 한국어 ✓"
+        );
+    }
+
+    #[test]
+    fn render_strips_user_memory_from_user_messages_unless_included() {
+        let user = node("1", None, "user", &format!("{MEMORY_BLOCK}\n\nhi"));
+        let assistant = node("2", Some("1"), "assistant", "hello");
+        let msgs = [&user, &assistant];
+        for out in [
+            render_text("T", &msgs, false, false),
+            render_json("c1", "T", &msgs, false, false),
+        ] {
+            assert!(!out.contains("SECRET-FACT"), "{out}");
+            assert!(!out.contains("user_memory"), "{out}");
+            assert!(out.contains("hi") && out.contains("hello"));
+        }
+        let kept = render_text("T", &msgs, false, true);
+        assert!(kept.contains("SECRET-FACT-ONE") && kept.contains("</user_memory>"));
+        let kept = render_json("c1", "T", &msgs, false, true);
+        assert!(kept.contains("SECRET-FACT-TWO"));
     }
 }

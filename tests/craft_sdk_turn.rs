@@ -254,7 +254,7 @@ fn lane_flag_after_the_subcommand_selects_the_sdk_lane() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), "Hello\n");
     assert!(
-        err(&o).contains("--lane sdk turn --session sess-1"),
+        err(&o).contains(r#"monocle craft turn --lane sdk --env=local --session=sess-1 "...""#),
         "{}",
         err(&o)
     );
@@ -290,14 +290,16 @@ fn no_secret(o: &Output) {
 fn streams_deltas_authenticates_with_socket_token_and_never_leaks_it() {
     let (addr, log) = start(happy());
     let home = setup(&addr);
-    let o = turn(home.path(), &["hi there"]);
+    let o = turn(home.path(), &["-v", "hi there"]);
     assert!(o.status.success(), "{}", err(&o));
     // Deltas live; the whole `text` is not repeated; thinking/other session ignored.
     assert_eq!(out(&o), "Hello\n");
     let e = err(&o);
     assert!(e.contains("Session: sess-1"), "{e}");
     assert!(
-        e.contains(r#"continue with: monocle craft --lane sdk turn --session sess-1 "...""#),
+        e.contains(
+            r#"continue with: monocle craft turn --lane sdk --env=local --session=sess-1 "...""#
+        ),
         "{e}"
     );
     assert!(!out(&o).contains("continue with"), "{}", out(&o));
@@ -1007,6 +1009,7 @@ fn interactive_lines_reuse_the_session_created_by_the_first_turn() {
         "{l:?}"
     );
     assert_eq!(err(&o).matches("Session: sess-1").count(), 1, "{}", err(&o));
-    assert_eq!(err(&o).matches("continue with").count(), 1, "{}", err(&o));
+    // `-i` never prints the continue hint.
+    assert_eq!(err(&o).matches("continue with").count(), 0, "{}", err(&o));
     no_secret(&o);
 }

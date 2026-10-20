@@ -16,14 +16,14 @@ use crate::net::Client;
 use crate::socketio::{ws_origin, SocketIo};
 
 pub struct SdkTurn<'a> {
-    /// `-i`: the loop prints the continue hint once at the end.
+    /// `-i`: this turn is part of an interactive loop.
     pub interactive: bool,
     /// A later turn of the loop on an announced session: no `Session:` line.
     pub follow_up: bool,
     /// Records the session id for `--continue` once it is known.
     pub last: Option<&'a crate::craft_state::LastSession>,
-    /// Command prefix for the "continue with:" hint.
-    pub hint_prefix: &'a str,
+    /// Command prefix for the "continue with:" hint; `None` = no hint.
+    pub hint_prefix: Option<&'a str>,
     pub client: &'a Client,
     /// jarvice base from `auth::jarvice_url_for`.
     pub base: &'a str,
@@ -127,8 +127,10 @@ fn run_checked(t: &SdkTurn) -> Result<(Result<()>, Option<String>)> {
         if let Some(last) = t.last {
             last.set(id);
         }
-        if !t.interactive {
-            r.errln(&super::craft_turn::continue_hint(t.hint_prefix, id));
+        if let Some(prefix) = t.hint_prefix {
+            if !crate::util::quiet() {
+                r.errln(&super::craft_turn::continue_hint(prefix, id));
+            }
         }
     }
     // Server-provided text can sit inside any error: scrub at the boundary.
@@ -156,6 +158,7 @@ fn run_inner(
         r.errln(&format!("Session: {id}"));
     }
     *sid = Some(id.clone());
+    super::craft_turn::note_session(&id);
     let token = http(t, deadline, || {
         sdk::socket_token(t.client, t.base, t.bearer)
     })?;
@@ -249,7 +252,7 @@ fn drive(
                         sock.emit("message", &json!({"session_id": id, "content": t.text}))?;
                         sent = true;
                     }
-                } else {
+                } else if crate::util::verbose() {
                     r.errln(&format!("[session_status] {}", short(&data["status"])));
                 }
             }

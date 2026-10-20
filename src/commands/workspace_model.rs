@@ -104,11 +104,29 @@ fn overrides(client: &Client, url: &str, bearer: &str, a: &WriteArgs) -> Result<
     })
 }
 
-pub fn list_command(client: &Client, creds: &Credentials, sel: &Selection) -> Result<()> {
+pub fn list_command(
+    client: &Client,
+    creds: &Credentials,
+    sel: &Selection,
+    json: bool,
+) -> Result<()> {
     let (url, bearer) = connect(client, creds, sel)?;
     let all = models::list_models(client, &url, &bearer)?;
+    if json {
+        let v: Vec<Value> = all
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": s(m, "id"), "name": s(m, "name"), "base_model_id": s(m, "base_model_id"),
+                    "active": m["is_active"].as_bool().unwrap_or(true),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(());
+    }
     if all.is_empty() {
-        eprintln!("No workspace models found.");
+        crate::note!("No workspace models found.");
         return Ok(());
     }
     let rows: Vec<Vec<String>> = all
@@ -127,14 +145,26 @@ pub fn list_command(client: &Client, creds: &Credentials, sel: &Selection) -> Re
             ]
         })
         .collect();
-    print_table(&["MODEL ID", "NAME", "BASE", "ACTIVE"], &rows);
+    print_table(&["ID", "NAME", "BASE", "ACTIVE"], &rows);
     Ok(())
 }
 
-pub fn show_command(client: &Client, creds: &Credentials, sel: &Selection, id: &str) -> Result<()> {
+/// Prints the model as JSON. Large `data:` URLs (the profile image) are replaced
+/// by `<data:MIME, N bytes>` unless `full`, which prints the exact server body.
+pub fn show_command(
+    client: &Client,
+    creds: &Credentials,
+    sel: &Selection,
+    id: &str,
+    full: bool,
+) -> Result<()> {
     let (url, bearer) = connect(client, creds, sel)?;
     models::find(&models::list_models(client, &url, &bearer)?, id)?;
-    print_json(&models::get_model(client, &url, &bearer, id)?);
+    let mut model = models::get_model(client, &url, &bearer, id)?;
+    if !full {
+        models::elide_data_urls(&mut model);
+    }
+    print_json(&model);
     Ok(())
 }
 

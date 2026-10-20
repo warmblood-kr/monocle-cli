@@ -3,6 +3,7 @@ pub mod audio_speech;
 pub mod audio_speech_azure;
 pub mod audio_transcribe;
 pub mod audio_transcribe_azure;
+pub mod cells;
 pub mod chat;
 pub mod claude;
 pub mod craft;

@@ -6,7 +6,6 @@ use std::io::Write;
 
 use crate::auth::AuthSession;
 use crate::commands::chat::resolve_jarvice;
-use crate::commands::model_list::pad;
 use crate::credentials::Credentials;
 use crate::error::{AppError, Result};
 use crate::jarvice_knowledge as kb;
@@ -21,43 +20,13 @@ pub(crate) fn connect(
 ) -> Result<(String, String)> {
     let (_session, jarvice_url, bearer): (AuthSession, String, String) =
         resolve_jarvice(client, creds)?;
-    eprintln!(
-        "Profile: {} ({}) — tenant {}",
-        selection.profile,
-        selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
-    );
+    selection.announce(creds);
     Ok((jarvice_url, bearer))
 }
 
 /// Left-aligned table on stdout; the last column is left unpadded.
 pub(crate) fn print_table(headers: &[&str], rows: &[Vec<String>]) {
-    let widths: Vec<usize> = (0..headers.len())
-        .map(|c| {
-            rows.iter()
-                .map(|r| r[c].chars().count())
-                .chain([headers[c].len()])
-                .max()
-                .unwrap()
-        })
-        .collect();
-    let line = |cells: &[String]| {
-        let last = cells.len() - 1;
-        let parts: Vec<String> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                if i == last {
-                    c.clone()
-                } else {
-                    pad(c, widths[i])
-                }
-            })
-            .collect();
-        let _ = writeln!(std::io::stdout(), "{}", parts.join("  "));
-    };
-    line(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
-    rows.iter().for_each(|r| line(r));
+    crate::table::print(headers, rows, None, None);
 }
 
 /// `monocle knowledge create NAME` — prints the new collection id to stdout.
@@ -145,29 +114,47 @@ pub fn knowledge_list_command(
     creds: &Credentials,
     selection: &Selection,
     collection: Option<&str>,
+    json: bool,
 ) -> Result<()> {
     let (url, bearer) = connect(client, creds, selection)?;
     let all = kb::list_knowledge(client, &url, &bearer, false)?;
+    if json {
+        let v: serde_json::Value = match collection {
+            None => all
+                .iter()
+                .map(|k| serde_json::json!({"id": k.id, "name": k.name, "files": k.files().len()}))
+                .collect(),
+            Some(key) => {
+                let one = kb::find(&all, key)?;
+                one.files()
+                    .iter()
+                    .map(|f| serde_json::json!({"id": f.id, "name": f.meta.name}))
+                    .collect()
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(());
+    }
     match collection {
-        None if all.is_empty() => eprintln!("No collections found."),
+        None if all.is_empty() => crate::note!("No collections found."),
         None => {
             let rows: Vec<Vec<String>> = all
                 .iter()
                 .map(|k| vec![k.id.clone(), k.name.clone(), k.files().len().to_string()])
                 .collect();
-            print_table(&["COLLECTION ID", "NAME", "FILES"], &rows);
+            print_table(&["ID", "NAME", "FILES"], &rows);
         }
         Some(key) => {
             let one = kb::find(&all, key)?;
             if one.files().is_empty() {
-                eprintln!("No files in '{}'.", one.name);
+                crate::note!("No files in '{}'.", one.name);
             } else {
                 let rows: Vec<Vec<String>> = one
                     .files()
                     .iter()
                     .map(|f| vec![f.id.clone(), f.meta.name.clone()])
                     .collect();
-                print_table(&["FILE ID", "NAME"], &rows);
+                print_table(&["ID", "NAME"], &rows);
             }
         }
     }
