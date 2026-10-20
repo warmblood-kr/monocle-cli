@@ -10,6 +10,7 @@
 //! - `GET /servers/{id}` — `id` is the catalog name for marketplace servers but a
 //!   uuid for tenant custom servers, so [`find_server`] maps name -> id first.
 //! - `GET /servers/attention` -> `{"count": N}` (servers whose auth failed).
+//! - Thread set: `GET|PUT /api/v1/chats/{id}/mcp-servers` (`chats.py`), see [`chat_servers_raw`].
 //! - `POST /servers/{name}/enable|disable` (no body) and
 //!   `POST /servers/{name}/tools/{tool}` with `{"enabled": bool}` — the latter only
 //!   flips a switch (404 when the server is not enabled); it never runs the tool.
@@ -157,4 +158,28 @@ pub fn set_enabled(
         return Err(api_error(what, &resp));
     }
     Ok(())
+}
+
+/// `GET` (`servers = None`) or `PUT` (`Some(ids)`, replaces the WHOLE set) of
+/// `/api/v1/chats/{id}/mcp-servers`; both answer `{"server_ids":[..],"ever_set":bool}`.
+/// The ids are catalog ids and jarvice does not check that they exist.
+pub fn chat_servers_raw(
+    client: &Client,
+    jarvice_url: &str,
+    bearer: &str,
+    chat_id: &str,
+    servers: Option<&[String]>,
+) -> Result<Value> {
+    let url = format!(
+        "{jarvice_url}/api/v1/chats/{}/mcp-servers",
+        percent_encode(chat_id, false)
+    );
+    let Some(ids) = servers else {
+        return get_value(client, &url, bearer, "Fetching the chat's MCP servers");
+    };
+    let resp = client.put_json_once(&url, &auth_headers(bearer), &json!({ "server_ids": ids }))?;
+    if !resp.ok() {
+        return Err(api_error("Updating the chat's MCP servers", &resp));
+    }
+    resp.json()
 }

@@ -28,7 +28,7 @@ use monocle_cli::commands::knowledge::{
 };
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::mcp::{
-    mcp_attention_command, mcp_ls_command, mcp_set_command, mcp_show_command,
+    mcp_attention_command, mcp_ls_command, mcp_set_command, mcp_show_command, mcp_thread_command,
 };
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
@@ -73,7 +73,7 @@ Commands:
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
-    mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, tool)
+    mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, tool, thread)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
     craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
 
@@ -159,7 +159,7 @@ enum Commands {
         #[command(subcommand)]
         command: KnowledgeCommand,
     },
-    /// Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, tool)
+    /// Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, tool, thread)
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
@@ -517,6 +517,44 @@ enum McpCommand {
         /// New state
         #[arg(value_enum)]
         state: Toggle,
+    },
+    /// Per-chat MCP server selection (a display mirror, not proof a tool fired)
+    Thread {
+        #[command(subcommand)]
+        command: McpThreadCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpThreadCommand {
+    /// Print the MCP server ids set on a chat. This is a display mirror (the
+    /// ChatMcpEnabled table): it does NOT prove a tool fires; to confirm, run
+    /// `chat --tool-ids mcp:SERVER --verify-tool-firing`
+    Get {
+        /// Chat id (see `monocle chat list`)
+        chat_id: String,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// REPLACE the whole MCP server set of a chat. This is a display mirror (the
+    /// ChatMcpEnabled table): it does NOT guarantee the tool is called; to confirm,
+    /// run `chat --tool-ids mcp:SERVER --verify-tool-firing`. Ids are catalog ids
+    /// from `monocle mcp ls`; the server does not reject unknown ids
+    Set {
+        /// Chat id (see `monocle chat list`)
+        chat_id: String,
+        /// Server ids to set
+        servers: Vec<String>,
+        /// Comma-separated server ids to set (same as listing them)
+        #[arg(long = "servers", value_delimiter = ',')]
+        servers_flag: Vec<String>,
+        /// Explicitly clear the set (required when no servers are given)
+        #[arg(long, conflicts_with_all = ["servers", "servers_flag"])]
+        none: bool,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1052,6 +1090,34 @@ fn main() {
                 Some(&tool),
                 matches!(state, Toggle::Enable),
             ),
+            McpCommand::Thread { command } => match command {
+                McpThreadCommand::Get { chat_id, json } => {
+                    mcp_thread_command(&client, &creds, &selection, &chat_id, None, json)
+                }
+                McpThreadCommand::Set {
+                    chat_id,
+                    mut servers,
+                    servers_flag,
+                    none,
+                    json,
+                } => {
+                    servers.extend(servers_flag);
+                    if servers.is_empty() && !none {
+                        Err(monocle_cli::error::AppError::new(
+                            "No servers given: list server ids, or pass --none to clear the chat's MCP servers.",
+                        ))
+                    } else {
+                        mcp_thread_command(
+                            &client,
+                            &creds,
+                            &selection,
+                            &chat_id,
+                            Some(&servers),
+                            json,
+                        )
+                    }
+                }
+            },
         },
         Commands::Knowledge { command } => match command {
             KnowledgeCommand::Create { name } => {

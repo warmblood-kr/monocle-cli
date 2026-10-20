@@ -119,3 +119,29 @@ pub fn mcp_set_command(
     eprintln!("{what}: {}", if enabled { "enabled" } else { "disabled" });
     Ok(())
 }
+
+/// `monocle mcp thread get|set CHAT_ID` — `servers = None` reads, `Some` replaces
+/// the whole set. Prints the resulting `server_ids`, one per line.
+pub fn mcp_thread_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    chat_id: &str,
+    servers: Option<&[String]>,
+    json: bool,
+) -> Result<()> {
+    let (url, bearer) = connect(client, creds, selection)?;
+    let body = mcp::chat_servers_raw(client, &url, &bearer, chat_id, servers)?;
+    if json {
+        print_json(&body);
+        return Ok(());
+    }
+    let ids = body["server_ids"].as_array().cloned().unwrap_or_default();
+    if ids.is_empty() {
+        eprintln!("No MCP servers set for this chat.");
+    }
+    for id in ids.iter().filter_map(|v| v.as_str()) {
+        println!("{id}");
+    }
+    Ok(())
+}

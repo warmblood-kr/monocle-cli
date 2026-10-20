@@ -342,6 +342,16 @@ impl Client {
         self.send_opt("POST", url, req, false)
     }
 
+    /// PUT a JSON body making exactly one attempt — no transport retry. For
+    /// state-changing replaces whose replay after a lost response is unwanted.
+    pub fn put_json_once(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Resp> {
+        let mut req = self.inner.put(url).json(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        self.send_opt("PUT", url, req, false)
+    }
+
     /// [`post_json_once`](Self::post_json_once) that never follows a redirect (a
     /// 3xx comes back as a plain response) and never replays after a 401. For
     /// bodies carrying a secret that must reach only the named host.
