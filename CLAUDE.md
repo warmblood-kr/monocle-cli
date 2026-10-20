@@ -67,14 +67,18 @@ jarvice는 이 헤더로 처리 분기를 가르므로(jarvice `middleware.py:24
 모바일 계열 동작을 검증할 때는 CLI 대신 **헤더 3개를 갖춘 `curl`**을 쓸 것:
 
 ```bash
-curl -sS https://stg-agent.monocle-ai.com/<endpoint> \
+curl -sS https://stg-warmblood.monocle-ai.com/<endpoint> \
   -H 'content-type: application/json' \
   -H "X-Session-Id: $SESSION_ID" \
   -H "Authorization: Bearer $ACCESS_TOKEN"
 ```
 
-호스트를 헷갈리지 말 것 — 스테이징 **jarvice** 테넌트는 `stg-agent.monocle-ai.com`
-이고, `stg.monocle-ai.com`은 **Stark**(인증 서버)다.
+호스트를 헷갈리지 말 것 — curl 대상은 CLI가 `Profile: ... — tenant <domain>`으로
+보여주는 테넌트 도메인이다(스테이징: `stg-warmblood.monocle-ai.com`,
+`src/profiles.rs`). `stg-agent.monocle-ai.com`은 chat/mcp REST를 curl할 테넌트
+호스트가 **아니다** — 같은 ALB로 resolve되지만 stg CLI 토큰으로 chat 엔드포인트가
+HTTP 401/500을 냈고 `stg-warmblood`에서는 동작했다. 이 호스트가 실제로 무엇을 위한
+것인지는 미확인이다. `stg.monocle-ai.com`은 **Stark**(인증 서버)다.
 
 ## 설계 원칙 — 조합성·상호운용성 (유닉스 철학)
 

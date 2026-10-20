@@ -616,6 +616,26 @@ pub fn chat_list_command(
     Ok(())
 }
 
+/// `monocle chat delete <id>` — permanently delete one hosted thread (once-only
+/// request; confirmation on stderr, stdout stays empty).
+pub fn chat_delete_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &crate::profiles::Selection,
+    id: &str,
+) -> Result<()> {
+    let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
+    eprintln!(
+        "Profile: {} ({}) — tenant {}",
+        selection.profile,
+        selection.environment,
+        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+    );
+    crate::jarvice_chats::delete_thread(client, &jarvice_url, &bearer, id)?;
+    eprintln!("Deleted chat {id}");
+    Ok(())
+}
+
 /// `monocle chat content <id>` — print one hosted thread's active message
 /// path to stdout (profile banner on stderr, like `chat list`). Nothing
 /// reaches stdout on error.
