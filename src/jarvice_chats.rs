@@ -674,8 +674,9 @@ const INJECTED_TAGS: [&str; 2] = ["user_memory", "past_conversations"];
 /// If `text` starts with an injected-block tag (`<user_memory>`,
 /// `</past_conversations>`, …), return `(is_closing, byte length of the tag)`.
 /// Matching is ASCII case-insensitive and allows whitespace inside the angle
-/// brackets (`< user_memory >`, `</ USER_MEMORY >`), so a variant spelling
-/// cannot slip a block past the filter.
+/// brackets (`< user_memory >`, `</ USER_MEMORY >`) and attributes on the
+/// opener, so a variant spelling cannot slip a block past the filter. A tag
+/// missing its `>` extends to the end of the text.
 fn injected_tag_at(text: &str) -> Option<(bool, usize)> {
     let skip_ws = |s: &str| s.len() - s.trim_start().len();
     let mut at = text.strip_prefix('<').map(|_| 1)?;
@@ -690,8 +691,17 @@ fn injected_tag_at(text: &str) -> Option<(bool, usize)> {
             .is_some_and(|b| b.eq_ignore_ascii_case(t.as_bytes()))
     })?;
     at += name.len();
-    at += skip_ws(&text[at..]);
-    text[at..].starts_with('>').then_some((closing, at + 1))
+    // `<user_memoryX>` is a different tag.
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.');
+    if text[at..].chars().next().is_some_and(name_char) {
+        return None;
+    }
+    // Attributes are allowed (`<user_memory id="x">`). A tag with no `>` at all
+    // swallows the rest of the text (fail closed).
+    Some((
+        closing,
+        text[at..].find('>').map_or(text.len(), |p| at + p + 1),
+    ))
 }
 
 /// Remove the injected `<user_memory>` and `<past_conversations>` blocks
@@ -1221,6 +1231,24 @@ mod tests {
         ] {
             assert_eq!(strip_injected_context(text), "hi", "{text}");
         }
+    }
+
+    #[test]
+    fn strip_injected_context_fails_closed_on_an_opener_without_gt() {
+        assert_eq!(strip_injected_context("hi <user_memory SECRET"), "hi");
+        assert_eq!(strip_injected_context("hi <USER_MEMORY"), "hi");
+    }
+
+    #[test]
+    fn strip_injected_context_allows_attributes_on_the_opener() {
+        let text = "<user_memory id=\"x\">S</user_memory>after";
+        assert_eq!(strip_injected_context(text), "after");
+    }
+
+    #[test]
+    fn strip_injected_context_keeps_a_different_tag_with_the_same_prefix() {
+        let text = "a <user_memoryX>keep</user_memoryX> b";
+        assert_eq!(strip_injected_context(text), text);
     }
 
     #[test]
