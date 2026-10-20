@@ -77,7 +77,11 @@ fn short(t: &str) -> String {
 /// The ONE output boundary: everything the command writes to stdout/stderr goes
 /// through here, so a server echoing a secret (the access token) never reaches a
 /// terminal or a pipe. Empty secrets are ignored.
-pub struct Redactor(Vec<String>);
+pub struct Redactor {
+    forms: Vec<String>,
+    /// Hold-back tail of the assistant delta stream (see [`Redactor::delta`]).
+    hold: std::cell::RefCell<String>,
+}
 
 impl Redactor {
     pub fn new(secrets: &[&str]) -> Self {
@@ -91,13 +95,51 @@ impl Redactor {
                 all.push(esc.to_string());
             }
         }
-        Self(all)
+        Self {
+            forms: all,
+            hold: Default::default(),
+        }
     }
 
     pub fn scrub(&self, t: &str) -> String {
-        self.0
+        self.forms
             .iter()
             .fold(t.to_string(), |t, s| t.replace(s, "[REDACTED]"))
+    }
+
+    /// Feed one assistant delta through the single scrubbed stream. A secret split
+    /// across deltas can't leak: the last `longest form - 1` chars stay unemitted
+    /// until more text (or [`Redactor::flush_stream`]) arrives. Returns what is safe to emit.
+    fn delta(&self, t: &str) -> String {
+        let mut b = self.hold.borrow_mut();
+        b.push_str(t);
+        let s = self.scrub(&b);
+        let keep = self
+            .forms
+            .iter()
+            .map(|f| f.chars().count())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let cut = s.chars().count().saturating_sub(keep);
+        let at = s.char_indices().nth(cut).map_or(s.len(), |(i, _)| i);
+        *b = s[at..].to_string();
+        s[..at].to_string()
+    }
+
+    /// Emit the held-back tail (scrubbed). Text mode: raw; `--json`: a synthetic delta frame.
+    fn flush_stream(&self, json: bool) -> bool {
+        let tail = self.scrub(&std::mem::take(&mut *self.hold.borrow_mut()));
+        if tail.is_empty() {
+            return false;
+        }
+        if json {
+            let f = json!({"type": "assistant_delta", "data": {"text": tail}});
+            self.emit("ws", "frame", &f);
+        } else {
+            self.out(&tail);
+        }
+        true
     }
 
     fn out(&self, t: &str) {
@@ -251,6 +293,8 @@ fn run_inner(
         }
     })?;
     let res = drive(t, opts, r, &id, &mut conn, deadline);
+    // Every exit (end, error, timeout, interrupt) flushes the held-back tail.
+    r.flush_stream(opts.json);
     conn.close();
     res
 }
@@ -279,10 +323,30 @@ fn drive(
         let Ok(frame) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
-        if opts.json {
-            r.emit("ws", "frame", &frame);
-        }
         let kind = frame["type"].as_str().unwrap_or("");
+        if opts.json {
+            let mut f = frame.clone();
+            if kind == "assistant_delta" {
+                if let Some(k) = ["text", "delta", "content"]
+                    .into_iter()
+                    .find(|k| f["data"][*k].is_string())
+                {
+                    let t = f["data"][k].as_str().unwrap_or("").to_string();
+                    f["data"][k] = json!(r.delta(&t));
+                }
+            } else if matches!(
+                kind,
+                "assistant_message"
+                    | "turn_end"
+                    | "turn_done"
+                    | "error"
+                    | "input_rejected"
+                    | "interrupted"
+            ) {
+                r.flush_stream(true);
+            }
+            r.emit("ws", "frame", &f);
+        }
         let data = &frame["data"];
         match kind {
             "ready" if !sent => {
@@ -298,11 +362,14 @@ fn drive(
             "assistant_delta" => {
                 streamed = true;
                 if let (false, Some(t)) = (opts.json, data_text(data)) {
-                    r.out(t);
+                    r.out(&r.delta(t));
                     wrote_text = true;
                 }
             }
             "assistant_message" => {
+                if !opts.json && r.flush_stream(false) {
+                    wrote_text = true;
+                }
                 if !opts.json && !streamed {
                     if let Some(t) = data_text(data) {
                         r.out(t);
@@ -339,6 +406,9 @@ fn drive(
                 return poll(t, opts, r, id, baseline, deadline);
             }
             "turn_end" | "turn_done" => {
+                if !opts.json {
+                    r.flush_stream(false);
+                }
                 if wrote_text {
                     r.out("\n");
                 }

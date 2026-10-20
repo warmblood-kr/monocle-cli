@@ -783,3 +783,132 @@ fn stalled_workspace_listing_times_out_at_the_deadline() {
     assert_times_out_fast(&o, t0);
     assert!(!lines(&log).iter().any(|l| l.starts_with("WS connect")));
 }
+
+// ---- a token split across assistant_delta frames must not leak when concatenated ----
+
+fn delta_script(parts: Vec<String>, end: bool) -> WsScript {
+    ws_script(move |s, log| {
+        frame(s, READY);
+        recv(s, log);
+        for p in &parts {
+            let f = serde_json::json!({"type": "assistant_delta", "data": {"text": p}});
+            frame(s, &f.to_string());
+        }
+        if end {
+            frame(s, r#"{"type":"turn_end","data":{}}"#);
+        } else {
+            while s.read().is_ok() {}
+        }
+    })
+}
+
+fn run_deltas(parts: &[&str], end: bool, extra: &[&str]) -> Output {
+    let parts = parts.iter().map(|p| p.to_string()).collect();
+    run_reflect(delta_script(parts, end), Arc::new(rest_default), extra)
+}
+
+/// Concatenation of every delta frame's text in `--json` output.
+fn frame_texts(o: &Output) -> String {
+    out(o)
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["frame"]["type"] == "assistant_delta")
+        .map(|v| v["frame"]["data"]["text"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn assert_split_clean(o: &Output, json: bool) {
+    no_token(o);
+    if json {
+        let t = frame_texts(o);
+        assert!(
+            !t.contains("SECRET-ACCESS-TOK") && t.contains("[REDACTED]"),
+            "{t}"
+        );
+    } else {
+        assert!(out(o).contains("[REDACTED]"), "{}", out(o));
+    }
+}
+
+#[test]
+fn token_split_in_two_deltas_is_redacted() {
+    let (a, b) = TOKEN.split_at(10);
+    for json in [false, true] {
+        let extra: &[&str] = if json { &["--json"] } else { &[] };
+        let o = run_deltas(&[&format!("pre {a}"), &format!("{b} post")], true, extra);
+        assert!(o.status.success(), "{}", err(&o));
+        assert_split_clean(&o, json);
+        if !json {
+            assert_eq!(out(&o), "pre [REDACTED] post\n");
+        }
+    }
+}
+
+#[test]
+fn token_split_in_three_deltas_is_redacted() {
+    let (a, rest) = TOKEN.split_at(6);
+    let (b, c) = rest.split_at(9);
+    for json in [false, true] {
+        let extra: &[&str] = if json { &["--json"] } else { &[] };
+        let o = run_deltas(&[&format!("x {a}"), b, &format!("{c} y")], true, extra);
+        assert!(o.status.success(), "{}", err(&o));
+        assert_split_clean(&o, json);
+        if !json {
+            assert_eq!(out(&o), "x [REDACTED] y\n");
+        }
+    }
+}
+
+#[test]
+fn tail_is_flushed_at_turn_end() {
+    // The stream ends right after the token: the held-back tail must still come out.
+    let (a, b) = TOKEN.split_at(20);
+    let o = run_deltas(&["t ", a, b], true, &[]);
+    assert_eq!(out(&o), "t [REDACTED]\n");
+    let o = run_deltas(&["tail-only"], true, &[]);
+    assert_eq!(out(&o), "tail-only\n");
+    let o = run_deltas(&["abc ", a, b], true, &["--json"]);
+    assert_split_clean(&o, true);
+    assert!(
+        frame_texts(&o).ends_with("[REDACTED]"),
+        "{}",
+        frame_texts(&o)
+    );
+    // Synthetic tail frame comes before the terminal frame.
+    assert!(
+        out(&o)
+            .trim_end()
+            .ends_with(r#""type":"turn_end","data":{}}}"#),
+        "{}",
+        out(&o)
+    );
+}
+
+#[test]
+fn ordinary_text_is_complete_and_in_order() {
+    let o = run_deltas(&["Hel", "lo ", "world"], true, &[]);
+    assert_eq!(out(&o), "Hello world\n");
+    let o = run_deltas(&["Hel", "lo ", "wörld"], true, &["--json"]);
+    assert_eq!(frame_texts(&o), "Hello wörld");
+}
+
+#[test]
+fn buffered_tail_is_flushed_scrubbed_on_timeout() {
+    let (a, _) = TOKEN.split_at(12);
+    for json in [false, true] {
+        let extra: &[&str] = if json { &["--json"] } else { &[] };
+        let mut args = vec!["--timeout", "2"];
+        args.extend_from_slice(extra);
+        // Stall after a delta holding the partial token (+ a fully held tail).
+        let o = run_deltas(&[&format!("ok {a}")], false, &args);
+        assert!(
+            !o.status.success() && err(&o).contains("Timed out"),
+            "{}",
+            err(&o)
+        );
+        no_token(&o);
+        let shown = if json { frame_texts(&o) } else { out(&o) };
+        // Without the flush the held-back partial token would be silently dropped.
+        assert_eq!(shown.trim_end(), format!("ok {a}"), "{shown}");
+    }
+}
