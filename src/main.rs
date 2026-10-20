@@ -504,7 +504,7 @@ struct ModelWriteArgs {
     /// Model id (what `monocle chat --model` takes)
     id: String,
     /// JSON file with ModelForm fields (base_model_id, name, meta, params, ...); flags override it.
-    /// `meta` and `params` are merged key-wise onto the stored model (keys not in the file are kept); other fields are replaced
+    /// On update, `meta` and `params` merge key-wise onto the stored model (keys not in the file are kept) and other fields are replaced; on create the file is the starting point
     #[arg(long, value_name = "PATH")]
     file: Option<String>,
     /// Display name (default for create: the id)
