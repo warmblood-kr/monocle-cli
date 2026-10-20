@@ -143,22 +143,62 @@ pub struct DiagLine<'a> {
     pub duration_ms: Option<u64>,
 }
 
-/// Number right after `marker` in `msg` (our own error format), 3-4 digits.
-fn number_after(msg: &str, marker: &str) -> Option<u16> {
-    let rest = &msg[msg.find(marker)? + marker.len()..];
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    (3..=4)
-        .contains(&digits.len())
-        .then(|| digits.parse().ok())?
+fn all_digits(s: &str, len: std::ops::RangeInclusive<usize>) -> bool {
+    len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `(status, ws_close_code)` of one of our errors. `Turn failed …` embeds
-/// server-provided text, so nothing is parsed from it.
+/// Exactly our own HTTP-failure wordings, matched against the WHOLE message:
+/// `<what> failed: HTTP NNN[ (code)].` (`craft_server::api_error` and siblings;
+/// `what` is letters/spaces only, `code` is `[a-z_]{1,40}`),
+/// `Could not get a socket token (HTTP NNN).` and
+/// `WebSocket handshake refused: HTTP NNN.`
+fn http_status(msg: &str) -> Option<u16> {
+    let num = if let Some(n) = msg
+        .strip_prefix("Could not get a socket token (HTTP ")
+        .and_then(|r| r.strip_suffix(")."))
+    {
+        n
+    } else if let Some(n) = msg
+        .strip_prefix("WebSocket handshake refused: HTTP ")
+        .and_then(|r| r.strip_suffix('.'))
+    {
+        n
+    } else {
+        let (what, rest) = msg.split_once(" failed: HTTP ")?;
+        if !(1..=40).contains(&what.len())
+            || !what.chars().all(|c| c.is_ascii_alphabetic() || c == ' ')
+        {
+            return None;
+        }
+        let rest = rest.strip_suffix('.')?;
+        match rest.split_once(' ') {
+            None => rest,
+            Some((n, code)) => {
+                let code = code.strip_prefix('(')?.strip_suffix(')')?;
+                if !(1..=40).contains(&code.len())
+                    || !code.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
+                {
+                    return None;
+                }
+                n
+            }
+        }
+    };
+    all_digits(num, 3..=3).then(|| num.parse().ok())?
+}
+
+/// Exactly `ws.rs`'s `WebSocket closed by the server (close code N).`
+fn close_code(msg: &str) -> Option<u16> {
+    let n = msg
+        .strip_prefix("WebSocket closed by the server (close code ")?
+        .strip_suffix(").")?;
+    all_digits(n, 1..=5).then(|| n.parse().ok())?
+}
+
+/// `(status, ws_close_code)` of one of our errors: only our own fixed wordings,
+/// matched whole, so server-provided text inside any message is never read.
 pub fn error_codes(msg: &str) -> (Option<u16>, Option<u16>) {
-    if msg.starts_with("Turn failed") {
-        return (None, None);
-    }
-    (number_after(msg, "HTTP "), number_after(msg, "close code "))
+    (http_status(msg), close_code(msg))
 }
 
 /// Rotate to `PATH.1` (replacing any older one) once the file would pass this.
@@ -487,21 +527,46 @@ mod tests {
     }
 
     #[test]
-    fn codes_come_only_from_our_own_text() {
+    fn codes_come_only_from_our_own_exact_wordings() {
         assert_eq!(
-            error_codes("Delegation failed: HTTP 502 (bad_gateway)."),
+            error_codes("Delegation failed: HTTP 502."),
             (Some(502), None)
         );
         assert_eq!(
-            error_codes("WebSocket closed by the server (close code 1011)"),
-            (None, Some(1011))
+            error_codes("Responses API failed: HTTP 429 (rate_limited)."),
+            (Some(429), None)
         );
         assert_eq!(
-            error_codes("Turn failed (error): HTTP 418 close code 1000"),
-            (None, None)
+            error_codes("Could not get a socket token (HTTP 401)."),
+            (Some(401), None)
         );
-        assert_eq!(error_codes("HTTP 99999 nope"), (None, None));
-        assert_eq!(error_codes("no codes here"), (None, None));
+        assert_eq!(
+            error_codes("WebSocket handshake refused: HTTP 403."),
+            (Some(403), None)
+        );
+        assert_eq!(
+            error_codes("WebSocket closed by the server (close code 1011)."),
+            (None, Some(1011))
+        );
+        // Server text (a body containing both patterns) must never be read.
+        let body = "HTTP 418 close code 1011";
+        for msg in [
+            format!("Turn failed (error): {body}"),
+            format!("Responses API error: {body}"),
+            format!("Responses API failed: HTTP 500 ({body})."),
+            format!("Delegation failed: {body}."),
+            format!("x failed: HTTP 502. {body}"),
+            format!("Could not get a socket token (HTTP 401). {body}"),
+            format!("{body} failed: HTTP 502."),
+            format!("prefix {body}"),
+            format!("WebSocket closed by the server (close code 1011). {body}"),
+            format!("WebSocket closed by the server (close code {body})."),
+            "Delegation failed: HTTP 99999.".to_string(),
+            "Delegation failed: HTTP 502 (Bad-Code).".to_string(),
+            "no codes here".to_string(),
+        ] {
+            assert_eq!(error_codes(&msg), (None, None), "{msg}");
+        }
     }
 
     #[test]
