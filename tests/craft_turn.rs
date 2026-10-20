@@ -1226,6 +1226,12 @@ fn turn_records_session_and_continue_reuses_it() {
 fn continue_without_stored_session_errors_before_any_request() {
     let (addr, log) = start(happy(), Arc::new(rest_default));
     let home = setup(&addr);
+    // Expired token: a refresh (stub request) would happen if auth were reached.
+    let c = home.path().join(".monocle/credentials.json");
+    let stale = std::fs::read_to_string(&c)
+        .unwrap()
+        .replace("2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z");
+    std::fs::write(&c, stale).unwrap();
     let url = format!("http://{addr}");
     let o = turn(home.path(), &url, &["--continue", "hi", "--no-delegation"]);
     assert!(!o.status.success());
@@ -1279,4 +1285,28 @@ fn continue_conflicts_with_session() {
     assert!(!o.status.success());
     assert!(err(&o).contains("cannot be used with"), "{}", err(&o));
     assert!(lines(&log).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_monocle_dir_is_tightened_to_0700_and_credentials_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+    let (addr, _log) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let dir = home.path().join(".monocle");
+    let creds = dir.join("credentials.json");
+    let before = std::fs::read(&creds).unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let creds_mode = mode(&creds);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["hi there", "--no-delegation"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&state_file(home.path())), 0o600);
+    assert_eq!(before, std::fs::read(&creds).unwrap());
+    assert_eq!(creds_mode, mode(&creds));
 }

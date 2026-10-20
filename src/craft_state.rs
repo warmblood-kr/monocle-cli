@@ -71,7 +71,7 @@ impl LastSession {
     fn write(&self, m: &Map) -> std::io::Result<()> {
         use std::io::Write;
         #[cfg(unix)]
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
         if !self.dir.exists() {
             let mut b = fs::DirBuilder::new();
             b.recursive(true);
@@ -79,6 +79,9 @@ impl LastSession {
             b.mode(0o700);
             b.create(&self.dir)?;
         }
+        // An existing dir (e.g. 0755 from older versions) is tightened too.
+        #[cfg(unix)]
+        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
         let tmp = self.dir.join(format!(
             "craft-last-session.json.tmp.{}",
             std::process::id()

@@ -418,26 +418,30 @@ fn delegate(
     Ok(())
 }
 
-/// `--continue`: the stored id for this profile/env/lane, checked to still exist
-/// (a gone session drops its entry). No stored id or a failed check makes no turn.
-fn resolve_continue(
-    last: &LastSession,
-    selection: &Selection,
-    lane: Lane,
-    exists: impl FnOnce(&str) -> Result<bool>,
-) -> Result<String> {
+/// `--continue`, step 1 (no network, no auth): the stored id for this
+/// profile/env/lane. None stored makes no turn and no request of any kind.
+fn stored_continue(last: &LastSession, selection: &Selection, lane: Lane) -> Result<String> {
     let lane_name = if lane == Lane::Sdk {
         "sdk"
     } else {
         "openworker"
     };
-    let Some(id) = last.get() else {
+    last.get().ok_or_else(|| {
         let flag = if lane == Lane::Sdk { " --lane sdk" } else { "" };
-        return Err(AppError::new(format!(
+        AppError::new(format!(
             "No previous craft session for lane {lane_name} (profile {}, env {}). Start one with: monocle craft{flag} turn \"...\"",
             selection.profile, selection.environment
-        )));
-    };
+        ))
+    })
+}
+
+/// `--continue`, step 2: the stored id must still exist (a gone session drops
+/// its entry).
+fn check_continue(
+    last: &LastSession,
+    id: String,
+    exists: impl FnOnce(&str) -> Result<bool>,
+) -> Result<String> {
     if !exists(&id)? {
         last.clear();
         return Err(AppError::new(format!(
@@ -469,6 +473,12 @@ pub fn craft_turn_command(
         },
     );
     opts.last = Some(last.clone());
+    // Read the state file before any auth/connect so "none stored" costs no request.
+    let stored = if opts.continue_last {
+        Some(stored_continue(&last, selection, lane)?)
+    } else {
+        None
+    };
     if lane == Lane::Sdk {
         if opts.workspace.is_some() {
             return Err(AppError::new(
@@ -476,8 +486,8 @@ pub fn craft_turn_command(
             ));
         }
         let (base, bearer) = connect(client, creds, selection, lane)?;
-        if opts.continue_last {
-            opts.session = Some(resolve_continue(&last, selection, lane, |id| {
+        if let Some(id) = stored {
+            opts.session = Some(check_continue(&last, id, |id| {
                 sdk::session_exists(client, &base, &bearer, id)
             })?);
         }
@@ -507,8 +517,8 @@ pub fn craft_turn_command(
         ws_base: &ws_base,
         bearer: &bearer,
     };
-    if opts.continue_last {
-        opts.session = Some(resolve_continue(&last, selection, lane, |id| {
+    if let Some(id) = stored {
+        opts.session = Some(check_continue(&last, id, |id| {
             craft::session_exists(client, &base, &bearer, id)
         })?);
     }
