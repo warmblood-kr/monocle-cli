@@ -93,10 +93,21 @@ pub(crate) fn safe_detail_code(body: &Value) -> Option<String> {
 /// errors carry a stable `detail.code` envelope, which is safe and useful when
 /// it passes [`is_safe_code`]; any other body (stack text, proxy HTML) is not.
 pub(crate) fn api_error(what: &str, resp: &Resp) -> AppError {
-    let code = resp.json::<Value>().ok().and_then(|v| safe_detail_code(&v));
-    match code {
-        Some(code) => AppError::new(format!("{what} failed: HTTP {} ({code}).", resp.status)),
-        None => AppError::new(format!("{what} failed: HTTP {}.", resp.status)),
+    AppError::new(format!(
+        "{what} failed: {}.",
+        status_label(resp.status, &resp.text())
+    ))
+}
+
+/// `HTTP <status>` plus ` (<code>)` when `body` is JSON with a safe `detail.code`.
+/// The body text is only inspected, never echoed.
+pub(crate) fn status_label(status: u16, body: &str) -> String {
+    match serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| safe_detail_code(&v))
+    {
+        Some(c) => format!("HTTP {status} ({c})"),
+        None => format!("HTTP {status}"),
     }
 }
 
@@ -680,6 +691,27 @@ mod tests {
         assert_eq!(
             parse_with_idle(&rx, Duration::from_secs(5)).unwrap().answer,
             "hi"
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_label_tests {
+    use super::status_label;
+
+    #[test]
+    fn keeps_only_safe_code() {
+        assert_eq!(
+            status_label(404, r#"{"detail":{"code":"not_found"}}"#),
+            "HTTP 404 (not_found)"
+        );
+        assert_eq!(
+            status_label(500, r#"{"detail":{"code":"Bearer eyJ x"}}"#),
+            "HTTP 500"
+        );
+        assert_eq!(
+            status_label(502, "<html>SECRET-TOKEN-MARKER</html>"),
+            "HTTP 502"
         );
     }
 }

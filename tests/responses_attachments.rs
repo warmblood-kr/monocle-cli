@@ -80,7 +80,7 @@ fn upload_failure_surfaces_a_clear_error_and_never_calls_responses() {
 
     let s = stub(move |_addr, _method, url, _body| {
         if url.starts_with("/api/v1/files/") {
-            (500, "upload broke".to_string())
+            (500, "SECRET-TOKEN-MARKER".to_string())
         } else if url.starts_with("/api/responses") {
             *responses_called_for_handler.lock().unwrap() = true;
             (
@@ -105,7 +105,8 @@ fn upload_failure_surfaces_a_clear_error_and_never_calls_responses() {
         Err(e) => e.to_string(),
     };
     assert!(err.contains("File upload failed"), "got: {err}");
-    assert!(err.contains("500"), "got: {err}");
+    assert!(err.contains("HTTP 500"), "got: {err}");
+    assert!(!err.contains("SECRET-TOKEN-MARKER"), "got: {err}");
     assert!(
         !*responses_called.lock().unwrap(),
         "must not call /api/responses when the upload itself failed"

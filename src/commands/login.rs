@@ -449,25 +449,10 @@ fn poll_for_token(
                     "Authorization request was denied by the user.",
                 ))
             }
-            Some(e) => {
-                let desc = val
-                    .as_ref()
-                    .and_then(|v| v.get("error_description"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                return Err(AppError::new(format!("Token polling failed: {e} - {desc}")));
-            }
+            Some(e) => return Err(AppError::new(poll_failed_message(e))),
             None => {
-                let raw = resp.text();
-                let snippet: String = raw.chars().take(200).collect();
-                let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-                let snippet = if snippet.is_empty() {
-                    "(empty)".to_string()
-                } else {
-                    snippet
-                };
                 return Err(AppError::new(format!(
-                    "Token polling failed: server returned HTTP {} with non-OAuth response. Body: {snippet}",
+                    "Token polling failed: server returned HTTP {} with non-OAuth response.",
                     resp.status
                 )));
             }
@@ -477,6 +462,16 @@ fn poll_for_token(
     Err(AppError::new(
         "Device code expired. Please run login again.",
     ))
+}
+
+/// Server-controlled OAuth `error` is shown only if it is a safe code;
+/// `error_description` is never shown.
+fn poll_failed_message(error: &str) -> String {
+    if crate::jarvice_knowledge::is_safe_code(error) {
+        format!("Token polling failed: {error}")
+    } else {
+        "Token polling failed.".to_string()
+    }
 }
 
 fn build_creds(
@@ -546,4 +541,18 @@ fn print_login_success(email: &str, tenant_name: &str, leading_newline: bool) {
         c::bold("monocle setup"),
         c::dim(".)")
     );
+}
+
+#[cfg(test)]
+mod poll_message_tests {
+    use super::poll_failed_message;
+
+    #[test]
+    fn unsafe_error_is_omitted() {
+        assert_eq!(
+            poll_failed_message("invalid_grant"),
+            "Token polling failed: invalid_grant"
+        );
+        assert_eq!(poll_failed_message("Bearer eyJ x"), "Token polling failed.");
+    }
 }

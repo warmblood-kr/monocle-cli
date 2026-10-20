@@ -197,3 +197,35 @@ fn root_help_shows_router_hides_aliases() {
         Some(0)
     );
 }
+
+const MARKER: &str = "Bearer eyJSECRET-TOKEN-MARKER";
+
+/// A failing endpoint whose body carries a token-like marker.
+fn leaky_stub() -> common::Stub {
+    common::stub(|_, _, _, _| (500, format!(r#"{{"detail":{{"message":"{MARKER}"}}}}"#)))
+}
+
+fn assert_no_leak(o: &Output) {
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(o));
+    let all = format!("{}{}", stderr(o), stdout(o));
+    assert!(!all.contains("SECRET-TOKEN-MARKER"), "leaked: {all}");
+    assert!(all.contains("HTTP 500"), "got: {all}");
+}
+
+#[test]
+fn failed_responses_never_echo_the_body() {
+    let stub = leaky_stub();
+    let home = logged_in_home(&stub);
+    std::fs::write(home.path().join("a.wav"), b"RIFF").unwrap();
+    // models (model_list), audio_io via speech / image / transcribe
+    for args in [
+        &["router", "models"][..],
+        &["router", "audio", "speak", "hi", "-o", "x.mp3"],
+        &[
+            "router", "image", "generate", "a cat", "--model", "m", "-o", "x.png",
+        ],
+        &["router", "audio", "transcribe", "a.wav"],
+    ] {
+        assert_no_leak(&run(home.path(), args));
+    }
+}

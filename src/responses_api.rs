@@ -233,10 +233,9 @@ impl<'a> ResponsesClient<'a> {
         )?;
         if !resp.ok() {
             return Err(AppError::new(format!(
-                "File upload failed (HTTP {}) for {}: {}",
-                resp.status,
-                file.filename,
-                resp.text()
+                "File upload failed ({}) for {}",
+                crate::jarvice_knowledge::status_label(resp.status, &resp.text()),
+                file.filename
             )));
         }
         let data: Value = resp.json()?;

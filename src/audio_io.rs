@@ -98,14 +98,12 @@ pub fn resolve_audio_input(
     })
 }
 
-/// Print an API error (status + body) to stderr and exit 1.
+/// Print an API error (status + safe `detail.code` only, never the body) to stderr and exit 1.
 pub fn write_api_error_and_exit(resp: &Resp) -> ! {
-    let body = resp.text();
-    eprintln!("API error {} {}", resp.status, resp.status_text);
-    eprint!("{body}");
-    if !body.ends_with('\n') {
-        eprintln!();
-    }
+    eprintln!(
+        "API error: {}",
+        crate::jarvice_knowledge::status_label(resp.status, &resp.text())
+    );
     std::process::exit(1);
 }
 
