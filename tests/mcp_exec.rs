@@ -12,7 +12,11 @@ use monocle_cli::credentials::{Credentials, CredentialsData};
 const LIST: &str = r#"{"servers":[
  {"id":"law","name":"law","enabled":true,"tools":[{"name":"get","enabled":true},{"name":"off","enabled":false}]},
  {"id":"dis","name":"dis","enabled":false,"tools":[]},
- {"id":"au","name":"au","enabled":true,"auth_required":true,"tools":[]}]}"#;
+ {"id":"au","name":"au","enabled":true,"auth_required":true,"tools":[]},
+ {"id":"cu-1","name":"cu","enabled":true,"tools":[]},
+ {"id":"cu-2","name":"nolist","enabled":true,"tools":[]},
+ {"id":"cu-3","name":"errd","enabled":true,"tools":[]},
+ {"id":"d.x","name":"dotted","enabled":true,"tools":[{"name":"foo.bar","enabled":true}]}]}"#;
 /// (method, url, body)
 type Seen = Arc<Mutex<Vec<(String, String, String)>>>;
 const ANSWER: &str = "it returned x";
@@ -30,6 +34,17 @@ fn stub(resp: String, chat_status: u16) -> (common::Stub, Seen) {
         s.lock().unwrap().push((m.into(), u.into(), b.into()));
         match (m, u) {
             ("GET", "/api/v1/mcp/servers") => (200, LIST.into(), vec![]),
+            ("GET", "/api/v1/mcp/servers/cu-1") => (
+                200,
+                r#"{"id":"cu-1","tools":[{"name":"get","enabled":true},{"name":"off","enabled":false}]}"#.into(),
+                vec![],
+            ),
+            ("GET", "/api/v1/mcp/servers/cu-2") => (200, r#"{"id":"cu-2"}"#.into(), vec![]),
+            ("GET", "/api/v1/mcp/servers/cu-3") => (
+                200,
+                r#"{"id":"cu-3","tools":[{"name":"get"}],"tools_error":"boom"}"#.into(),
+                vec![],
+            ),
             ("POST", "/api/responses") if chat_status == 200 => {
                 (200, resp.clone(), vec![("x-thread-id", "th-9".to_string())])
             }
@@ -156,4 +171,44 @@ fn chat_error_body_is_not_echoed() {
     let o = run(&st, &["mcp", "exec", "law/get"]);
     assert_ne!(o.status.code(), Some(0));
     assert!(!err(&o).contains("SECRET-SERVER-BODY") && !out(&o).contains("SECRET-SERVER-BODY"));
+}
+
+#[test]
+fn custom_server_preflights_against_detail_tools() {
+    let (st, seen) = stub(reply(None), 200);
+    let o = run(&st, &["mcp", "exec", "cu/get"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(chats(&seen).len(), 1);
+    for (target, needle) in [
+        ("cu/zzz", "has no tool"),
+        ("cu/off", "is disabled"),
+        (
+            "nolist/get",
+            "MCP tool list unavailable for 'nolist'; cannot verify tool 'get' exists",
+        ),
+        ("errd/get", "MCP tool list unavailable for 'errd'"),
+    ] {
+        let (st, seen) = stub(reply(None), 200);
+        let o = run(&st, &["mcp", "exec", target]);
+        assert_eq!(o.status.code(), Some(1), "{target}: {}", err(&o));
+        assert!(err(&o).contains(needle), "{target}: {}", err(&o));
+        assert!(chats(&seen).is_empty(), "{target}");
+    }
+}
+
+#[test]
+fn odd_names_are_sanitized_like_jarvice() {
+    let (st, seen) = stub(reply(Some(r#"[{"name":"d_x__foo_bar"}]"#)), 200);
+    let o = run(&st, &["mcp", "exec", "dotted/foo.bar", "--verify"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&chats(&seen)[0]).unwrap();
+    assert_eq!(v["tools"], serde_json::json!(["mcp:d_x__foo_bar"]));
+}
+
+#[test]
+fn server_only_verify_cannot_verify_on_unparsed_entries() {
+    let r = reply(Some(r#"[{"id":"1"}]"#));
+    let (st, _) = stub(r, 200);
+    let o = run(&st, &["mcp", "exec", "law", "--verify"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
 }

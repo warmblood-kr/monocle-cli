@@ -161,8 +161,14 @@ fn exec_template(server: &str, tool: Option<&str>) -> String {
 }
 
 /// Cheap checks against the catalog so a doomed turn is never sent.
-/// Returns the server id to use in the `mcp:` tool id.
-fn exec_preflight(all: &[mcp::Server], server: &str, tool: Option<&str>) -> Result<String> {
+/// Returns the server id to use in the `mcp:` tool id. Custom servers list no
+/// tools in the catalog, so `detail` (the server detail body) supplies them.
+fn exec_preflight(
+    all: &[mcp::Server],
+    server: &str,
+    tool: Option<&str>,
+    detail: impl FnOnce(&str) -> Result<serde_json::Value>,
+) -> Result<String> {
     let s = mcp::find_server(all, server)?;
     let fail = |m: String| Err(crate::error::AppError::new(m));
     if !s.enabled {
@@ -177,21 +183,34 @@ fn exec_preflight(all: &[mcp::Server], server: &str, tool: Option<&str>) -> Resu
         ));
     }
     if let Some(t) = tool {
-        // Custom servers list no tools in the catalog; only judge when it does.
-        if !s.tools.is_empty() {
-            match s.tools.iter().find(|x| x.name == t) {
-                None => {
+        let fetched;
+        let tools: &[mcp::Tool] = if s.tools.is_empty() {
+            let body = detail(&s.id)?;
+            let errored = body.get("tools_error").is_some_and(|e| !e.is_null());
+            fetched = serde_json::from_value::<Server>(body).map(|d| d.tools).ok();
+            match fetched.as_deref() {
+                Some(ts) if !ts.is_empty() && !errored => ts,
+                _ => {
                     return fail(format!(
-                        "MCP server '{server}' has no tool '{t}' (run `monocle mcp show {server}`)."
+                        "MCP tool list unavailable for '{server}'; cannot verify tool '{t}' exists."
                     ))
                 }
-                Some(x) if !x.enabled => {
-                    return fail(format!(
-                        "Tool '{t}' of '{server}' is disabled (run `monocle mcp tool {server} {t} enable`)."
-                    ))
-                }
-                _ => {}
             }
+        } else {
+            &s.tools
+        };
+        match tools.iter().find(|x| x.name == t) {
+            None => {
+                return fail(format!(
+                    "MCP server '{server}' has no tool '{t}' (run `monocle mcp show {server}`)."
+                ))
+            }
+            Some(x) if !x.enabled => {
+                return fail(format!(
+                    "Tool '{t}' of '{server}' is disabled (run `monocle mcp tool {server} {t} enable`)."
+                ))
+            }
+            _ => {}
         }
     }
     Ok(s.id.clone())
@@ -209,38 +228,49 @@ fn exec_verdict(
         reply.unparsed_tool_calls,
         "--responses mode",
     );
-    let prefixes = [format!("{}__", server.id), format!("{}__", server.name)];
+    // jarvice sanitizes names it sends natively; tools_used carries the sanitized
+    // form, so compare sanitized-to-sanitized (both sides).
+    let used: Vec<String> = reply.tools_used.iter().map(|u| mcp::sanitize(u)).collect();
+    let prefixes = [
+        format!("{}__", mcp::sanitize(&server.id)),
+        format!("{}__", mcp::sanitize(&server.name)),
+    ];
     let expected = match tool {
         Some(t) => {
-            let qualified = prefixes.iter().map(|p| format!("{p}{t}"));
-            let want = qualified
-                .into_iter()
-                .find(|q| reply.tools_used.contains(q))
-                .unwrap_or_else(|| t.to_string());
+            let want = [&server.id, &server.name]
+                .iter()
+                .map(|n| mcp::fn_name(n, t))
+                .find(|q| used.contains(q))
+                .unwrap_or_else(|| mcp::sanitize(t));
             ToolFiringExpectation::Named(want)
         }
         None => ToolFiringExpectation::Any,
     };
     let verdict = tool_firing_verification(
         &expected,
-        &reply.tools_used,
+        &used,
         reply.unparsed_tools_used,
         reply.tools_used_present,
         dropped.as_deref(),
     );
-    let foreign = tool.is_none()
-        && matches!(verdict, ToolFiringVerdict::Passed(_))
-        && !reply.tools_used.is_empty()
-        && !reply
-            .tools_used
+    if tool.is_none() && matches!(verdict, ToolFiringVerdict::Passed(_)) {
+        let ours = used
             .iter()
             .any(|u| prefixes.iter().any(|p| u.starts_with(p.as_str())));
-    if foreign {
-        return ToolFiringVerdict::Failed(format!(
-            "✗ tool-firing verification FAILED: no tool of `{}` ran; these ran instead: {}",
-            server.name,
-            reply.tools_used.join(", ")
-        ));
+        if !ours && reply.unparsed_tools_used > 0 {
+            // Unreadable entries might be this server's; "Any" must not pass on them.
+            return ToolFiringVerdict::CannotVerify(format!(
+                "? tool-firing verification: CANNOT VERIFY — {} `tools_used` entry/entries came back in an unrecognized shape, so whether a tool of `{}` ran is unknown",
+                reply.unparsed_tools_used, server.name
+            ));
+        }
+        if !ours {
+            return ToolFiringVerdict::Failed(format!(
+                "✗ tool-firing verification FAILED: no tool of `{}` ran; these ran instead: {}",
+                server.name,
+                reply.tools_used.join(", ")
+            ));
+        }
     }
     verdict
 }
@@ -260,9 +290,11 @@ pub fn mcp_exec_command(
     };
     let (session, url, bearer) = resolve_jarvice(client, creds)?;
     let all = mcp::parse_servers(&mcp::list_servers_raw(client, &url, &bearer)?)?;
-    let id = exec_preflight(&all, server, tool)?;
+    let id = exec_preflight(&all, server, tool, |id| {
+        mcp::server_detail_raw(client, &url, &bearer, id)
+    })?;
     let tool_id = match tool {
-        Some(t) => format!("mcp:{id}__{t}"),
+        Some(t) => format!("mcp:{}", mcp::fn_name(&id, t)),
         None => format!("mcp:{id}"),
     };
     let text = if prompt.is_empty() {
