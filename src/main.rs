@@ -503,7 +503,8 @@ enum KnowledgeCommand {
 struct ModelWriteArgs {
     /// Model id (what `monocle chat --model` takes)
     id: String,
-    /// JSON file with ModelForm fields (base_model_id, name, meta, params, ...); flags override it
+    /// JSON file with ModelForm fields (base_model_id, name, meta, params, ...); flags override it.
+    /// `meta` and `params` are merged key-wise onto the stored model (keys not in the file are kept); other fields are replaced
     #[arg(long, value_name = "PATH")]
     file: Option<String>,
     /// Display name (default for create: the id)
@@ -523,6 +524,33 @@ struct ModelWriteArgs {
     /// Knowledge collection name or id (repeatable; replaces the model's collections)
     #[arg(long = "knowledge", value_name = "COLLECTION")]
     knowledge: Vec<String>,
+    /// Detach all tools (conflicts with --tool)
+    #[arg(long, conflicts_with = "tools")]
+    clear_tools: bool,
+    /// Detach all knowledge collections (conflicts with --knowledge)
+    #[arg(long, conflicts_with = "knowledge")]
+    clear_knowledge: bool,
+    /// Who can use the model: `private` (owner only; create default) or `public`
+    /// (everyone in the tenant). Omit to keep the stored setting on update.
+    #[arg(
+        long,
+        value_parser = ["private", "public"],
+        conflicts_with_all = ["read_groups", "write_groups", "read_users", "write_users"]
+    )]
+    access: Option<String>,
+    /// Share: group id allowed to read (repeatable). Any --read-*/--write-* flag
+    /// makes the model shared and replaces the whole access list.
+    #[arg(long = "read-group", value_name = "GROUP_ID")]
+    read_groups: Vec<String>,
+    /// Share: group id allowed to write (repeatable)
+    #[arg(long = "write-group", value_name = "GROUP_ID")]
+    write_groups: Vec<String>,
+    /// Share: user id allowed to read (repeatable)
+    #[arg(long = "read-user", value_name = "USER_ID")]
+    read_users: Vec<String>,
+    /// Share: user id allowed to write (repeatable)
+    #[arg(long = "write-user", value_name = "USER_ID")]
+    write_users: Vec<String>,
 }
 
 impl From<ModelWriteArgs> for WriteArgs {
@@ -536,6 +564,13 @@ impl From<ModelWriteArgs> for WriteArgs {
             system: a.system,
             tools: a.tools,
             knowledge: a.knowledge,
+            clear_tools: a.clear_tools,
+            clear_knowledge: a.clear_knowledge,
+            access: a.access,
+            read_groups: a.read_groups,
+            write_groups: a.write_groups,
+            read_users: a.read_users,
+            write_users: a.write_users,
         }
     }
 }

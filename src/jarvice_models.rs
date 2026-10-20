@@ -153,6 +153,12 @@ pub struct Overrides {
     pub tool_ids: Vec<String>,
     /// Replaces `meta.knowledge` when non-empty: `{id, name, type: "collection"}`.
     pub knowledge: Vec<Value>,
+    /// Sets `meta.toolIds = []` (an empty `tool_ids` alone means "leave as is").
+    pub clear_tools: bool,
+    /// Sets `meta.knowledge = []`.
+    pub clear_knowledge: bool,
+    /// Replaces `access_control` (`null` = public, `{}` = private, else shared).
+    pub access_control: Option<Value>,
 }
 
 fn obj<'a>(form: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
@@ -165,7 +171,7 @@ fn obj<'a>(form: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, V
 
 /// Build the full `ModelForm` for create/update: start from `stored` (update) or
 /// empty (create), overlay the top-level keys of `file` (a JSON `ModelForm`
-/// fragment), then the flags. A new model defaults to `name = id`, private
+/// fragment; `meta` and `params` are merged key-wise, other keys replaced), then the flags. A new model defaults to `name = id`, private
 /// (`access_control = {}`, as jarvice's own "private" — omitted would mean public)
 /// and active. The `id` of the result is always `id`.
 pub fn build_form(
@@ -206,12 +212,24 @@ pub fn build_form(
             }
         }
         for (k, v) in f {
-            form.insert(k.clone(), v.clone());
+            // meta/params merge key-wise (top level) so a fragment setting one
+            // key does not drop the stored toolIds/knowledge/temperature/...
+            match (form.get_mut(k), v) {
+                (Some(Value::Object(old)), Value::Object(new)) if k == "meta" || k == "params" => {
+                    old.extend(new.clone());
+                }
+                _ => {
+                    form.insert(k.clone(), v.clone());
+                }
+            }
         }
     }
     form.insert("id".into(), json!(id));
     if let Some(b) = &o.base_model_id {
         form.insert("base_model_id".into(), json!(b));
+    }
+    if let Some(a) = &o.access_control {
+        form.insert("access_control".into(), a.clone());
     }
     if let Some(n) = &o.name {
         form.insert("name".into(), json!(n));
@@ -224,8 +242,14 @@ pub fn build_form(
     if !o.tool_ids.is_empty() {
         meta.insert("toolIds".into(), json!(o.tool_ids));
     }
+    if o.clear_tools {
+        meta.insert("toolIds".into(), json!([]));
+    }
     if !o.knowledge.is_empty() {
         meta.insert("knowledge".into(), json!(o.knowledge));
+    }
+    if o.clear_knowledge {
+        meta.insert("knowledge".into(), json!([]));
     }
     let params = obj(&mut form, "params");
     if let Some(s) = &o.system {
