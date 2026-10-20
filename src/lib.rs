@@ -15,6 +15,7 @@ pub mod diag;
 pub mod endpoints;
 pub mod error;
 pub mod image_io;
+pub mod instrument;
 pub mod jarvice_agent;
 pub mod jarvice_chats;
 pub mod jarvice_knowledge;

@@ -21,6 +21,7 @@ use crate::config::{Config, ConfigData};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
+use crate::instrument::{Lane, Timings};
 use crate::net::Client;
 use crate::origin::auth_headers;
 use crate::responses_api::ResponsesClient;
@@ -49,6 +50,8 @@ pub struct ChatOptions {
     /// `--show-tools`: after each reply, print the tool names the server
     /// reports it executed (`tools_used`) to stderr.
     pub show_tools: bool,
+    /// `--timings`: one-shot hosted Chat only; one JSON line to stderr.
+    pub timings: bool,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -857,6 +860,9 @@ fn router_flag_hint(flag: &str) -> String {
 /// `--system-prompt`/`--max-tokens` support (the endpoint has no such
 /// fields) — each is warned-and-ignored rather than silently dropped.
 fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    // Starts with the command, like the craft lanes: t_request_ms covers auth,
+    // input and attachment prep up to the request.
+    let mut tm = Timings::new(Lane::Chat);
     let mut model = options
         .model
         .as_deref()
@@ -899,14 +905,28 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
-        let reply = rc.respond(
+        tm.sent();
+        let res = rc.respond(
             &model,
             &text,
             &images,
             &files,
             options.resume.as_deref(),
             &options.tool_ids,
-        )?;
+        );
+        // Non-streaming: the whole reply arrives as one response.
+        if let Ok(r) = &res {
+            if r.content.is_empty() {
+                tm.event();
+            } else {
+                tm.text();
+            }
+        }
+        tm.finish();
+        if options.timings {
+            eprintln!("{}", tm.line());
+        }
+        let reply = res?;
         let dropped_msg = dropped_tool_calls_message(
             &reply.tool_calls,
             reply.unparsed_tool_calls,
