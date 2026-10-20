@@ -38,6 +38,7 @@ use monocle_cli::commands::status::status_command;
 use monocle_cli::commands::token::token_command;
 use monocle_cli::commands::unset::unset_command;
 use monocle_cli::commands::upgrade::upgrade_command;
+use monocle_cli::commands::whoami::whoami_command;
 use monocle_cli::commands::workspace_model::{self as wm, WriteArgs};
 use monocle_cli::config::Config;
 use monocle_cli::credentials::Credentials;
@@ -69,6 +70,7 @@ Commands:
     setup    Configure Claude Code to use Monocle authentication
     unset    Remove Monocle configuration from Claude Code
     status   Show authentication and configuration status
+    whoami   Show who this profile is signed in as (local; --server asks jarvice)
     claude   Launch Claude Code with Monocle authentication
     profile  List, inspect, and select saved profiles
 
@@ -128,6 +130,18 @@ enum Commands {
     Unset,
     /// Show authentication and configuration status
     Status,
+    /// Show who this profile is signed in as (local, no network by default)
+    Whoami {
+        /// Also ask jarvice who it thinks you are. Calls GET /api/v1/auths/, which creates a
+        /// server-side session token as a side effect (the CLI discards it). 401/403 means the
+        /// tenant does not accept this Stark token (STARK_JWT_VERIFIER_MODE) or the token has
+        /// no email claim (stark#1061)
+        #[arg(long)]
+        server: bool,
+        /// Print machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage saved Monocle profiles
     Profile {
         #[command(subcommand)]
@@ -1100,6 +1114,9 @@ fn main() {
         Commands::Status => {
             status_command(&creds, &home, &selection);
             Ok(())
+        }
+        Commands::Whoami { server, json } => {
+            whoami_command(&client, &creds, &selection, server, json)
         }
         Commands::Profile { command } => match command {
             ProfileCommands::List => profile_list_command(&config, &home),
