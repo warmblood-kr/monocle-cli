@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use crate::commands::redact::Redactor;
 use crate::error::{AppError, Result};
+use crate::instrument::{Lane, Timings};
 use crate::jarvice_agent as sdk;
 use crate::jarvice_chats::is_valid_chat_id;
 use crate::net::Client;
@@ -24,6 +25,8 @@ pub struct SdkTurn<'a> {
     pub title: Option<&'a str>,
     pub timeout: Duration,
     pub json: bool,
+    /// Print one timings JSON line to stderr after the turn.
+    pub timings: bool,
 }
 
 /// Server error strings that are safe and useful to show; anything else is generic.
@@ -90,8 +93,13 @@ pub fn run(t: &SdkTurn) -> Result<()> {
     };
     let deadline = Instant::now() + t.timeout;
     let mut r = Redactor::new(&[t.bearer.strip_prefix("Bearer ").unwrap_or(t.bearer)]);
-    let res = run_inner(t, &origin, id, &mut r, deadline);
+    let mut tm = Timings::new(Lane::Sdk);
+    let res = run_inner(t, &origin, id, &mut r, deadline, &mut tm);
     t.client.set_request_cap(None);
+    tm.finish();
+    if t.timings {
+        eprintln!("{}", tm.line());
+    }
     // Server-provided text can sit inside any error: scrub at the boundary.
     res.map_err(|e| AppError::new(r.scrub(&e.to_string())))
 }
@@ -102,11 +110,14 @@ fn run_inner(
     id: Option<String>,
     r: &mut Redactor,
     deadline: Instant,
+    tm: &mut Timings,
 ) -> Result<()> {
     let id = match id {
         Some(id) => id,
-        None => http(t, deadline, || {
-            sdk::create_session(t.client, t.base, t.bearer, t.title.unwrap_or("CLI turn"))
+        None => tm.time_session_create(|| {
+            http(t, deadline, || {
+                sdk::create_session(t.client, t.base, t.bearer, t.title.unwrap_or("CLI turn"))
+            })
         })?,
     };
     r.errln(&format!("Session: {id}"));
@@ -118,8 +129,9 @@ fn run_inner(
     if left.is_zero() {
         return Err(timed_out(t));
     }
-    let mut sock =
-        SocketIo::connect(origin, &token, left.min(Duration::from_secs(15))).map_err(|e| {
+    let mut sock = tm
+        .time_connect(|| SocketIo::connect(origin, &token, left.min(Duration::from_secs(15))))
+        .map_err(|e| {
             if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(200) {
                 timed_out(t)
             } else {
@@ -127,7 +139,7 @@ fn run_inner(
             }
         })?;
     drop(token);
-    let res = drive(t, r, &id, &mut sock, deadline);
+    let res = drive(t, r, &id, &mut sock, deadline, tm);
     // Every exit (result, error, timeout, interrupt) flushes the held-back tail.
     flush(t, r, &id);
     if matches!(&res, Err(e) if e.to_string().starts_with("Timed out")) {
@@ -158,6 +170,7 @@ fn drive(
     id: &str,
     sock: &mut SocketIo,
     deadline: Instant,
+    tm: &mut Timings,
 ) -> Result<()> {
     sock.emit("start_session", &json!({"session_id": id}))?;
     let (mut sent, mut deltas, mut wrote) = (false, false, false);
@@ -171,6 +184,9 @@ fn drive(
         };
         if data["session_id"].as_str().is_some_and(|s| s != id) {
             continue;
+        }
+        if sent {
+            tm.event();
         }
         if t.json {
             match name.as_str() {
@@ -194,6 +210,7 @@ fn drive(
                 let status = data["status"].as_str().unwrap_or("");
                 if status == "active" {
                     if !sent {
+                        tm.sent();
                         sock.emit("message", &json!({"session_id": id, "content": t.text}))?;
                         sent = true;
                     }
@@ -203,6 +220,9 @@ fn drive(
             }
             "text_delta" => {
                 deltas = true;
+                if !content.is_empty() {
+                    tm.text();
+                }
                 if !t.json {
                     // (--json: `content` was already replaced by the scrubbed chunk)
                     r.out(&r.delta(content));
@@ -210,6 +230,9 @@ fn drive(
                 }
             }
             "text" if !deltas => {
+                if !content.is_empty() {
+                    tm.text();
+                }
                 if !t.json {
                     r.out(&r.lead(content));
                     wrote = true;

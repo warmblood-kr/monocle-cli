@@ -534,6 +534,8 @@ fn opts() -> TurnOpts {
         approve: Approve::Deny,
         json: false,
         poll_every: Duration::from_millis(50),
+        timings: false,
+        delegates: true,
     }
 }
 
@@ -970,4 +972,76 @@ fn delta_ending_in_unrelated_char_is_not_redacted() {
     assert_eq!(out(&o), "well-known -\n");
     let o = run_frames(delta_then("error", "error", "TOK is fine"), &[]);
     assert!(err(&o).contains("TOK is fine"), "{}", err(&o)); // flag set, but no >=8 suffix match
+}
+
+/// The single `{"timings":…}` line on stderr, if any (asserts there is at most one).
+fn timings_line(o: &Output) -> Option<serde_json::Value> {
+    let l: Vec<_> = err(o)
+        .lines()
+        .filter(|l| l.starts_with(r#"{"timings""#))
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["timings"].clone())
+        .collect();
+    assert!(l.len() <= 1, "{l:?}");
+    l.into_iter().next()
+}
+
+#[test]
+fn timings_line_has_ordered_fields_and_leaves_stdout_alone() {
+    let (addr, _) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let url = format!("http://{addr}");
+    let plain = turn(home.path(), &url, &["hi there", "--no-delegation"]);
+    let timed = turn(
+        home.path(),
+        &url,
+        &["hi there", "--no-delegation", "--timings"],
+    );
+    assert!(timed.status.success(), "{}", err(&timed));
+    assert!(timings_line(&plain).is_none());
+    assert_eq!(out(&plain), out(&timed));
+    let t = timings_line(&timed).expect("timings line");
+    assert_eq!(t["lane"], "openworker");
+    let n = |k: &str| {
+        t[k].as_u64()
+            .unwrap_or_else(|| panic!("{k} missing in {t}"))
+    };
+    assert!(n("ttfe_ms") <= n("ttft_ms") && n("ttft_ms") <= n("total_ms"));
+    n("t_request_ms");
+    n("connect_ms");
+    assert!(t["delegation_ms"].is_null(), "--no-delegation: {t}");
+    assert!(t["session_create_ms"].is_null());
+    assert_eq!(t["run_id"].as_str().unwrap().len(), 16);
+    assert!(t["started_at"].as_str().unwrap().ends_with('Z'));
+    // Only numbers/ids/lane: no token, prompt or answer text.
+    let line = err(&timed);
+    let line = line
+        .lines()
+        .find(|l| l.starts_with(r#"{"timings""#))
+        .unwrap();
+    for bad in [TOKEN, "hi there", "Hello"] {
+        assert!(!line.contains(bad), "{line}");
+    }
+    no_token(&timed);
+}
+
+#[test]
+fn timings_json_mode_and_no_text_gives_null_ttft() {
+    let (addr, _) = start(
+        ws_script(|s, log| {
+            frame(s, READY);
+            recv(s, log);
+            frame(s, r#"{"type":"turn_end","data":{}}"#);
+        }),
+        Arc::new(rest_default),
+    );
+    let home = setup(&addr);
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["x", "--no-delegation", "--json", "--timings"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let t = timings_line(&o).unwrap();
+    assert!(t["ttft_ms"].is_null() && t["ttfe_ms"].is_u64() && t["total_ms"].is_u64());
+    assert!(out(&o).lines().all(|l| !l.contains("timings")));
 }

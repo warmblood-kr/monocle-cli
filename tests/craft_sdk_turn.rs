@@ -635,3 +635,61 @@ fn slow_upgrade_then_stalled_engine_open_respects_the_deadline() {
     assert!(err(&o).contains("Timed out after 3s"), "{}", err(&o));
     assert!(lines(&log).iter().any(|l| l.starts_with("WS connect")));
 }
+
+#[test]
+fn timings_line_has_ordered_fields_and_leaves_stdout_alone() {
+    let (addr, _) = start(happy());
+    let home = setup(&addr);
+    let plain = turn(home.path(), &["hi there"]);
+    let timed = turn(home.path(), &["hi there", "--timings"]);
+    assert!(timed.status.success(), "{}", err(&timed));
+    assert_eq!(out(&plain), out(&timed));
+    assert!(!err(&plain).contains(r#"{"timings""#));
+    let e = err(&timed);
+    let lines: Vec<_> = e
+        .lines()
+        .filter(|l| l.starts_with(r#"{"timings""#))
+        .collect();
+    assert_eq!(lines.len(), 1, "{e}");
+    let t = &serde_json::from_str::<serde_json::Value>(lines[0]).unwrap()["timings"];
+    assert_eq!(t["lane"], "sdk");
+    let n = |k: &str| {
+        t[k].as_u64()
+            .unwrap_or_else(|| panic!("{k} missing in {t}"))
+    };
+    assert!(n("ttfe_ms") <= n("ttft_ms") && n("ttft_ms") <= n("total_ms"));
+    n("t_request_ms");
+    n("connect_ms");
+    n("session_create_ms");
+    assert!(t["delegation_ms"].is_null());
+    for bad in [SOCKTOK, ACCESS, "hi there", "Hello"] {
+        assert!(!lines[0].contains(bad), "{}", lines[0]);
+    }
+    no_secret(&timed);
+}
+
+#[test]
+fn timings_with_json_and_no_text_gives_null_ttft() {
+    let (addr, _) = start(Arc::new(|s, log| {
+        handshake(s, log);
+        recv(s, log);
+        status(s, "active");
+        recv(s, log);
+        send(
+            s,
+            r#"42/agent,["result",{"session_id":"sess-1","success":true}]"#,
+        );
+        let _ = s.close(None);
+    }));
+    let home = setup(&addr);
+    let o = turn(home.path(), &["x", "--json", "--timings"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let e = err(&o);
+    let l = e
+        .lines()
+        .find(|l| l.starts_with(r#"{"timings""#))
+        .expect(&e);
+    let t = &serde_json::from_str::<serde_json::Value>(l).unwrap()["timings"];
+    assert!(t["ttft_ms"].is_null() && t["ttfe_ms"].is_u64());
+    assert!(!out(&o).contains("timings"));
+}

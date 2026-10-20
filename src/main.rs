@@ -282,6 +282,11 @@ struct ChatArgs {
     /// (`tools_used`) to stderr, e.g. `Tools: web_search, model_designer__delegate_model`.
     #[arg(long = "show-tools")]
     show_tools: bool,
+    /// One-shot only: print one JSON timings line to stderr (stdout unchanged). t0 is the moment
+    /// the request is sent; the reply is one blocking response, so ttfe = ttft = total (no
+    /// streaming). Includes a random run_id and started_at (UTC); never tokens, prompts or text
+    #[arg(long)]
+    timings: bool,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -301,6 +306,7 @@ impl From<ChatArgs> for ChatOptions {
                 None => ToolFiringExpectation::Any,
             }),
             show_tools: a.show_tools,
+            timings: a.timings,
         }
     }
 }
@@ -340,6 +346,7 @@ impl From<RouterChatArgs> for ChatOptions {
             tool_ids: Vec::new(),
             verify_tool_firing: None,
             show_tools: false,
+            timings: false,
         }
     }
 }
@@ -467,6 +474,14 @@ enum CraftCommand {
         /// Print each received frame / polled message as one JSON line instead of text
         #[arg(long)]
         json: bool,
+        /// After the turn, print one JSON timings line to stderr (stdout unchanged). t0 is the
+        /// moment the user message is handed to the socket; ttfe = first server frame after t0,
+        /// ttft = first non-empty assistant text, total = turn end (all ms from t0, monotonic;
+        /// null if it never happened). t_request_ms = ms from command start to t0; connect_ms,
+        /// delegation_ms, session_create_ms are setup phases. Includes a random run_id and
+        /// started_at (UTC); never tokens, prompts or text. If the answer is polled, ttft is accurate to the 2 s poll interval
+        #[arg(long)]
+        timings: bool,
     },
 }
 
@@ -1148,6 +1163,7 @@ fn main() {
                 title,
                 approve,
                 json,
+                timings,
             } => craft_turn_command(
                 &client,
                 &creds,
@@ -1165,6 +1181,8 @@ fn main() {
                     approve,
                     json,
                     poll_every: std::time::Duration::from_secs(2),
+                    timings,
+                    delegates: !no_delegation,
                 },
             ),
         },
