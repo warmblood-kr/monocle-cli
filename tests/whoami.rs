@@ -169,3 +169,27 @@ fn server_error_never_echoes_body() {
     assert!(!s.contains("BODY-SECRET"), "{s}");
     no_secrets(&s);
 }
+
+#[test]
+fn malformed_or_failing_response_never_leaks_token_or_cookie() {
+    // Parse failure (wrong type for `id`, token in the body) and a 500 that
+    // carries the minted token: neither may reach stdout/stderr. The CLI has no
+    // verbose/debug flag, and `Resp` has no `Debug` impl, so these two paths
+    // are the only ways a body could surface.
+    for (status, body) in [
+        (200, r#"{"token":"MINTED-MARKER-ccc","id":{"x":1}}"#),
+        (200, r#"{"token":"MINTED-MARKER-ccc"} trailing"#),
+        (500, r#"{"token":"MINTED-MARKER-ccc"}"#),
+    ] {
+        let (addr, _) = stub(status, body);
+        let home = home(&addr);
+        for args in [
+            &["whoami", "--server"][..],
+            &["whoami", "--server", "--json"][..],
+        ] {
+            let o = run(home.path(), args);
+            assert_eq!(o.status.code(), Some(1), "{}", all(&o));
+            no_secrets(&all(&o));
+        }
+    }
+}

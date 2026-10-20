@@ -38,6 +38,11 @@ struct ServerMe {
     permissions: Value,
 }
 
+fn parse_me(body: &[u8]) -> Result<ServerMe> {
+    serde_json::from_slice(body)
+        .map_err(|_| AppError::new("Server identity lookup returned an unexpected response."))
+}
+
 fn expiry(iso: &str, now: i64) -> Value {
     match parse_iso_ms(iso) {
         Some(exp) if now <= exp => json!({
@@ -64,8 +69,13 @@ fn server_identity(client: &Client, creds: &Credentials, local_email: &str) -> R
         let e = api_error("Server identity lookup", &resp);
         return Err(AppError::new(format!("{e}{hint}")));
     }
-    let me: ServerMe = resp.json()?;
+    // The body carries a freshly minted session token and the response a
+    // Set-Cookie with it. Parse straight into `ServerMe` (no token field), drop
+    // the whole `Resp` before anything else runs, and report a parse failure
+    // with a fixed message: serde's error text can quote body content.
+    let me = parse_me(resp.bytes());
     drop(resp);
+    let me = me?;
     Ok(json!({
         "id": me.id, "email": me.email, "name": me.name, "role": me.role,
         "permission_groups": me.permissions.as_object().map_or(0, |o| o.len()),
