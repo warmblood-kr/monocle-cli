@@ -1,6 +1,6 @@
 [package]
 name = "monocle-cli"
-version = "1.10.0"
+version = "1.11.0"
 edition = "2021"
 description = "Control and use Monocle AI from your terminal: log in, chat with models, run the agent, or integrate Claude Code."
 license = "MIT"
@@ -26,6 +26,12 @@ base64 = "0.22"
 rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tiny_http = "0.12"
+# WebSocket client for `craft turn`, isolated in src/ws.rs. Only the handshake +
+# framing is used (no TLS feature): TLS is rustls with the *ring* provider and the
+# webpki roots reqwest already pulls in, so no second crypto provider enters the tree.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 open = "5"
 ctrlc = "3"
 # Line editing for the interactive `agent` REPL only (arrows/history/Emacs keys).

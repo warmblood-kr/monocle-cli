@@ -10,6 +10,8 @@ use serde_json::Value;
 
 use crate::auth::get_access_token;
 use crate::commands::chat::resolve_jarvice;
+use crate::commands::craft_sdk_turn::{self, SdkTurn};
+use crate::commands::craft_turn::{run_turn, Target, TurnOpts};
 use crate::commands::knowledge::print_table;
 use crate::craft_server as craft;
 use crate::credentials::Credentials;
@@ -72,6 +74,41 @@ pub enum SessionCommand {
     Delete {
         id: String,
         /// Print the server's response as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach your Stark delegation to a session so Craft can call the model
+    /// gateway (openworker lane; stg/prod Craft hosts only)
+    Delegate {
+        id: String,
+        /// Print {"ok","expires_at"} as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorkspaceCommand {
+    /// List recent workspaces
+    List {
+        /// Print the raw workspaces as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a workspace folder (prints the server's response as JSON)
+    Open {
+        path: String,
+        /// Create the folder if it does not exist
+        #[arg(long)]
+        create: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AgentCommand {
+    /// List the agents the Craft server offers
+    List {
+        /// Print the raw agents as JSON
         #[arg(long)]
         json: bool,
     },
@@ -158,6 +195,9 @@ pub fn craft_session_command(
         }
         _ => {}
     }
+    if let SessionCommand::Delegate { id, json } = command {
+        return delegate(client, creds, selection, lane, id, *json);
+    }
     let (url, bearer) = connect(client, creds, selection, lane)?;
     let (c, u, b) = (client, url.as_str(), bearer.as_str());
     let sdk_lane = lane == Lane::Sdk;
@@ -230,12 +270,9 @@ pub fn craft_session_command(
                 return print_json(&h);
             }
             let lines: Vec<String> = if sdk_lane {
-                h["entries"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|e| e.to_string())
-                    .collect()
+                // v2 `events`; v1 fallback `entries` (shapes beyond `type`/`content` unpinned).
+                let list = h["events"].as_array().or(h["entries"].as_array());
+                list.into_iter().flatten().map(sdk_event_line).collect()
             } else {
                 h["messages"]
                     .as_array()
@@ -319,6 +356,7 @@ pub fn craft_session_command(
                 None => std::io::stdout().write_all(&bytes)?,
             }
         }
+        SessionCommand::Delegate { .. } => unreachable!("handled above"),
         SessionCommand::Delete { id, json } => {
             let r = if sdk_lane {
                 sdk::delete(c, u, b, id)?
@@ -336,4 +374,189 @@ pub fn craft_session_command(
         }
     }
     Ok(())
+}
+
+fn openworker_only(lane: Lane, what: &str) -> Result<()> {
+    if lane == Lane::Sdk {
+        return Err(AppError::new(format!(
+            "{what} is only supported on the openworker lane."
+        )));
+    }
+    Ok(())
+}
+
+/// `session delegate`: the id_token goes only to the env's own Craft host (see
+/// `craft::delegation_base`). The host check runs before credentials are read, and
+/// the token is read after a fresh access token so it is current. It is never printed.
+fn delegate(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    lane: Lane,
+    id: &str,
+    json: bool,
+) -> Result<()> {
+    openworker_only(lane, "`session delegate`")?;
+    let base = craft::delegation_base(&selection.environment)?;
+    let bearer = format!("Bearer {}", get_access_token(client, creds).token);
+    let data = creds.read();
+    let id_token = data.as_ref().map(|c| c.id_token.as_str()).unwrap_or("");
+    if id_token.is_empty() {
+        return Err(AppError::new(
+            "No id_token stored; run `monocle login` again.",
+        ));
+    }
+    let r = craft::attach_delegation(client, &base, &bearer, id, id_token)?;
+    if json {
+        print_json(&serde_json::json!({"ok": true, "expires_at": r["expires_at"]}))?;
+    }
+    eprintln!(
+        "Delegation attached (expires_at {})",
+        text(&r["expires_at"])
+    );
+    Ok(())
+}
+
+/// `craft turn`: hosts are vetted (REST base and WS origin) before anything is
+/// sent; delegation (unless skipped) goes first, then the socket.
+pub fn craft_turn_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    lane: Lane,
+    no_delegation: bool,
+    title: Option<String>,
+    opts: TurnOpts,
+) -> Result<()> {
+    if lane == Lane::Sdk {
+        if opts.workspace.is_some() {
+            return Err(AppError::new(
+                "--workspace is only supported on the openworker lane.",
+            ));
+        }
+        let (base, bearer) = connect(client, creds, selection, lane)?;
+        return craft_sdk_turn::run(&SdkTurn {
+            client,
+            base: &base,
+            bearer: &bearer,
+            text: &opts.text,
+            session: opts.session.as_deref(),
+            title: title.as_deref(),
+            timeout: opts.timeout,
+            json: opts.json,
+        });
+    }
+    if title.is_some() {
+        return Err(AppError::new("--title is only supported on the sdk lane."));
+    }
+    let ws_base = craft::ws_base(&selection.environment)?;
+    let (base, bearer) = connect(client, creds, selection, lane)?;
+    let target = Target {
+        client,
+        base: &base,
+        ws_base: &ws_base,
+        bearer: &bearer,
+    };
+    run_turn(&target, &opts, |id| {
+        if no_delegation {
+            return Ok(());
+        }
+        delegate(client, creds, selection, lane, id, false)
+    })
+}
+
+pub fn craft_workspace_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    lane: Lane,
+    command: &WorkspaceCommand,
+) -> Result<()> {
+    openworker_only(lane, "`craft workspace`")?;
+    let (url, bearer) = connect(client, creds, selection, lane)?;
+    match command {
+        WorkspaceCommand::List { json } => {
+            let all = craft::list_workspaces(client, &url, &bearer)?;
+            if *json {
+                return print_json(&all);
+            }
+            if all.is_empty() {
+                eprintln!("No recent workspaces.");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = all
+                .iter()
+                .map(|x| {
+                    vec![
+                        one_line(s(x, "name")),
+                        text(&x["exists"]),
+                        s(x, "path").into(),
+                    ]
+                })
+                .collect();
+            print_table(&["NAME", "EXISTS", "PATH"], &rows);
+        }
+        WorkspaceCommand::Open { path, create } => {
+            print_json(&craft::open_workspace(
+                client, &url, &bearer, path, *create,
+            )?)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn craft_agent_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    lane: Lane,
+    command: &AgentCommand,
+) -> Result<()> {
+    openworker_only(lane, "`craft agent`")?;
+    let (url, bearer) = connect(client, creds, selection, lane)?;
+    let AgentCommand::List { json } = command;
+    let all = craft::list_agents(client, &url, &bearer)?;
+    if *json {
+        return print_json(&all);
+    }
+    if all.is_empty() {
+        eprintln!("No agents.");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = all
+        .iter()
+        .map(|x| {
+            vec![
+                s(x, "name").into(),
+                if x["default"].as_bool() == Some(true) {
+                    "yes"
+                } else {
+                    ""
+                }
+                .into(),
+                text(&x["needs_workspace"]),
+                one_line(s(x, "title")),
+                one_line(s(x, "tagline")),
+            ]
+        })
+        .collect();
+    print_table(&["NAME", "DEFAULT", "NEEDS WS", "TITLE", "TAGLINE"], &rows);
+    Ok(())
+}
+
+/// One sdk history event as `type<TAB>summary`: user/text show their content;
+/// other types (tool_use, tool_result, thinking, result, ...) a tool name or
+/// truncated compact JSON — never a full tool result.
+fn sdk_event_line(e: &serde_json::Value) -> String {
+    let kind = s(e, "type");
+    let body = if matches!(kind, "user" | "text") {
+        one_line(&text(&e["content"]))
+    } else if kind == "tool_result" {
+        String::new() // never dump tool output
+    } else if let Some(n) = ["tool_name", "name"].iter().find_map(|k| e[*k].as_str()) {
+        one_line(n)
+    } else {
+        one_line(&e.to_string()).chars().take(120).collect()
+    };
+    format!("{kind}\t{body}")
 }

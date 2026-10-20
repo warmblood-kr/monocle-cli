@@ -50,9 +50,15 @@ pub fn get_session(client: &Client, base: &str, bearer: &str, id: &str) -> Resul
     get(client, &url, bearer, "Showing session", id)?.json()
 }
 
+/// `GET .../history/v2` (`{events[], event_count, in_flight}`); v1 (`entries[]`,
+/// always empty for cf worker sessions) is tried once, only if v2 is 404.
 pub fn history(client: &Client, base: &str, bearer: &str, id: &str) -> Result<Value> {
     let url = format!("{base}/api/v1/agent/sessions/{}/history", checked_id(id)?);
-    get(client, &url, bearer, "Reading session history", id)?.json()
+    let resp = client.get(&format!("{url}/v2"), &auth_headers(bearer))?;
+    if resp.status == 404 {
+        return get(client, &url, bearer, "Reading session history", id)?.json();
+    }
+    check("Reading session history", id, resp)?.json()
 }
 
 pub fn files(
@@ -94,4 +100,38 @@ pub fn delete(client: &Client, base: &str, bearer: &str, id: &str) -> Result<Val
         client.delete(&url, &auth_headers(bearer))?,
     )?;
     Ok(resp.json().unwrap_or(Value::Null))
+}
+
+/// `POST /api/v1/agent/sessions` — a new session; returns its id.
+pub fn create_session(client: &Client, base: &str, bearer: &str, title: &str) -> Result<String> {
+    let url = format!("{base}/api/v1/agent/sessions");
+    let resp = client.post_json_once(
+        &url,
+        &auth_headers(bearer),
+        &serde_json::json!({"title": title}),
+    )?;
+    let v: Value = check("Creating session", "", resp)?.json()?;
+    v["id"]
+        .as_str()
+        .filter(|id| crate::jarvice_chats::is_valid_chat_id(id))
+        .map(str::to_string)
+        .ok_or_else(|| AppError::new("Creating session returned no usable session ID."))
+}
+
+/// `GET /api/v1/auths/` — a fresh jarvice HS256 token, the Socket.IO `/agent`
+/// credential. Callers must keep it in memory only. The body is never echoed.
+pub fn socket_token(client: &Client, base: &str, bearer: &str) -> Result<String> {
+    let resp = client.get(&format!("{base}/api/v1/auths/"), &auth_headers(bearer))?;
+    if !resp.ok() {
+        return Err(AppError::new(format!(
+            "Could not get a socket token (HTTP {}).",
+            resp.status
+        )));
+    }
+    let v: Value = resp.json()?;
+    v["token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| AppError::new("Could not get a socket token (none returned)."))
 }

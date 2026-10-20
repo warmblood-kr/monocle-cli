@@ -13,7 +13,11 @@ use monocle_cli::commands::chat::{
     chat_command, chat_content_command, chat_list_command, ChatOptions, ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
-use monocle_cli::commands::craft::{craft_session_command, Lane, SessionCommand};
+use monocle_cli::commands::craft::{
+    craft_agent_command, craft_session_command, craft_turn_command, craft_workspace_command,
+    AgentCommand, Lane, SessionCommand, WorkspaceCommand,
+};
+use monocle_cli::commands::craft_turn::{Approve, TurnOpts};
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::knowledge::{
@@ -67,7 +71,7 @@ Commands:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
-    craft    Inspect and delete Craft sessions (list, show, history, files, download, delete)
+    craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
 
   Router (direct API):
     router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
@@ -156,7 +160,7 @@ enum Commands {
         #[command(subcommand)]
         command: WorkspaceModelCommand,
     },
-    /// Inspect and delete Craft sessions (list, show, history, files, download, delete)
+    /// Inspect Craft sessions, workspaces and agents (session, workspace, agent)
     Craft {
         /// Craft backend: the Craft server (openworker) or jarvice agent sessions (sdk)
         #[arg(long, value_enum, default_value = "openworker")]
@@ -413,6 +417,48 @@ enum CraftCommand {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Recent workspaces (openworker lane only)
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    /// Agents offered by the Craft server (openworker lane only)
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Send one message to a Craft agent and print its answer (both lanes; --workspace, --agent, --approve and --no-delegation apply to openworker only)
+    Turn {
+        /// The message to send
+        text: String,
+        /// Continue this session (default: a fresh `cli-<time>-<hex>` id, printed to stderr)
+        #[arg(long)]
+        session: Option<String>,
+        /// Workspace folder to run in (opened first). Default: your most recent existing one
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Create the --workspace folder if it does not exist
+        #[arg(long, requires = "workspace")]
+        create_workspace: bool,
+        /// Agent to talk to (see `craft agent list`)
+        #[arg(long, default_value = "cowork")]
+        agent: String,
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 180)]
+        timeout: u64,
+        /// Do not attach your Stark delegation to the session first
+        #[arg(long)]
+        no_delegation: bool,
+        /// Title for the new session (sdk lane only; default "CLI turn")
+        #[arg(long)]
+        title: Option<String>,
+        /// Answer for permission prompts (a CLI turn cannot ask interactively)
+        #[arg(long, value_enum, default_value = "deny")]
+        approve: Approve,
+        /// Print each received frame / polled message as one JSON line instead of text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -503,7 +549,8 @@ enum KnowledgeCommand {
 struct ModelWriteArgs {
     /// Model id (what `monocle chat --model` takes)
     id: String,
-    /// JSON file with ModelForm fields (base_model_id, name, meta, params, ...); flags override it
+    /// JSON file with ModelForm fields (base_model_id, name, meta, params, ...); flags override it.
+    /// On update, `meta` and `params` merge key-wise onto the stored model (keys not in the file are kept) and other fields are replaced; on create the file is the starting point
     #[arg(long, value_name = "PATH")]
     file: Option<String>,
     /// Display name (default for create: the id)
@@ -523,6 +570,33 @@ struct ModelWriteArgs {
     /// Knowledge collection name or id (repeatable; replaces the model's collections)
     #[arg(long = "knowledge", value_name = "COLLECTION")]
     knowledge: Vec<String>,
+    /// Detach all tools (conflicts with --tool)
+    #[arg(long, conflicts_with = "tools")]
+    clear_tools: bool,
+    /// Detach all knowledge collections (conflicts with --knowledge)
+    #[arg(long, conflicts_with = "knowledge")]
+    clear_knowledge: bool,
+    /// Who can use the model: `private` (owner only; create default) or `public`
+    /// (everyone in the tenant). Omit to keep the stored setting on update.
+    #[arg(
+        long,
+        value_parser = ["private", "public"],
+        conflicts_with_all = ["read_groups", "write_groups", "read_users", "write_users"]
+    )]
+    access: Option<String>,
+    /// Share: group id allowed to read (repeatable). Any --read-*/--write-* flag
+    /// makes the model shared and replaces the whole access list.
+    #[arg(long = "read-group", value_name = "GROUP_ID")]
+    read_groups: Vec<String>,
+    /// Share: group id allowed to write (repeatable)
+    #[arg(long = "write-group", value_name = "GROUP_ID")]
+    write_groups: Vec<String>,
+    /// Share: user id allowed to read (repeatable)
+    #[arg(long = "read-user", value_name = "USER_ID")]
+    read_users: Vec<String>,
+    /// Share: user id allowed to write (repeatable)
+    #[arg(long = "write-user", value_name = "USER_ID")]
+    write_users: Vec<String>,
 }
 
 impl From<ModelWriteArgs> for WriteArgs {
@@ -536,6 +610,13 @@ impl From<ModelWriteArgs> for WriteArgs {
             system: a.system,
             tools: a.tools,
             knowledge: a.knowledge,
+            clear_tools: a.clear_tools,
+            clear_knowledge: a.clear_knowledge,
+            access: a.access,
+            read_groups: a.read_groups,
+            write_groups: a.write_groups,
+            read_users: a.read_users,
+            write_users: a.write_users,
         }
     }
 }
@@ -960,10 +1041,47 @@ fn main() {
                 wm::delete_command(&client, &creds, &selection, &id)
             }
         },
-        Commands::Craft {
-            lane,
-            command: CraftCommand::Session { command },
-        } => craft_session_command(&client, &creds, &selection, lane, &command),
+        Commands::Craft { lane, command } => match command {
+            CraftCommand::Session { command } => {
+                craft_session_command(&client, &creds, &selection, lane, &command)
+            }
+            CraftCommand::Workspace { command } => {
+                craft_workspace_command(&client, &creds, &selection, lane, &command)
+            }
+            CraftCommand::Agent { command } => {
+                craft_agent_command(&client, &creds, &selection, lane, &command)
+            }
+            CraftCommand::Turn {
+                text,
+                session,
+                workspace,
+                create_workspace,
+                agent,
+                timeout,
+                no_delegation,
+                title,
+                approve,
+                json,
+            } => craft_turn_command(
+                &client,
+                &creds,
+                &selection,
+                lane,
+                no_delegation,
+                title,
+                TurnOpts {
+                    text,
+                    session,
+                    workspace,
+                    create_workspace,
+                    agent,
+                    timeout: std::time::Duration::from_secs(timeout),
+                    approve,
+                    json,
+                    poll_every: std::time::Duration::from_secs(2),
+                },
+            ),
+        },
         Commands::Agent {
             prompt,
             workdir,
