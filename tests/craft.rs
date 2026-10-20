@@ -678,6 +678,34 @@ fn workspace_and_agent_commands() {
     assert_eq!(seen.lock().unwrap()[0].1, "/v1/agents");
 }
 
+/// Boolean columns print `yes`/`no`, never an empty cell (a non-default agent
+/// has `no` in DEFAULT, a workspace-free one `no` in NEEDS WS).
+#[test]
+fn agent_list_prints_no_for_false_booleans() {
+    let (_, _, home) = setup();
+    let (a, _seen) = canned(
+        200,
+        r#"{"agents":[{"name":"coder","title":"Coder","needs_workspace":true,"default":true,"tagline":"t1"},{"name":"plain","title":"Plain","needs_workspace":false,"default":false,"tagline":"t2"},{"name":"bare","title":"Bare","tagline":"t3"}]}"#,
+        None,
+    );
+    let url = format!("http://{a}");
+    let o = run(home.path(), Some(&url), &["craft", "agent", "list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let table = out(&o);
+    let cells = |name: &str| -> Vec<String> {
+        table
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} row missing: {table}"))
+            .split_whitespace()
+            .map(String::from)
+            .collect()
+    };
+    assert_eq!(cells("coder")[1..3], ["yes", "yes"], "{table}");
+    assert_eq!(cells("plain")[1..3], ["no", "no"], "{table}");
+    assert_eq!(cells("bare")[1], "no", "missing default is no: {table}");
+}
+
 #[test]
 fn sdk_lane_rejected_for_workspace_agent_delegate() {
     let (addr, log, home) = setup();

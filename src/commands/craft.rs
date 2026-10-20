@@ -716,12 +716,7 @@ pub fn craft_agent_command(
         .map(|x| {
             vec![
                 s(x, "name").into(),
-                if x["default"].as_bool() == Some(true) {
-                    "yes"
-                } else {
-                    ""
-                }
-                .into(),
+                yes_no(x["default"].as_bool() == Some(true)).into(),
                 flag(&x["needs_workspace"]),
                 one_line(s(x, "title")),
                 one_line(s(x, "tagline")),

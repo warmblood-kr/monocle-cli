@@ -671,36 +671,91 @@ fn body_text(content: &str, show_tools: bool) -> String {
 /// UI strips both; neither is something the user typed.
 const INJECTED_TAGS: [&str; 2] = ["user_memory", "past_conversations"];
 
-/// Drop every `<tag>…</tag>` block (multi-line, anywhere in the text). An
-/// opening tag with no closing tag drops everything after it, so a malformed
-/// block never leaks. Whitespace around a removed block is collapsed so no
-/// blank gap is left.
-fn strip_tag_blocks(text: &str, tag: &str) -> String {
-    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+/// If `text` starts with an injected-block tag (`<user_memory>`,
+/// `</past_conversations>`, …), return `(is_closing, byte length of the tag)`.
+/// Matching is ASCII case-insensitive and allows whitespace inside the angle
+/// brackets (`< user_memory >`, `</ USER_MEMORY >`), so a variant spelling
+/// cannot slip a block past the filter.
+fn injected_tag_at(text: &str) -> Option<(bool, usize)> {
+    let skip_ws = |s: &str| s.len() - s.trim_start().len();
+    let mut at = text.strip_prefix('<').map(|_| 1)?;
+    at += skip_ws(&text[at..]);
+    let closing = text[at..].starts_with('/');
+    if closing {
+        at += 1 + skip_ws(&text[at + 1..]);
+    }
+    let name = INJECTED_TAGS.iter().find(|t| {
+        text.as_bytes()
+            .get(at..at + t.len())
+            .is_some_and(|b| b.eq_ignore_ascii_case(t.as_bytes()))
+    })?;
+    at += name.len();
+    at += skip_ws(&text[at..]);
+    text[at..].starts_with('>').then_some((closing, at + 1))
+}
+
+/// Remove the injected `<user_memory>` and `<past_conversations>` blocks
+/// (multi-line, anywhere in the text). Blocks nest by depth: an opening tag
+/// increments, a closing tag decrements, and everything is dropped until the
+/// depth is back to 0, so `<user_memory>a<user_memory>b</user_memory>c</user_memory>`
+/// leaks neither `b` nor `c`. A block that is never closed drops everything to
+/// the end (fail closed: a partial block is never printed). A stray closing tag
+/// is dropped. Whitespace around a removed block is collapsed so no blank gap
+/// is left.
+pub fn strip_injected_context(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(&open) {
-        out.push_str(rest[..start].trim_end());
-        let after = &rest[start + open.len()..];
-        match after.find(&close) {
-            Some(end) => {
-                rest = after[end + close.len()..].trim_start();
-                if !out.is_empty() && !rest.is_empty() {
-                    out.push_str("\n\n");
+    let mut depth = 0usize;
+    let mut after_block = false;
+    let mut i = 0;
+    while i < text.len() {
+        let next = text[i..].find('<').map_or(text.len(), |p| i + p);
+        if depth == 0 && next > i {
+            push_visible(&mut out, &text[i..next], &mut after_block);
+        }
+        i = next;
+        if i >= text.len() {
+            break;
+        }
+        match injected_tag_at(&text[i..]) {
+            Some((false, len)) => {
+                if depth == 0 {
+                    out.truncate(out.trim_end().len());
                 }
+                depth += 1;
+                i += len;
             }
-            None => return out,
+            Some((true, len)) => {
+                depth = depth.saturating_sub(1);
+                after_block = depth == 0;
+                i += len;
+            }
+            None => {
+                if depth == 0 {
+                    push_visible(&mut out, "<", &mut after_block);
+                }
+                i += 1;
+            }
         }
     }
-    out.push_str(rest);
     out
 }
 
-/// Remove the injected `<user_memory>` and `<past_conversations>` blocks.
-pub fn strip_injected_context(text: &str) -> String {
-    INJECTED_TAGS
-        .iter()
-        .fold(text.to_string(), |acc, tag| strip_tag_blocks(&acc, tag))
+/// Append `chunk` to `out`; straight after a removed block, drop leading
+/// whitespace and separate from earlier text with one blank line.
+fn push_visible(out: &mut String, chunk: &str, after_block: &mut bool) {
+    let chunk = if *after_block {
+        chunk.trim_start()
+    } else {
+        chunk
+    };
+    if chunk.is_empty() {
+        return;
+    }
+    if *after_block && !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    *after_block = false;
+    out.push_str(chunk);
 }
 
 /// Message body for one rendered message: the stored content, without the
@@ -1144,6 +1199,62 @@ mod tests {
     fn strip_injected_context_drops_everything_after_an_unclosed_tag() {
         let out = strip_injected_context("question\n<user_memory>\nSECRET-FACT-ONE still open");
         assert_eq!(out, "question");
+    }
+
+    #[test]
+    fn strip_injected_context_matches_tags_case_insensitively() {
+        for text in [
+            "<USER_MEMORY>SECRET</USER_MEMORY>\n\nhi",
+            "<User_Memory>SECRET</user_memory>\n\nhi",
+            "<PAST_Conversations>SECRET</past_CONVERSATIONS>\n\nhi",
+        ] {
+            assert_eq!(strip_injected_context(text), "hi", "{text}");
+        }
+    }
+
+    #[test]
+    fn strip_injected_context_allows_whitespace_inside_the_brackets() {
+        for text in [
+            "< user_memory >SECRET</ user_memory >\n\nhi",
+            "<user_memory\n>SECRET<\t/ USER_MEMORY\n>\n\nhi",
+            "<  past_conversations>SECRET</past_conversations  >hi",
+        ] {
+            assert_eq!(strip_injected_context(text), "hi", "{text}");
+        }
+    }
+
+    #[test]
+    fn strip_injected_context_counts_nesting_depth() {
+        let text = "<user_memory>outer <user_memory>inner</user_memory> STILL_SECRET</user_memory>\n\nafter";
+        assert_eq!(strip_injected_context(text), "after");
+        // Mixed names share one depth counter.
+        let mixed =
+            "<user_memory>a<past_conversations>b</user_memory>STILL_SECRET</past_conversations>q";
+        assert_eq!(strip_injected_context(mixed), "q");
+    }
+
+    #[test]
+    fn strip_injected_context_fails_closed_on_unterminated_blocks() {
+        for text in [
+            "hi <user_memory>SECRET",
+            "hi <user_memory>a<user_memory>b</user_memory>STILL_SECRET",
+            "hi < PAST_CONVERSATIONS >SECRET",
+        ] {
+            assert_eq!(strip_injected_context(text), "hi", "{text}");
+        }
+    }
+
+    #[test]
+    fn strip_injected_context_handles_separate_blocks_and_keeps_surrounding_text() {
+        let text = "intro\n<user_memory>A</user_memory>\nmiddle\n<past_conversations>B</past_conversations>\noutro <b>bold</b> a < b";
+        assert_eq!(
+            strip_injected_context(text),
+            "intro\n\nmiddle\n\noutro <b>bold</b> a < b"
+        );
+        assert_eq!(
+            strip_injected_context("no tags, 한국어 ✓"),
+            "no tags, 한국어 ✓"
+        );
     }
 
     #[test]
