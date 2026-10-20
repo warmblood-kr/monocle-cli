@@ -297,3 +297,216 @@ fn router_chat_timings_line_on_stderr_only() {
     assert!(n("ttfe_ms") <= n("ttft_ms") && n("ttft_ms") <= n("total_ms"));
     assert!(!l.contains("router answer") && !l.contains("Bearer"));
 }
+
+// ── --stream (headless SSE) ──────────────────────────────────────────────────
+
+fn sse(v: serde_json::Value) -> String {
+    format!("data: {v}\n\n")
+}
+
+fn delta(t: &str) -> String {
+    sse(serde_json::json!({"choices":[{"delta":{"content":t}}]}))
+}
+
+const DONE: &str = "data: [DONE]\n\n";
+
+fn thread_hdr() -> Vec<(&'static str, String)> {
+    vec![("x-thread-id", "thread-s".to_string())]
+}
+
+fn timings(o: &Output) -> serde_json::Value {
+    let e = stderr(o);
+    let l = e
+        .lines()
+        .find(|l| l.starts_with(r#"{"timings""#))
+        .expect(&e);
+    serde_json::from_str::<serde_json::Value>(l).unwrap()["timings"].clone()
+}
+
+#[test]
+fn stream_prints_chunks_and_omits_session_header() {
+    let chunks = vec![
+        (0, delta("Hel")),
+        (0, delta("lo ")),
+        (0, delta("world")),
+        (0, sse(serde_json::json!({"tools_used": []}))),
+        (0, DONE.to_string()),
+    ];
+    let (stub, reqs) = common::stub_sse_chunked(200, thread_hdr(), chunks);
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat", "--stream"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "Hello world\n");
+    assert!(stderr(&o).contains("Thread: thread-s"), "{}", stderr(&o));
+    let r = reqs.lock().unwrap()[0].to_lowercase();
+    assert!(!r.contains("x-session-id"), "{r}");
+    let body: serde_json::Value =
+        serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["stream"], true);
+}
+
+#[test]
+fn non_stream_default_still_sends_session_header_and_stream_false() {
+    let (stub, reqs) =
+        common::stub_sse_chunked(200, thread_hdr(), vec![(0, RESPONSES_REPLY.to_string())]);
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{ANSWER}\n"));
+    let r = reqs.lock().unwrap()[0].to_lowercase();
+    assert!(r.contains("x-session-id"), "{r}");
+    let body: serde_json::Value =
+        serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["stream"], false);
+}
+
+#[test]
+fn stream_timings_order_with_sources_first_and_reads_to_eof() {
+    let chunks = vec![
+        (0, sse(serde_json::json!({"sources": []}))),
+        (250, delta("hi")),
+        (0, DONE.to_string()),
+        (300, ": trailing\n\n".to_string()),
+    ];
+    let (stub, _) = common::stub_sse_chunked(200, thread_hdr(), chunks);
+    let home = logged_in_home(&stub);
+    let path = home.path().join("d.jsonl");
+    let o = run_piped(
+        home.path(),
+        &[
+            "chat",
+            "--stream",
+            "--timings",
+            "--diagnostics-file",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let t = timings(&o);
+    let n = |k: &str| t[k].as_u64().unwrap();
+    assert!(n("ttfe_ms") < 200, "{t}");
+    assert!(n("ttft_ms") >= 200 && n("ttft_ms") >= n("ttfe_ms"), "{t}");
+    // total includes the bytes after [DONE]: the body was read to EOF.
+    assert!(n("total_ms") >= n("ttft_ms") + 250, "{t}");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let names: Vec<String> = raw
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(names, ["first_event", "first_text", "done"]);
+}
+
+#[test]
+fn stream_redacts_token_split_across_chunks() {
+    // The test login's access token is "tok".
+    let chunks = vec![
+        (0, delta("a to")),
+        (0, delta("k b")),
+        (0, delta(" end to")),
+        (0, DONE.to_string()),
+    ];
+    let (stub, _) = common::stub_sse_chunked(200, thread_hdr(), chunks);
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat", "--stream"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "a [REDACTED] b end [REDACTED]\n");
+}
+
+#[test]
+fn stream_mid_stream_error_exits_1_without_server_text() {
+    let chunks = vec![
+        (0, delta("part")),
+        (
+            0,
+            sse(serde_json::json!({"error": {"content": "SECRET-SERVER-STRING"}})),
+        ),
+        (0, DONE.to_string()),
+    ];
+    let (stub, _) = common::stub_sse_chunked(200, thread_hdr(), chunks);
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat", "--stream"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        !stderr(&o).contains("SECRET-SERVER-STRING"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!stdout(&o).contains("SECRET-SERVER-STRING"));
+    assert!(stderr(&o).contains("HTTP 200"), "{}", stderr(&o));
+}
+
+#[test]
+fn stream_pre_stream_http_error_shows_status_and_safe_code_only() {
+    let (stub, _) = common::stub_sse_chunked(
+        400,
+        vec![],
+        vec![(
+            0,
+            r#"{"detail":{"code":"bad_model","message":"LEAKY TEXT"}}"#.to_string(),
+        )],
+    );
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat", "--stream"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("HTTP 400 (bad_model)"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!stderr(&o).contains("LEAKY TEXT"));
+    assert_eq!(stdout(&o), "");
+}
+
+#[test]
+fn stream_show_tools_and_verify_tool_firing_accumulate_rounds() {
+    let round = |name: &str| {
+        sse(
+            serde_json::json!({"tools_used": [{"id":"c","name":name,"arguments":"{}","result":""}]}),
+        )
+    };
+    let chunks = vec![
+        (0, round("web_search")),
+        (0, delta("ok")),
+        (0, round("law__law_get")),
+        (0, DONE.to_string()),
+    ];
+    let (stub, _) = common::stub_sse_chunked(200, thread_hdr(), chunks.clone());
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat", "--stream", "--show-tools"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "ok\n");
+    assert!(
+        stderr(&o).contains("Tools: web_search, law__law_get\n"),
+        "{}",
+        stderr(&o)
+    );
+
+    let ok = run_piped(
+        home.path(),
+        &["chat", "--stream", "--verify-tool-firing=law__law_get"],
+    );
+    assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
+    let bad = run_piped(
+        home.path(),
+        &["chat", "--stream", "--verify-tool-firing=nope"],
+    );
+    assert_eq!(bad.status.code(), Some(1), "{}", stderr(&bad));
+}
+
+#[test]
+fn stream_with_no_tool_round_fails_verification() {
+    let chunks = vec![
+        (0, delta("x")),
+        (0, sse(serde_json::json!({"tools_used": []}))),
+        (0, DONE.to_string()),
+    ];
+    let (stub, _) = common::stub_sse_chunked(200, thread_hdr(), chunks);
+    let home = logged_in_home(&stub);
+    let o = run_piped(home.path(), &["chat", "--stream", "--verify-tool-firing"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+}

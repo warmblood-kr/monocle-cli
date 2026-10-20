@@ -343,3 +343,77 @@ impl Observer for RecordingObserver {
         self.events.push("step".to_string());
     }
 }
+
+// ── chunked / delayed SSE stub (raw TCP) ─────────────────────────────────────
+
+/// Raw requests (request line + headers + body, as received) seen by a
+/// [`stub_sse_chunked`] server.
+pub type RawRequests = Arc<Mutex<Vec<String>>>;
+
+/// A stub that answers every request with `status` + `headers` and then writes
+/// `chunks` — `(delay_ms_before, bytes)` — flushing after each, with NO
+/// content-length (`Connection: close`), so the body ends only at EOF. Unlike
+/// [`stub_sse`], the client sees the body arrive over time. Returns the raw
+/// requests so tests can assert on headers (e.g. no `x-session-id`).
+pub fn stub_sse_chunked(
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+    chunks: Vec<(u64, String)>,
+) -> (Stub, RawRequests) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let seen: RawRequests = Arc::default();
+    let log = seen.clone();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut s) = conn else { continue };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let (head_end, len) = loop {
+                let n = s.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break (buf.len(), 0);
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    break (i + 4, len);
+                }
+            };
+            while buf.len() < head_end + len {
+                let n = s.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            log.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf).into_owned());
+            let mut head = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
+            );
+            for (k, v) in &headers {
+                head.push_str(&format!("{k}: {v}\r\n"));
+            }
+            head.push_str("\r\n");
+            let _ = s.write_all(head.as_bytes()).and_then(|_| s.flush());
+            for (delay, bytes) in &chunks {
+                thread::sleep(std::time::Duration::from_millis(*delay));
+                if s.write_all(bytes.as_bytes())
+                    .and_then(|_| s.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    (Stub { addr }, seen)
+}

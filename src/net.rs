@@ -482,9 +482,11 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let headers = collect_headers(resp.headers());
         Ok(EventStream {
             status,
             content_type,
+            headers,
             reader: BufReader::new(resp),
             request_url: url.to_string(),
         })
@@ -638,6 +640,7 @@ fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)
 pub struct EventStream {
     pub status: u16,
     pub content_type: String,
+    headers: Vec<(String, String)>,
     reader: BufReader<reqwest::blocking::Response>,
     /// The request URL, kept only for diagnostic logging on a mid-stream read
     /// failure (see `next_line`).
@@ -647,6 +650,15 @@ pub struct EventStream {
 impl EventStream {
     pub fn ok(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// Look up a response header by name (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
     }
 
     /// Whether the body is a Server-Sent Events stream.

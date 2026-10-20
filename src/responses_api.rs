@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use crate::agent::providers::{ensure_tool_call_ids, FileAttachment, ImageAttachment, ToolCall};
 use crate::error::{AppError, Result};
 use crate::net::{Client, FilePart};
-use crate::origin::{auth_headers, responses_headers};
+use crate::origin::{auth_headers, responses_headers, responses_stream_headers};
 
 /// One turn's reply, plus the thread id to pass as `--resume`/the next turn's
 /// `thread_id` to keep the conversation going. jarvice always resolves (and
@@ -119,11 +119,12 @@ fn build_request_body(
     file_ids: &[String],
     thread_id: Option<&str>,
     tool_ids: &[String],
+    stream: bool,
 ) -> Value {
     let mut body = json!({
         "model": model,
         "input": build_input(text, images, file_ids),
-        "stream": false,
+        "stream": stream,
     });
     if let Some(id) = thread_id {
         body["thread"] = json!({"thread_id": id});
@@ -194,7 +195,7 @@ impl<'a> ResponsesClient<'a> {
             file_ids.push(self.upload_file(&bearer, file)?);
         }
 
-        let body = build_request_body(model, text, images, &file_ids, thread_id, tool_ids);
+        let body = build_request_body(model, text, images, &file_ids, thread_id, tool_ids, false);
 
         // `_once`: a turn can run paid tool calls / sub-agent delegations, so a
         // lost response must not replay it (monocle-cli#172).
@@ -210,6 +211,67 @@ impl<'a> ResponsesClient<'a> {
         let data: Value = resp.json()?;
         let thread_id = resp.header("x-thread-id").map(str::to_string);
         parse_reply(&data, thread_id)
+    }
+
+    /// One HEADLESS streaming turn (`stream: true`, no `X-Session-Id` — see
+    /// `responses_stream_headers`). `on_event` fires for every SSE `data:`
+    /// payload; `on_text` for each non-empty answer delta. Reads the body to
+    /// EOF (not just `[DONE]`). A mid-stream `{"error":..}` is returned as an
+    /// error carrying no server text. One attempt only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn respond_stream(
+        &self,
+        model: &str,
+        text: &str,
+        images: &[ImageAttachment],
+        files: &[FileAttachment],
+        thread_id: Option<&str>,
+        tool_ids: &[String],
+        on_event: &mut dyn FnMut(),
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<ResponsesReply> {
+        let bearer = format!("Bearer {}", self.token);
+        let mut file_ids: Vec<String> = Vec::with_capacity(files.len());
+        for file in files {
+            file_ids.push(self.upload_file(&bearer, file)?);
+        }
+        let body = build_request_body(model, text, images, &file_ids, thread_id, tool_ids, true);
+        let mut stream = self.client.post_json_stream_once(
+            &format!("{}/api/responses", self.jarvice_url),
+            &responses_stream_headers(&bearer),
+            &body,
+        )?;
+        if !stream.ok() {
+            let label = crate::jarvice_knowledge::status_label(stream.status, &stream.read_all());
+            return Err(AppError::new(format!("Responses API failed: {label}.")));
+        }
+        let thread_id = stream.header("x-thread-id").map(str::to_string);
+        if !stream.is_event_stream() {
+            return Err(AppError::new(format!(
+                "Responses API did not stream (HTTP {}, unexpected content type).",
+                stream.status
+            )));
+        }
+        // A blocking read cannot time out by itself: a reader thread feeds
+        // lines through a channel, and silence beyond STREAM_IDLE is an error.
+        // ponytail: reader thread left blocked on timeout; the CLI exits right after.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || while tx.send(stream.next_line()).is_ok() {});
+        let mut parser = StreamParser::default();
+        loop {
+            let line = match rx.recv_timeout(STREAM_IDLE) {
+                Ok(l) => l?,
+                Err(_) => {
+                    return Err(AppError::new(format!(
+                        "The server went silent for {}s; giving up (the turn may still have been processed).",
+                        STREAM_IDLE.as_secs()
+                    )))
+                }
+            };
+            let Some(line) = line else { break };
+            parser.feed(&line, on_event, on_text);
+        }
+        parser.finish(thread_id)
     }
 
     /// Upload one non-image file to jarvice's `POST /api/v1/files/` and
@@ -248,6 +310,70 @@ impl<'a> ResponsesClient<'a> {
                     file.filename
                 ))
             })
+    }
+}
+
+/// Longest silence tolerated mid-stream.
+const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Folds the headless `/api/responses` SSE wire (only `data: <json>` lines;
+/// OpenAI-style `choices[0].delta.content`, per-round `tools_used`, an
+/// `{"error":{..}}` event, `[DONE]`) into a `ResponsesReply`.
+#[derive(Default)]
+struct StreamParser {
+    content: String,
+    names: Vec<String>,
+    unparsed: usize,
+    tools_present: bool,
+    errored: bool,
+}
+
+impl StreamParser {
+    fn feed(&mut self, line: &str, on_event: &mut dyn FnMut(), on_text: &mut dyn FnMut(&str)) {
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        on_event();
+        if v.get("error").is_some() {
+            self.errored = true;
+        }
+        if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
+            if !t.is_empty() {
+                self.content.push_str(t);
+                on_text(t);
+            }
+        }
+        if v.get("tools_used").is_some() {
+            let (n, u, present) = parse_tools_used(v.get("tools_used"));
+            self.names.extend(n);
+            self.unparsed += u;
+            self.tools_present |= present;
+        }
+    }
+
+    fn finish(self, thread_id: Option<String>) -> Result<ResponsesReply> {
+        if self.errored {
+            // The server's error string is never echoed.
+            return Err(AppError::new(
+                "Responses API failed: HTTP 200 (the server reported an error mid-stream).",
+            ));
+        }
+        Ok(ResponsesReply {
+            content: self.content,
+            thread_id,
+            tool_calls: Vec::new(),
+            unparsed_tool_calls: 0,
+            tools_used: self.names,
+            unparsed_tools_used: self.unparsed,
+            tools_used_present: self.tools_present,
+        })
     }
 }
 
@@ -395,14 +521,14 @@ mod tests {
 
     #[test]
     fn empty_tool_ids_are_omitted_from_the_request_body() {
-        let body = build_request_body("m", "hi", &[], &[], None, &[]);
+        let body = build_request_body("m", "hi", &[], &[], None, &[], false);
         assert!(body.get("tools").is_none());
     }
 
     #[test]
     fn tool_ids_are_sent_as_the_tools_field() {
         let tool_ids = vec!["ms365-server-id".to_string()];
-        let body = build_request_body("m", "hi", &[], &[], None, &tool_ids);
+        let body = build_request_body("m", "hi", &[], &[], None, &tool_ids, false);
         assert_eq!(body["tools"], json!(["ms365-server-id"]));
     }
 
@@ -458,6 +584,20 @@ mod tests {
         assert_eq!(reply.tools_used, vec!["web_search", "query_chat_history"]);
         assert_eq!(reply.unparsed_tools_used, 0);
         assert!(reply.tools_used_present);
+    }
+
+    #[test]
+    fn realistic_tools_used_entry_without_result_text_is_parsed() {
+        // Real server shape: {id, name, arguments, result, files?}; the
+        // result may carry no text at all.
+        let data = body_with_tools_used(
+            "hi",
+            Some(json!([{"id": "call_1", "name": "law__law_get",
+                "arguments": "{\"id\":\"1\"}", "result": "", "files": []}])),
+        );
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.tools_used, vec!["law__law_get"]);
+        assert_eq!(reply.unparsed_tools_used, 0);
     }
 
     #[test]

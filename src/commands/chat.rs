@@ -50,6 +50,8 @@ pub struct ChatOptions {
     /// `--show-tools`: after each reply, print the tool names the server
     /// reports it executed (`tools_used`) to stderr.
     pub show_tools: bool,
+    /// `--stream`: hosted Chat, one-shot only — headless SSE (no `X-Session-Id`).
+    pub stream: bool,
     /// `--timings`: one-shot hosted Chat only; one JSON line to stderr.
     pub timings: bool,
     /// `--diagnostics-file` / `MONOCLE_DIAGNOSTICS_FILE` (one-shot hosted Chat only).
@@ -709,11 +711,12 @@ fn tools_line(tools_used: &[String], unparsed: usize, present: bool) -> String {
     if tools_used.is_empty() && unparsed == 0 {
         return "Tools: none".to_string();
     }
-    format!(
-        "Tools: {}{}",
-        tools_used.join(", "),
+    let note = if unparsed > 0 {
         unparsed_note(unparsed)
-    )
+    } else {
+        String::new()
+    };
+    format!("Tools: {}{note}", tools_used.join(", "))
 }
 
 pub(crate) fn dropped_tool_calls_message(
@@ -940,6 +943,13 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         std::process::exit(1);
     }
 
+    if options.stream && stdin_is_tty {
+        eprintln!(
+            "--stream requires piped input (one-shot only). Pipe your prompt, e.g.:\n  echo \"hello\" | monocle chat --stream"
+        );
+        std::process::exit(1);
+    }
+
     // Auth FIRST, same rationale as the completions path — an expired/missing
     // login must surface before any local-input error masks it.
     let (session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
@@ -949,22 +959,52 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     if let Some((text, images, files)) = one_shot_input {
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
+        let mut redactor = crate::commands::redact::Redactor::new(&[]);
+        redactor.add_secret(&session.token);
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
         tm = tm.with_diagnostics(
             crate::instrument::diagnostics_path(options.diagnostics_file.clone()),
             crate::instrument::host_of(&jarvice_url),
         );
         tm.sent();
-        let res = rc.respond(
-            &model,
-            &text,
-            &images,
-            &files,
-            options.resume.as_deref(),
-            &options.tool_ids,
-        );
+        let res = if options.stream {
+            let mut out = std::io::stdout().lock();
+            let mut wrote = false;
+            let tm_cell = std::cell::RefCell::new(&mut tm);
+            let res = rc.respond_stream(
+                &model,
+                &text,
+                &images,
+                &files,
+                options.resume.as_deref(),
+                &options.tool_ids,
+                &mut || tm_cell.borrow_mut().event(),
+                &mut |delta| {
+                    tm_cell.borrow_mut().text();
+                    wrote = true;
+                    let _ = out.write_all(redactor.delta(delta).as_bytes());
+                    let _ = out.flush();
+                },
+            );
+            // Held-back tail, then the newline `println!` gives the one-shot path.
+            let _ = out.write_all(redactor.take_tail().as_bytes());
+            if wrote || res.is_ok() {
+                let _ = out.write_all(b"\n");
+            }
+            let _ = out.flush();
+            res
+        } else {
+            rc.respond(
+                &model,
+                &text,
+                &images,
+                &files,
+                options.resume.as_deref(),
+                &options.tool_ids,
+            )
+        };
         // Non-streaming: the whole reply arrives as one response.
-        if let Ok(r) = &res {
+        if let (false, Ok(r)) = (options.stream, &res) {
             if r.content.is_empty() {
                 tm.event();
             } else {
@@ -985,7 +1025,9 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         // the previous order exited before printing it, so a failing check
         // swallowed the one thing you need in order to see why it failed.
         // stdout stays the answer channel, stderr the verdict channel.
-        println!("{}", reply.content);
+        if !options.stream {
+            println!("{}", reply.content);
+        }
         if let Some(id) = reply.thread_id {
             eprintln!("Thread: {id}");
         }
@@ -1249,7 +1291,7 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
 mod tests {
     use super::{
         chat_help_text, dispatch_chat_command, dropped_tool_calls_message, handle_help_command,
-        resolve_max_tokens, resolve_repl_attachments, tool_firing_verification,
+        resolve_max_tokens, resolve_repl_attachments, tool_firing_verification, tools_line,
         ToolFiringExpectation, ToolFiringVerdict, TurnDiagnostics,
     };
     use crate::agent::providers::{FunctionCall, ToolCall};
@@ -1436,6 +1478,14 @@ mod tests {
     #[test]
     fn dropped_tool_calls_message_none_when_nothing_to_report() {
         assert_eq!(dropped_tool_calls_message(&[], 0, "--responses mode"), None);
+    }
+
+    #[test]
+    fn tools_line_has_no_unrecognized_shape_note_when_all_names_parsed() {
+        let line = tools_line(&["law__law_get".to_string()], 0, true);
+        assert_eq!(line, "Tools: law__law_get");
+        let line = tools_line(&["a".to_string()], 2, true);
+        assert!(line.contains("⚠ 2 `tools_used`"), "{line}");
     }
 
     #[test]
