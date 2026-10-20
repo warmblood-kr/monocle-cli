@@ -67,6 +67,11 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle knowledge content <collection> <file>` | Print the text the server extracted from the file (to check parsing before testing search) |
 | `monocle knowledge ask <collection> <question> [--model M] [--json]` | Ask one question with the collection attached (one model turn, not saved to your threads). Answer on stdout; the files it was grounded in on stderr (or `{"answer","sources"}` with `--json`). jarvice has no retrieval endpoint, so this is the only way to see whether stored content is used |
 | `monocle knowledge delete <collection>` | Delete a collection **and its files** (kept if any file can't be deleted, so you can retry) |
+| `monocle mcp ls [--json]` | List your MCP servers (name, enabled, auth state `none`/`connected`/`needed`/`failed`, tool count); `--json` prints the server body unchanged |
+| `monocle mcp show <server> [--json]` | Show one server (name or id) and its tools with each tool's enabled state |
+| `monocle mcp attention [--json]` | Print how many servers need re-authentication |
+| `monocle mcp enable <server>` / `disable <server>` | Turn a server on or off for your account |
+| `monocle mcp tool <server> <tool> enable\|disable` | Switch one tool of an enabled server on or off (only flips the setting; never runs the tool) |
 | `monocle workspace-model list` | List workspace (custom) models: id, name, base model, active |
 | `monocle workspace-model show <id>` | Print one model as JSON |
 | `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment). Access: `--access private\|public`, or `--read-group/--write-group/--read-user/--write-user ID` (repeatable) to share |
