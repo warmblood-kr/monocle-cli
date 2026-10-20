@@ -860,6 +860,9 @@ fn router_flag_hint(flag: &str) -> String {
 /// `--system-prompt`/`--max-tokens` support (the endpoint has no such
 /// fields) — each is warned-and-ignored rather than silently dropped.
 fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    // Starts with the command, like the craft lanes: t_request_ms covers auth,
+    // input and attachment prep up to the request.
+    let mut tm = Timings::new(Lane::Chat);
     let mut model = options
         .model
         .as_deref()
@@ -902,7 +905,6 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
-        let mut tm = Timings::new(Lane::Chat);
         tm.sent();
         let res = rc.respond(
             &model,

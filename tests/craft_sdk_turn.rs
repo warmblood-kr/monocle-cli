@@ -693,3 +693,14 @@ fn timings_with_json_and_no_text_gives_null_ttft() {
     assert!(t["ttft_ms"].is_null() && t["ttfe_ms"].is_u64());
     assert!(!out(&o).contains("timings"));
 }
+
+#[test]
+fn timings_does_not_change_json_stdout() {
+    let (addr, _) = start(happy());
+    let home = setup(&addr);
+    let a = turn(home.path(), &["hi there", "--json"]);
+    let b = turn(home.path(), &["hi there", "--json", "--timings"]);
+    assert!(a.status.success() && b.status.success());
+    assert_eq!(a.stdout, b.stdout);
+    assert!(err(&b).contains(r#"{"timings""#));
+}

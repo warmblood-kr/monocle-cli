@@ -1045,3 +1045,23 @@ fn timings_json_mode_and_no_text_gives_null_ttft() {
     assert!(t["ttft_ms"].is_null() && t["ttfe_ms"].is_u64() && t["total_ms"].is_u64());
     assert!(out(&o).lines().all(|l| !l.contains("timings")));
 }
+
+#[test]
+fn timings_does_not_change_json_stdout() {
+    let (addr, _) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let url = format!("http://{addr}");
+    let a = turn(
+        home.path(),
+        &url,
+        &["hi there", "--no-delegation", "--json"],
+    );
+    let b = turn(
+        home.path(),
+        &url,
+        &["hi there", "--no-delegation", "--json", "--timings"],
+    );
+    assert!(a.status.success() && b.status.success());
+    assert_eq!(a.stdout, b.stdout);
+    assert!(timings_line(&b).is_some());
+}
