@@ -72,7 +72,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment) |
 | `monocle workspace-model update <id> [same flags]` | Change only the given fields (`--tool`/`--knowledge` replace the lists) |
 | `monocle workspace-model toggle <id>` / `delete <id>` | Flip active/inactive; delete |
-| `monocle craft [--lane openworker\|sdk] session list\|show <id>\|history <id>\|files <id>\|download <id> <path>\|delete <id>` | Inspect and delete Craft sessions; see [Craft sessions](#-craft-sessions) |
+| `monocle craft [--lane openworker\|sdk] session list\|show <id>\|history <id>\|files <id>\|download <id> <path>\|delete <id>\|delegate <id>`, `craft workspace list\|open <path> [--create]`, `craft agent list` | Inspect and delete Craft sessions, list/open workspaces, list agents, attach delegation; see [Craft sessions](#-craft-sessions) |
 | `monocle router models` | List available models from the router (with modality) |
 | `monocle router chat [--model <id>] [--system-prompt <text>] [--system-prompt-file <path>] [--max-tokens <n>] [--file <path\|url>]...` | Chat via the router's plain `/v1/chat/completions` (REPL or stdin); no Responses-API options |
 | `monocle router audio transcribe [file] [--model <id>] [--language <code>] [--response-format <fmt>]` | OpenAI-compatible STT (file or stdin) |
@@ -324,11 +324,17 @@ monocle craft session files <id>                    # sdk: [--folder uploads|out
 monocle craft session download <id> <path> [-o FILE]  # bytes to stdout, or to FILE
 monocle craft session delete <id>
 monocle --env stg craft --lane sdk session list     # jarvice agent sessions
+monocle craft session delegate <id> [--json]        # openworker only: attach your Stark delegation
+monocle craft workspace list [--json]               # openworker only: recent workspaces (name, exists, path)
+monocle craft workspace open <path> [--create]      # prints the server's JSON response
+monocle craft agent list [--json]                   # openworker only: name, default, needs workspace, title
 ```
 
 - `openworker` talks to the Craft server with your monocle access token. Its URL is `MONOCLE_CRAFT_URL` if set, else `https://craft-stg.monocle-ai.com` for `--env stg` and `https://craft.monocle-ai.com` for `--env prod`; for `local` set `MONOCLE_CRAFT_URL`. An override is refused if it names the other environment's Craft host (your token is never sent across environments) or any host other than loopback. `--workspace` filters `list` (this lane only).
 - `sdk` uses your tenant's jarvice agent sessions (`--folder` on `files` applies here only).
 - `list`, `show`, `history`, `files` and `delete` take `--json` for the raw server data on stdout. Data goes to stdout; the profile banner and confirmations go to stderr.
+- `workspace`, `agent` and `session delegate` exist on the openworker lane only; `--lane sdk` reports an error.
+- `session delegate` lets Craft call the model gateway as you: it sends your stored Stark `id_token` to `POST /v1/sessions/<id>/delegation` and prints `Delegation attached (expires_at N)` to stderr. The token is sent only to the selected environment's own Craft host (`https://craft-stg.monocle-ai.com` for `stg`, `https://craft.monocle-ai.com` for `prod`, default port); `MONOCLE_CRAFT_URL` is refused for this command unless it names exactly that host, and `local` is refused. Redirects are never followed and the token is never printed. A refusal asks you to run `monocle login` again; a 404 means the session belongs to another tenant.
 - Server error bodies are never printed: you see the HTTP status and, when the server sends one, a short error code. On the openworker lane `files` reports "session files unavailable" if the session is parked or its sandbox is gone.
 
 ### 🧵 Hosted Chat: server-managed threads

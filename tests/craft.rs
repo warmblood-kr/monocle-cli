@@ -429,6 +429,16 @@ fn missing_craft_url_names_the_environment() {
         monocle_cli::craft_server::base_url("stg").unwrap(),
         "https://craft-stg.monocle-ai.com"
     );
+    // Delegation host: exactly the env's Craft host, nothing for `local`.
+    assert_eq!(
+        monocle_cli::craft_server::delegation_base("stg").unwrap(),
+        "https://craft-stg.monocle-ai.com"
+    );
+    assert_eq!(
+        monocle_cli::craft_server::delegation_base("prod").unwrap(),
+        "https://craft.monocle-ai.com"
+    );
+    assert!(monocle_cli::craft_server::delegation_base("local").is_err());
     // An explicit :443 is the default https port and stays allowed. (Kept in this
     // test so the process-wide env var is never set concurrently with the asserts above.)
     std::env::set_var("MONOCLE_CRAFT_URL", "https://craft-stg.monocle-ai.com:443/");
@@ -512,4 +522,277 @@ fn craft_url_override_must_match_env() {
         assert!(err(&o).contains(want), "{url}: {}", err(&o));
     }
     assert!(requests(&log).is_empty());
+}
+
+// ── workspace / agent / delegate ──
+
+type Seen = Arc<Mutex<Vec<(String, String, String, String)>>>; // method, url, auth, body
+
+/// Stub answering every request with `status`/`body` (+ optional Location), recording all.
+fn canned(status: u16, body: &str, location: Option<String>) -> (String, Seen) {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", server.server_addr().to_ip().unwrap().port());
+    let seen = Seen::default();
+    let (s, body) = (seen.clone(), body.to_string());
+    thread::spawn(move || {
+        for mut req in server.incoming_requests() {
+            let mut b = String::new();
+            let _ = std::io::Read::read_to_string(req.as_reader(), &mut b);
+            let auth = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Authorization"))
+                .map(|h| h.value.to_string())
+                .unwrap_or_default();
+            s.lock()
+                .unwrap()
+                .push((req.method().to_string(), req.url().to_string(), auth, b));
+            let mut r = tiny_http::Response::from_string(body.clone()).with_status_code(status);
+            if let Some(l) = &location {
+                r = r.with_header(tiny_http::Header::from_bytes("Location", l.as_str()).unwrap());
+            }
+            let _ = req.respond(r);
+        }
+    });
+    (addr, seen)
+}
+
+const FAKE: &str = "FAKE.ID.TOKEN";
+
+fn with_fake_id_token(home: &Path) {
+    let c = Credentials::with_home(home);
+    let mut d = c.read().unwrap();
+    d.id_token = FAKE.into();
+    c.write(&d).unwrap();
+}
+
+#[test]
+fn workspace_and_agent_commands() {
+    let (_, _, home) = setup();
+    let (a, seen) = canned(
+        200,
+        r#"{"workspaces":[{"path":"/w/one","name":"one","exists":true}]}"#,
+        None,
+    );
+    let url = format!("http://{a}");
+    let o = run(home.path(), Some(&url), &["craft", "workspace", "list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        out(&o).contains("one") && out(&o).contains("/w/one"),
+        "{}",
+        out(&o)
+    );
+    let o = run(
+        home.path(),
+        Some(&url),
+        &["craft", "workspace", "list", "--json"],
+    );
+    assert!(out(&o).contains("\"exists\": true"), "{}", out(&o));
+    assert_eq!(seen.lock().unwrap()[0].1, "/v1/workspaces/recent");
+    assert_eq!(seen.lock().unwrap()[0].2, "Bearer tok");
+
+    let (a, seen) = canned(200, r#"{"opened":"/w/new"}"#, None);
+    let url = format!("http://{a}");
+    let o = run(
+        home.path(),
+        Some(&url),
+        &["craft", "workspace", "open", "/w/new", "--create"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(out(&o).contains("/w/new"));
+    let o = run(
+        home.path(),
+        Some(&url),
+        &["craft", "workspace", "open", "/w/x"],
+    );
+    assert_eq!(o.status.code(), Some(0));
+    let s = seen.lock().unwrap();
+    assert_eq!(
+        (s[0].0.as_str(), s[0].1.as_str()),
+        ("POST", "/v1/workspaces/open")
+    );
+    let b0: serde_json::Value = serde_json::from_str(&s[0].3).unwrap();
+    assert_eq!(b0, serde_json::json!({"path":"/w/new","create":true}));
+    let b1: serde_json::Value = serde_json::from_str(&s[1].3).unwrap();
+    assert_eq!(b1, serde_json::json!({"path":"/w/x","create":false}));
+    drop(s);
+
+    let (a, _) = canned(500, r#"{"error":"SECRET leaked"}"#, None);
+    let o = run(
+        home.path(),
+        Some(&format!("http://{a}")),
+        &["craft", "workspace", "open", "/w"],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        err(&o).contains("HTTP 500") && !err(&o).contains("SECRET"),
+        "{}",
+        err(&o)
+    );
+
+    let (a, seen) = canned(
+        200,
+        r#"{"agents":[{"name":"coder","title":"Coder","needs_workspace":true,"default":true,"tagline":"writes code"}]}"#,
+        None,
+    );
+    let url = format!("http://{a}");
+    let o = run(home.path(), Some(&url), &["craft", "agent", "list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        out(&o).contains("coder") && out(&o).contains("writes code"),
+        "{}",
+        out(&o)
+    );
+    let o = run(
+        home.path(),
+        Some(&url),
+        &["craft", "agent", "list", "--json"],
+    );
+    assert!(out(&o).contains("\"needs_workspace\": true"));
+    assert_eq!(seen.lock().unwrap()[0].1, "/v1/agents");
+}
+
+#[test]
+fn sdk_lane_rejected_for_workspace_agent_delegate() {
+    let (addr, log, home) = setup();
+    for args in [
+        &["craft", "--lane", "sdk", "workspace", "list"][..],
+        &["craft", "--lane", "sdk", "workspace", "open", "/w"],
+        &["craft", "--lane", "sdk", "agent", "list"],
+        &["craft", "--lane", "sdk", "session", "delegate", "abc"],
+    ] {
+        let o = run(home.path(), Some(&format!("http://{addr}")), args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+        assert!(
+            err(&o).contains("only supported on the openworker lane"),
+            "{}",
+            err(&o)
+        );
+    }
+    assert!(requests(&log).is_empty());
+}
+
+#[test]
+fn delegate_refuses_unallowlisted_hosts_before_sending_the_token() {
+    let (_, _, home) = setup();
+    with_fake_id_token(home.path());
+    let (a, seen) = canned(200, r#"{"ok":true,"expires_at":1}"#, None);
+    let loopback = format!("http://{a}");
+    for (env, url, want) in [
+        (
+            "stg",
+            Some(loopback.as_str()),
+            "only allowed against the Craft host",
+        ),
+        (
+            "local",
+            Some(loopback.as_str()),
+            "only allowed against the Craft host",
+        ),
+        ("local", None, "only allowed against the Craft host"),
+        (
+            "stg",
+            Some("https://craft.monocle-ai.com"),
+            "does not belong to env 'stg'",
+        ),
+        (
+            "prod",
+            Some("https://craft-stg.monocle-ai.com"),
+            "does not belong to env 'prod'",
+        ),
+        (
+            "stg",
+            Some("https://craft-stg.monocle-ai.com:8443"),
+            "default port",
+        ),
+    ] {
+        let o = run(
+            home.path(),
+            url,
+            &["--env", env, "craft", "session", "delegate", "abc"],
+        );
+        assert_eq!(o.status.code(), Some(1), "{env} {url:?}");
+        assert!(err(&o).contains(want), "{env} {url:?}: {}", err(&o));
+        assert!(!err(&o).contains(FAKE) && !out(&o).contains(FAKE));
+    }
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "token must not reach the stub"
+    );
+}
+
+#[test]
+fn attach_delegation_posts_token_and_maps_statuses() {
+    use monocle_cli::craft_server::attach_delegation;
+    let client = monocle_cli::net::Client::new();
+    let (a, seen) = canned(200, r#"{"ok":true,"expires_at":1893456000}"#, None);
+    let v = attach_delegation(
+        &client,
+        &format!("http://{a}"),
+        "Bearer tok",
+        "sess-1",
+        FAKE,
+    )
+    .unwrap();
+    assert_eq!(v["expires_at"], 1893456000);
+    let s = seen.lock().unwrap();
+    assert_eq!(
+        (s[0].0.as_str(), s[0].1.as_str()),
+        ("POST", "/v1/sessions/sess-1/delegation")
+    );
+    assert_eq!(s[0].2, "Bearer tok");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&s[0].3).unwrap(),
+        serde_json::json!({"id_token": FAKE})
+    );
+    drop(s);
+
+    for (status, want) in [
+        (400, "monocle login"),
+        (404, "not found"),
+        (500, "HTTP 500"),
+    ] {
+        let (a, _) = canned(status, &format!(r#"{{"error":"x","echo":"{FAKE}"}}"#), None);
+        let e = attach_delegation(
+            &client,
+            &format!("http://{a}"),
+            "Bearer tok",
+            "sess-1",
+            FAKE,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains(want) && !e.contains(FAKE), "{status}: {e}");
+    }
+    let (a, _) = canned(200, r#"{"ok":false}"#, None);
+    assert!(attach_delegation(&client, &format!("http://{a}"), "Bearer t", "s", FAKE).is_err());
+}
+
+#[test]
+fn attach_delegation_does_not_follow_redirects() {
+    use monocle_cli::craft_server::attach_delegation;
+    let (b, seen_b) = canned(200, r#"{"ok":true,"expires_at":1}"#, None);
+    let (a, seen_a) = canned(
+        307,
+        "",
+        Some(format!("http://{b}/v1/sessions/s/delegation")),
+    );
+    let e = attach_delegation(
+        &monocle_cli::net::Client::new(),
+        &format!("http://{a}"),
+        "Bearer tok",
+        "s",
+        FAKE,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("unexpected redirect") && !e.contains(FAKE),
+        "{e}"
+    );
+    assert_eq!(seen_a.lock().unwrap().len(), 1);
+    assert!(
+        seen_b.lock().unwrap().is_empty(),
+        "redirect target must get nothing"
+    );
 }
