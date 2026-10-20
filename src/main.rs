@@ -27,6 +27,9 @@ use monocle_cli::commands::knowledge::{
     knowledge_upload_command,
 };
 use monocle_cli::commands::login::login_command;
+use monocle_cli::commands::mcp::{
+    mcp_attention_command, mcp_ls_command, mcp_set_command, mcp_show_command,
+};
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
 use monocle_cli::commands::status::status_command;
@@ -70,6 +73,7 @@ Commands:
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
+    mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, tool)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
     craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
 
@@ -154,6 +158,11 @@ enum Commands {
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommand,
+    },
+    /// Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, tool)
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
     /// Manage workspace (custom) models: system prompt, tools, knowledge (then `chat --model <id>`)
     WorkspaceModel {
@@ -458,6 +467,56 @@ enum CraftCommand {
         /// Print each received frame / polled message as one JSON line instead of text
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Toggle {
+    Enable,
+    Disable,
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// List MCP servers (name, enabled, auth state, tool count)
+    Ls {
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one server and its tools with their enabled state
+    Show {
+        /// Server name or id (see `monocle mcp ls`)
+        server: String,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Count servers whose authentication failed and needs attention
+    Attention {
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable a server for your account
+    Enable {
+        /// Server name (see `monocle mcp ls`)
+        server: String,
+    },
+    /// Disable a server for your account
+    Disable {
+        /// Server name (see `monocle mcp ls`)
+        server: String,
+    },
+    /// Switch one tool of an enabled server on or off (does not run the tool)
+    Tool {
+        /// Server name
+        server: String,
+        /// Tool name (see `monocle mcp show`)
+        tool: String,
+        /// New state
+        #[arg(value_enum)]
+        state: Toggle,
     },
 }
 
@@ -966,6 +1025,33 @@ fn main() {
                 show_tools,
             }) => chat_content_command(&client, &creds, &selection, &id, format, show_tools),
             None => chat_command(&client, &creds, args.into()),
+        },
+        Commands::Mcp { command } => match command {
+            McpCommand::Ls { json } => mcp_ls_command(&client, &creds, &selection, json),
+            McpCommand::Show { server, json } => {
+                mcp_show_command(&client, &creds, &selection, &server, json)
+            }
+            McpCommand::Attention { json } => {
+                mcp_attention_command(&client, &creds, &selection, json)
+            }
+            McpCommand::Enable { server } => {
+                mcp_set_command(&client, &creds, &selection, &server, None, true)
+            }
+            McpCommand::Disable { server } => {
+                mcp_set_command(&client, &creds, &selection, &server, None, false)
+            }
+            McpCommand::Tool {
+                server,
+                tool,
+                state,
+            } => mcp_set_command(
+                &client,
+                &creds,
+                &selection,
+                &server,
+                Some(&tool),
+                matches!(state, Toggle::Enable),
+            ),
         },
         Commands::Knowledge { command } => match command {
             KnowledgeCommand::Create { name } => {

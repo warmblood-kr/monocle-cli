@@ -18,6 +18,7 @@ pub mod image_io;
 pub mod jarvice_agent;
 pub mod jarvice_chats;
 pub mod jarvice_knowledge;
+pub mod jarvice_mcp;
 pub mod jarvice_models;
 pub mod net;
 pub mod oidc;
