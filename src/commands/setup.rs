@@ -12,7 +12,7 @@ pub fn setup_command(creds: &Credentials, home: &Path) -> Result<()> {
     let creds = match creds.read() {
         Some(c) => c,
         None => {
-            eprintln!("Not logged in. Run `monocle login --tenant <domain>` first.");
+            eprintln!("{}", creds.not_logged_in());
             std::process::exit(1);
         }
     };

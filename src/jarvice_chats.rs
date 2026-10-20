@@ -167,6 +167,13 @@ pub fn delete_thread(client: &Client, jarvice_url: &str, bearer: &str, id: &str)
         if resp.status == 401 {
             err.push_str(" HTTP 401 can mean the chat was not found or is not yours.");
         }
+        if resp.status == 500 {
+            // jarvice answers a bare 500 for a missing or foreign id.
+            err = "Deleting the chat failed: not found or not yours.".to_string();
+            if crate::util::verbose() {
+                err.push_str(" (the server answered HTTP 500)");
+            }
+        }
         return Err(AppError::new(err));
     }
     if resp.json::<bool>().ok() != Some(true) {

@@ -4,6 +4,17 @@ use std::path::PathBuf;
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Global `-v/--verbose`: set once in `main`, read where protocol detail is printed.
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn verbose() -> bool {
+    VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// JS `new Date(...).toISOString()` — UTC, millisecond precision, trailing `Z`.
 pub fn to_iso(ts_ms: i64) -> String {
     Utc.timestamp_millis_opt(ts_ms)

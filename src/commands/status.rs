@@ -30,8 +30,11 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
         Some(c) => c,
         None => {
             eprintln!(
-                "Not logged in for profile '{}' ({}). Run `monocle --profile {} login --env {}` first.",
-                selection.profile, selection.environment, selection.profile, selection.environment
+                "{}",
+                crate::credentials::not_logged_in_message(
+                    &selection.profile,
+                    &selection.environment
+                )
             );
             return;
         }

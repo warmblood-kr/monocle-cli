@@ -105,9 +105,7 @@ fn locked_token(
     let stored = match creds.read() {
         Some(c) => c,
         None => {
-            return Err(AppError::new(
-                "Not logged in. Run `monocle login --tenant <domain>` first.",
-            ));
+            return Err(AppError::new(creds.not_logged_in()));
         }
     };
 
