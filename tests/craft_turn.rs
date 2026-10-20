@@ -650,3 +650,136 @@ fn handshake_http_error_shows_only_the_status_code() {
         "{e}"
     );
 }
+
+// ---- token reflection: a server echoing the access token must never reach the terminal ----
+
+fn reflecting_ws(kind_and_data: String) -> WsScript {
+    ws_script(move |s, log| {
+        frame(s, READY);
+        recv(s, log);
+        frame(s, &kind_and_data);
+        frame(s, r#"{"type":"turn_end","data":{}}"#);
+    })
+}
+
+fn assert_redacted(o: &Output) {
+    no_token(o);
+    let all = format!("{}{}", out(o), err(o));
+    assert!(all.contains("[REDACTED]"), "{all}");
+}
+
+fn run_reflect(ws: WsScript, rest: Rest, extra: &[&str]) -> Output {
+    let (addr, _) = start(ws, rest);
+    let home = setup(&addr);
+    let mut a = vec!["x", "--no-delegation"];
+    a.extend_from_slice(extra);
+    turn(home.path(), &format!("http://{addr}"), &a)
+}
+
+#[test]
+fn token_in_assistant_delta_is_redacted() {
+    let f = format!(r#"{{"type":"assistant_delta","data":{{"text":"leak {TOKEN} end"}}}}"#);
+    let o = run_reflect(reflecting_ws(f), Arc::new(rest_default), &[]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "leak [REDACTED] end\n");
+    assert_redacted(&o);
+}
+
+#[test]
+fn token_in_error_frame_is_redacted() {
+    let f = format!(r#"{{"type":"error","data":{{"error":"bad {TOKEN}"}}}}"#);
+    let o = run_reflect(reflecting_ws(f), Arc::new(rest_default), &[]);
+    assert!(!o.status.success());
+    assert_redacted(&o);
+}
+
+#[test]
+fn token_in_json_frame_is_redacted() {
+    let f = format!(r#"{{"type":"assistant_delta","data":{{"text":"leak {TOKEN}"}}}}"#);
+    let o = run_reflect(reflecting_ws(f), Arc::new(rest_default), &["--json"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_redacted(&o);
+    for l in out(&o).lines() {
+        serde_json::from_str::<serde_json::Value>(l).unwrap(); // still valid JSON
+    }
+}
+
+#[test]
+fn token_in_polled_assistant_message_is_redacted() {
+    let m = format!(
+        r#"{{"messages":[{{"role":"user","content":"x"}},{{"role":"assistant","content":"leak {TOKEN}"}}]}}"#
+    );
+    let m: &'static str = Box::leak(m.into_boxed_str());
+    let o = run_reflect(
+        accepted_script(),
+        polled(Box::leak(Box::new([r#"{"messages":[]}"#, m]))),
+        &[],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "leak [REDACTED]\n");
+    assert_redacted(&o);
+}
+
+#[test]
+fn token_in_polled_error_notice_is_redacted() {
+    let m = format!(
+        r#"{{"messages":[{{"role":"user","content":"x"}},{{"role":"notice","kind":"error","text":"bad {TOKEN}"}}]}}"#
+    );
+    let m: &'static str = Box::leak(m.into_boxed_str());
+    let o = run_reflect(
+        accepted_script(),
+        polled(Box::leak(Box::new([r#"{"messages":[]}"#, m]))),
+        &[],
+    );
+    assert!(!o.status.success());
+    assert_redacted(&o);
+}
+
+// ---- one overall deadline ----
+
+fn assert_times_out_fast(o: &Output, started: std::time::Instant) {
+    assert!(!o.status.success());
+    assert!(err(o).contains("Timed out after 2s"), "{}", err(o));
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(3500), "took {took:?}");
+}
+
+#[test]
+fn stalled_messages_endpoint_times_out_at_the_deadline() {
+    // Baseline read (call 1) answers; the first poll then stalls past --timeout.
+    let rest: Rest = Arc::new(|p, n| {
+        if p.ends_with("/messages") && n > 1 {
+            thread::sleep(Duration::from_secs(6));
+        }
+        rest_default(p, n)
+    });
+    let (addr, _) = start(accepted_script(), rest);
+    let home = setup(&addr);
+    let t0 = std::time::Instant::now();
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["x", "--no-delegation", "--timeout", "2"],
+    );
+    assert_times_out_fast(&o, t0);
+}
+
+#[test]
+fn stalled_workspace_listing_times_out_at_the_deadline() {
+    let rest: Rest = Arc::new(|p, n| {
+        if p == "GET /v1/workspaces/recent" {
+            thread::sleep(Duration::from_secs(6));
+        }
+        rest_default(p, n)
+    });
+    let (addr, log) = start(happy(), rest);
+    let home = setup(&addr);
+    let t0 = std::time::Instant::now();
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["x", "--no-delegation", "--timeout", "2"],
+    );
+    assert_times_out_fast(&o, t0);
+    assert!(!lines(&log).iter().any(|l| l.starts_with("WS connect")));
+}

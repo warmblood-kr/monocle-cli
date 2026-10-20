@@ -100,8 +100,10 @@ fn tls_stream(host: &str, tcp: TcpStream) -> Result<Stream> {
     Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
 }
 
-/// Open a connection and complete the handshake within `timeout` per I/O step.
+/// Open a connection and complete the handshake: DNS and the TCP connect share
+/// `timeout`; each handshake I/O step then gets what is left of it.
 pub fn connect(url: &str, subprotocols: &[&str], timeout: Duration) -> Result<WsConn> {
+    let started = Instant::now();
     let (tls, host, port) = vet(url)?;
     if subprotocols.is_empty()
         || subprotocols
@@ -119,11 +121,20 @@ pub fn connect(url: &str, subprotocols: &[&str], timeout: Duration) -> Result<Ws
         .headers_mut()
         .insert("Sec-WebSocket-Protocol", proto);
 
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
+    // DNS has no timeout of its own: resolve on a helper thread and stop waiting
+    // at the deadline (the thread is abandoned; the process exits soon after).
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = (host.clone(), port);
+    std::thread::spawn(move || {
+        let _ = tx.send(target.to_socket_addrs().ok().and_then(|mut a| a.next()));
+    });
+    let addr = rx
+        .recv_timeout(timeout)
+        .map_err(|_| fail("connect timed out"))?
         .ok_or_else(|| fail("host could not be resolved"))?;
+    let timeout = timeout
+        .saturating_sub(started.elapsed())
+        .max(Duration::from_millis(1));
     let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|_| fail("connection failed"))?;
     tcp.set_read_timeout(Some(timeout))
         .and_then(|_| tcp.set_write_timeout(Some(timeout)))

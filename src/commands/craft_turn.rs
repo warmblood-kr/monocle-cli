@@ -74,13 +74,75 @@ fn short(t: &str) -> String {
         .collect()
 }
 
-fn emit(source: &str, key: &str, v: &Value) {
-    println!("{}", json!({"source": source, key: v}));
+/// The ONE output boundary: everything the command writes to stdout/stderr goes
+/// through here, so a server echoing a secret (the access token) never reaches a
+/// terminal or a pipe. Empty secrets are ignored.
+pub struct Redactor(Vec<String>);
+
+impl Redactor {
+    pub fn new(secrets: &[&str]) -> Self {
+        let mut all = Vec::new();
+        for s in secrets.iter().filter(|s| !s.is_empty()) {
+            all.push(s.to_string());
+            // The form it takes inside a serialized JSON string.
+            let esc = serde_json::to_string(s).unwrap_or_default();
+            let esc = esc.trim_matches('"');
+            if esc != *s {
+                all.push(esc.to_string());
+            }
+        }
+        Self(all)
+    }
+
+    pub fn scrub(&self, t: &str) -> String {
+        self.0
+            .iter()
+            .fold(t.to_string(), |t, s| t.replace(s, "[REDACTED]"))
+    }
+
+    fn out(&self, t: &str) {
+        print!("{}", self.scrub(t));
+        let _ = std::io::stdout().flush();
+    }
+
+    fn errln(&self, t: &str) {
+        eprintln!("{}", self.scrub(t));
+    }
+
+    /// `--json` line: serialize, scrub the string, print.
+    fn emit(&self, source: &str, key: &str, v: &Value) {
+        self.out(&format!("{}\n", json!({"source": source, key: v})));
+    }
 }
 
-fn out(t: &str) {
-    print!("{t}");
-    let _ = std::io::stdout().flush();
+fn timed_out(opts: &TurnOpts, what: &str) -> AppError {
+    AppError::new(format!(
+        "Timed out after {}s waiting for {what}.",
+        opts.timeout.as_secs()
+    ))
+}
+
+/// Run one HTTP call under the overall deadline: it gets what is left (never more
+/// than its normal cap), and a failure at/after the deadline is reported as the
+/// timeout.
+fn http<T>(
+    t: &Target,
+    opts: &TurnOpts,
+    deadline: Instant,
+    call: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(timed_out(opts, "the turn"));
+    }
+    t.client.set_request_cap(Some(left));
+    let r = call();
+    let left = deadline.saturating_duration_since(Instant::now());
+    // The request's own timer can fire a hair before our clock does.
+    match r {
+        Err(_) if left < Duration::from_millis(200) => Err(timed_out(opts, "the turn")),
+        r => r,
+    }
 }
 
 fn send(ws: &mut WsConn, v: Value) -> Result<()> {
@@ -89,12 +151,21 @@ fn send(ws: &mut WsConn, v: Value) -> Result<()> {
 
 /// Workspace to pass on the socket: the explicit one (opened first), else the
 /// first recent one that still exists, else none (the server default applies).
-fn resolve_workspace(t: &Target, opts: &TurnOpts) -> Result<Option<String>> {
+fn resolve_workspace(
+    t: &Target,
+    opts: &TurnOpts,
+    r: &Redactor,
+    deadline: Instant,
+) -> Result<Option<String>> {
     if let Some(path) = &opts.workspace {
-        craft::open_workspace(t.client, t.base, t.bearer, path, opts.create_workspace)?;
+        http(t, opts, deadline, || {
+            craft::open_workspace(t.client, t.base, t.bearer, path, opts.create_workspace)
+        })?;
         return Ok(Some(path.clone()));
     }
-    match craft::list_workspaces(t.client, t.base, t.bearer) {
+    match http(t, opts, deadline, || {
+        craft::list_workspaces(t.client, t.base, t.bearer)
+    }) {
         Ok(all) => {
             let found = all
                 .iter()
@@ -103,33 +174,54 @@ fn resolve_workspace(t: &Target, opts: &TurnOpts) -> Result<Option<String>> {
             if found.is_none() {
                 // Observed on stg: without a workspace the cowork turn is accepted
                 // but never produces a message.
-                eprintln!(
-                    "No existing workspace found; the turn may stall. Pass --workspace PATH [--create-workspace]."
+                r.errln(
+                    "No existing workspace found; the turn may stall. Pass --workspace PATH [--create-workspace].",
                 );
             }
             Ok(found)
         }
+        Err(_) if deadline.saturating_duration_since(Instant::now()).is_zero() => {
+            Err(timed_out(opts, "the turn"))
+        }
         Err(_) => {
-            eprintln!("Could not list recent workspaces; using the server default.");
+            r.errln("Could not list recent workspaces; using the server default.");
             Ok(None)
         }
     }
 }
 
 /// Run one turn. `delegate` runs first (before any workspace call or socket).
+/// `opts.timeout` is ONE deadline from here on: delegation, workspace calls, the
+/// socket connect, frame reads and polling all share it.
 pub fn run_turn(
     t: &Target,
     opts: &TurnOpts,
     delegate: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
+    let deadline = Instant::now() + opts.timeout;
+    let token = t.bearer.strip_prefix("Bearer ").unwrap_or(t.bearer);
+    let r = Redactor::new(&[token]);
+    let res = run_inner(t, opts, delegate, &r, deadline);
+    t.client.set_request_cap(None);
+    // Server-provided text can sit inside any error: scrub at the boundary.
+    res.map_err(|e| AppError::new(r.scrub(&e.to_string())))
+}
+
+fn run_inner(
+    t: &Target,
+    opts: &TurnOpts,
+    delegate: impl FnOnce(&str) -> Result<()>,
+    r: &Redactor,
+    deadline: Instant,
 ) -> Result<()> {
     let id = match &opts.session {
         Some(s) if is_valid_chat_id(s) => s.clone(),
         Some(_) => return Err(AppError::new("Invalid session ID.")),
         None => new_session_id(),
     };
-    eprintln!("Session: {id}");
-    delegate(&id)?;
-    let workspace = resolve_workspace(t, opts)?;
+    r.errln(&format!("Session: {id}"));
+    http(t, opts, deadline, || delegate(&id))?;
+    let workspace = resolve_workspace(t, opts, r, deadline)?;
     let token = t
         .bearer
         .strip_prefix("Bearer ")
@@ -142,21 +234,36 @@ pub fn run_turn(
     if let Some(w) = &workspace {
         url.push_str(&format!("&workspace={}", percent_encode(w, false)));
     }
-    let deadline = Instant::now() + opts.timeout;
-    let step = Duration::from_secs(15).min(opts.timeout);
-    let mut conn = ws::connect(&url, &["openworker", token], step)?;
-    let r = drive(t, opts, &id, &mut conn, deadline);
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(timed_out(opts, "the turn"));
+    }
+    let mut conn = ws::connect(
+        &url,
+        &["openworker", token],
+        left.min(Duration::from_secs(15)),
+    )
+    .map_err(|e| {
+        if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(200) {
+            timed_out(opts, "the turn")
+        } else {
+            e
+        }
+    })?;
+    let res = drive(t, opts, r, &id, &mut conn, deadline);
     conn.close();
-    r
+    res
 }
 
-fn drive(t: &Target, opts: &TurnOpts, id: &str, ws: &mut WsConn, deadline: Instant) -> Result<()> {
-    let timeout = || {
-        AppError::new(format!(
-            "Timed out after {}s waiting for the turn.",
-            opts.timeout.as_secs()
-        ))
-    };
+fn drive(
+    t: &Target,
+    opts: &TurnOpts,
+    r: &Redactor,
+    id: &str,
+    ws: &mut WsConn,
+    deadline: Instant,
+) -> Result<()> {
+    let timeout = || timed_out(opts, "the turn");
     let mut baseline = 0;
     let mut sent = false;
     let mut streamed = false; // deltas seen since the last assistant_message
@@ -173,30 +280,32 @@ fn drive(t: &Target, opts: &TurnOpts, id: &str, ws: &mut WsConn, deadline: Insta
             continue;
         };
         if opts.json {
-            emit("ws", "frame", &frame);
+            r.emit("ws", "frame", &frame);
         }
         let kind = frame["type"].as_str().unwrap_or("");
         let data = &frame["data"];
         match kind {
             "ready" if !sent => {
                 // Messages already in the session, so polling can tell new from old.
-                baseline = craft::history(t.client, t.base, t.bearer, id)
-                    .map(|h| h["messages"].as_array().map_or(0, Vec::len))
-                    .unwrap_or(0);
+                baseline = http(t, opts, deadline, || {
+                    craft::history(t.client, t.base, t.bearer, id)
+                })
+                .map(|h| h["messages"].as_array().map_or(0, Vec::len))
+                .unwrap_or(0);
                 send(ws, json!({"type": "user_message", "text": opts.text}))?;
                 sent = true;
             }
             "assistant_delta" => {
                 streamed = true;
                 if let (false, Some(t)) = (opts.json, data_text(data)) {
-                    out(t);
+                    r.out(t);
                     wrote_text = true;
                 }
             }
             "assistant_message" => {
                 if !opts.json && !streamed {
                     if let Some(t) = data_text(data) {
-                        out(t);
+                        r.out(t);
                         wrote_text = true;
                     }
                 }
@@ -207,27 +316,31 @@ fn drive(t: &Target, opts: &TurnOpts, id: &str, ws: &mut WsConn, deadline: Insta
                     .iter()
                     .find_map(|k| data[*k].as_str())
                     .unwrap_or("");
-                eprintln!("[{kind}] {}", short(name));
+                r.errln(&format!("[{kind}] {}", short(name)));
             }
             "permission_required" => {
                 let (decision, word) = match opts.approve {
                     Approve::Deny => ("deny", "denied"),
                     Approve::Once => ("once", "approved once"),
                 };
-                eprintln!("[permission_required] {word} (--approve {decision})");
+                r.errln(&format!(
+                    "[permission_required] {word} (--approve {decision})"
+                ));
                 send(ws, json!({"type": "approval", "decision": decision}))?;
             }
             "question_requested" | "plan_proposed" => {
-                eprintln!("[{kind}] cannot be answered from the CLI; interrupting the turn.");
+                r.errln(&format!(
+                    "[{kind}] cannot be answered from the CLI; interrupting the turn."
+                ));
                 send(ws, json!({"type": "interrupt"}))?;
             }
             "turn_accepted" => {
-                eprintln!("Turn accepted (queued); polling for the answer.");
-                return poll(t, opts, id, baseline, deadline);
+                r.errln("Turn accepted (queued); polling for the answer.");
+                return poll(t, opts, r, id, baseline, deadline);
             }
             "turn_end" | "turn_done" => {
                 if wrote_text {
-                    out("\n");
+                    r.out("\n");
                 }
                 return Ok(());
             }
@@ -250,7 +363,14 @@ fn drive(t: &Target, opts: &TurnOpts, id: &str, ws: &mut WsConn, deadline: Insta
 /// Poll the message log until the answer to our message is complete: an
 /// assistant message exists after our user message and the log has stopped
 /// growing for one more poll (a turn may emit several assistant messages).
-fn poll(t: &Target, opts: &TurnOpts, id: &str, baseline: usize, deadline: Instant) -> Result<()> {
+fn poll(
+    t: &Target,
+    opts: &TurnOpts,
+    r: &Redactor,
+    id: &str,
+    baseline: usize,
+    deadline: Instant,
+) -> Result<()> {
     let mut printed = 0; // json mode: new messages already emitted
     let mut last_len = None;
     loop {
@@ -262,7 +382,9 @@ fn poll(t: &Target, opts: &TurnOpts, id: &str, baseline: usize, deadline: Instan
             )));
         }
         std::thread::sleep(opts.poll_every.min(left));
-        let h = craft::history(t.client, t.base, t.bearer, id)?;
+        let h = http(t, opts, deadline, || {
+            craft::history(t.client, t.base, t.bearer, id)
+        })?;
         let all = h["messages"]
             .as_array()
             .map(Vec::as_slice)
@@ -276,7 +398,7 @@ fn poll(t: &Target, opts: &TurnOpts, id: &str, baseline: usize, deadline: Instan
             after
                 .iter()
                 .skip(printed)
-                .for_each(|m| emit("poll", "message", m));
+                .for_each(|m| r.emit("poll", "message", m));
             printed = after.len();
         }
         if let Some(n) = after
@@ -294,7 +416,7 @@ fn poll(t: &Target, opts: &TurnOpts, id: &str, baseline: usize, deadline: Instan
         if !answers.is_empty() && stable {
             if !opts.json {
                 for m in answers {
-                    println!("{}", msg_text(m));
+                    r.out(&format!("{}\n", msg_text(m)));
                 }
             }
             return Ok(());
