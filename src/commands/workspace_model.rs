@@ -131,10 +131,22 @@ pub fn list_command(client: &Client, creds: &Credentials, sel: &Selection) -> Re
     Ok(())
 }
 
-pub fn show_command(client: &Client, creds: &Credentials, sel: &Selection, id: &str) -> Result<()> {
+/// Prints the model as JSON. Large `data:` URLs (the profile image) are replaced
+/// by `<data:MIME, N bytes>` unless `full`, which prints the exact server body.
+pub fn show_command(
+    client: &Client,
+    creds: &Credentials,
+    sel: &Selection,
+    id: &str,
+    full: bool,
+) -> Result<()> {
     let (url, bearer) = connect(client, creds, sel)?;
     models::find(&models::list_models(client, &url, &bearer)?, id)?;
-    print_json(&models::get_model(client, &url, &bearer, id)?);
+    let mut model = models::get_model(client, &url, &bearer, id)?;
+    if !full {
+        models::elide_data_urls(&mut model);
+    }
+    print_json(&model);
     Ok(())
 }
 

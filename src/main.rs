@@ -962,8 +962,15 @@ impl From<ModelWriteArgs> for WriteArgs {
 enum WorkspaceModelCommand {
     /// List workspace models (id, name, base, active)
     List,
-    /// Print one model as JSON
-    Show { id: String },
+    /// Print one model as JSON (data: URLs over 1 KiB, e.g. the profile image,
+    /// are shown as `<data:MIME, N bytes>`; `--full` prints the exact body)
+    Show {
+        /// Model ID (see `monocle workspace-model list`)
+        id: String,
+        /// Print the server body unchanged, including large data: URLs
+        #[arg(long)]
+        full: bool,
+    },
     /// Create a private, active model; prints its id to stdout
     Create(ModelWriteArgs),
     /// Change a model: only the given flags/--file fields change
@@ -1477,8 +1484,8 @@ fn main() {
         },
         Commands::WorkspaceModel { command } => match command {
             WorkspaceModelCommand::List => wm::list_command(&client, &creds, &selection),
-            WorkspaceModelCommand::Show { id } => {
-                wm::show_command(&client, &creds, &selection, &id)
+            WorkspaceModelCommand::Show { id, full } => {
+                wm::show_command(&client, &creds, &selection, &id, full)
             }
             WorkspaceModelCommand::Create(a) => {
                 wm::create_command(&client, &creds, &selection, &a.into())

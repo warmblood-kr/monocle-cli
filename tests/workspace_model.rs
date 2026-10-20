@@ -484,3 +484,54 @@ fn writes_make_a_single_attempt_on_transport_failure() {
     assert!(m::delete_model(&c, &base, "t", "x").is_err());
     assert_eq!(accepts.load(Ordering::SeqCst), 4, "a write was replayed");
 }
+
+// ── show elides large data: URLs ─────────────────────────────────────────────
+
+fn seed_with_image(state: &Shared, id: &str) -> String {
+    let image = format!("data:image/png;base64,{}", "A".repeat(5000));
+    state.lock().unwrap().models.push(json!({
+        "id": id, "user_id": "u1", "name": "Pic", "base_model_id": "gpt-x",
+        "meta": {"description": "keep me", "profile_image_url": image,
+                 "tiny": "data:text/plain,hi"},
+        "params": {"system": "p"}, "access_control": null, "is_active": true,
+        "created_at": 1, "updated_at": 1
+    }));
+    image
+}
+
+#[test]
+fn show_elides_large_data_urls_and_full_prints_the_exact_body() {
+    let (state, home) = setup();
+    let image = seed_with_image(&state, "m1");
+
+    let o = run(home.path(), &["workspace-model", "show", "m1"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let text = out(&o);
+    assert!(!text.contains("AAAA"), "image leaked into show output");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        v["meta"]["profile_image_url"],
+        format!("<data:image/png, {} bytes>", image.len())
+    );
+    assert_eq!(
+        v["meta"]["tiny"], "data:text/plain,hi",
+        "small data: URL kept"
+    );
+    assert_eq!(v["meta"]["description"], "keep me");
+
+    let o = run(home.path(), &["workspace-model", "show", "m1", "--full"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let v: Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["meta"]["profile_image_url"], image.as_str());
+}
+
+#[test]
+fn update_file_from_elided_show_output_keeps_the_stored_image() {
+    let (state, home) = setup();
+    let image = seed_with_image(&state, "m1");
+    let shown = run(home.path(), &["workspace-model", "show", "m1"]);
+    let f = home.path().join("shown.json");
+    std::fs::write(&f, out(&shown)).unwrap();
+    let b = update_body(&state, home.path(), &["--file", f.to_str().unwrap()]);
+    assert_eq!(b["meta"]["profile_image_url"], image.as_str());
+}
