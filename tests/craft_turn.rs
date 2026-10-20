@@ -506,10 +506,10 @@ fn delegation_failure_aborts_before_the_socket() {
 }
 
 #[test]
-fn sdk_lane_is_refused() {
+fn sdk_lane_refuses_workspace_flag() {
     let home = setup("127.0.0.1:1");
     let o = Command::new(env!("CARGO_BIN_EXE_monocle"))
-        .args(["craft", "--lane", "sdk", "turn", "x"])
+        .args(["craft", "--lane", "sdk", "turn", "x", "--workspace", "/w"])
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .current_dir(home.path())
@@ -517,7 +517,7 @@ fn sdk_lane_is_refused() {
         .unwrap();
     assert!(!o.status.success());
     assert!(
-        err(&o).contains("only supported on the openworker lane"),
+        err(&o).contains("--workspace is only supported on the openworker lane"),
         "{}",
         err(&o)
     );

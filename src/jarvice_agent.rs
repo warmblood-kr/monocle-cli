@@ -95,3 +95,37 @@ pub fn delete(client: &Client, base: &str, bearer: &str, id: &str) -> Result<Val
     )?;
     Ok(resp.json().unwrap_or(Value::Null))
 }
+
+/// `POST /api/v1/agent/sessions` — a new session; returns its id.
+pub fn create_session(client: &Client, base: &str, bearer: &str, title: &str) -> Result<String> {
+    let url = format!("{base}/api/v1/agent/sessions");
+    let resp = client.post_json_once(
+        &url,
+        &auth_headers(bearer),
+        &serde_json::json!({"title": title}),
+    )?;
+    let v: Value = check("Creating session", "", resp)?.json()?;
+    v["id"]
+        .as_str()
+        .filter(|id| crate::jarvice_chats::is_valid_chat_id(id))
+        .map(str::to_string)
+        .ok_or_else(|| AppError::new("Creating session returned no usable session ID."))
+}
+
+/// `GET /api/v1/auths/` — a fresh jarvice HS256 token, the Socket.IO `/agent`
+/// credential. Callers must keep it in memory only. The body is never echoed.
+pub fn socket_token(client: &Client, base: &str, bearer: &str) -> Result<String> {
+    let resp = client.get(&format!("{base}/api/v1/auths/"), &auth_headers(bearer))?;
+    if !resp.ok() {
+        return Err(AppError::new(format!(
+            "Could not get a socket token (HTTP {}).",
+            resp.status
+        )));
+    }
+    let v: Value = resp.json()?;
+    v["token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| AppError::new("Could not get a socket token (none returned)."))
+}

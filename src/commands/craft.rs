@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::auth::get_access_token;
 use crate::commands::chat::resolve_jarvice;
+use crate::commands::craft_sdk_turn::{self, SdkTurn};
 use crate::commands::craft_turn::{run_turn, Target, TurnOpts};
 use crate::commands::knowledge::print_table;
 use crate::craft_server as craft;
@@ -427,9 +428,30 @@ pub fn craft_turn_command(
     selection: &Selection,
     lane: Lane,
     no_delegation: bool,
+    title: Option<String>,
     opts: TurnOpts,
 ) -> Result<()> {
-    openworker_only(lane, "`craft turn`")?;
+    if lane == Lane::Sdk {
+        if opts.workspace.is_some() {
+            return Err(AppError::new(
+                "--workspace is only supported on the openworker lane.",
+            ));
+        }
+        let (base, bearer) = connect(client, creds, selection, lane)?;
+        return craft_sdk_turn::run(&SdkTurn {
+            client,
+            base: &base,
+            bearer: &bearer,
+            text: &opts.text,
+            session: opts.session.as_deref(),
+            title: title.as_deref(),
+            timeout: opts.timeout,
+            json: opts.json,
+        });
+    }
+    if title.is_some() {
+        return Err(AppError::new("--title is only supported on the sdk lane."));
+    }
     let ws_base = craft::ws_base(&selection.environment)?;
     let (base, bearer) = connect(client, creds, selection, lane)?;
     let target = Target {
