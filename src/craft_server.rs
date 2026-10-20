@@ -25,7 +25,7 @@ fn env_host(environment: &str) -> Option<&'static str> {
 }
 
 /// `(scheme, host, port)` of an `http(s)://host[:port]/...` URL (no userinfo allowed).
-fn url_parts(url: &str) -> Option<(&str, &str, Option<&str>)> {
+pub(crate) fn url_parts(url: &str) -> Option<(&str, &str, Option<&str>)> {
     let (scheme, rest) = url.split_once("://")?;
     let authority = rest.split(['/', '?', '#']).next()?;
     if authority.contains('@') {

@@ -103,23 +103,32 @@ fn tls_stream(host: &str, tcp: TcpStream) -> Result<Stream> {
 /// Open a connection and complete the handshake: DNS and the TCP connect share
 /// `timeout`; each handshake I/O step then gets what is left of it.
 pub fn connect(url: &str, subprotocols: &[&str], timeout: Duration) -> Result<WsConn> {
+    if subprotocols.is_empty() {
+        return Err(fail("subprotocol refused (invalid characters)"));
+    }
+    connect_with(url, subprotocols, timeout)
+}
+
+/// [`connect`] where `subprotocols` may be empty (no header sent).
+pub fn connect_with(url: &str, subprotocols: &[&str], timeout: Duration) -> Result<WsConn> {
     let started = Instant::now();
     let (tls, host, port) = vet(url)?;
-    if subprotocols.is_empty()
-        || subprotocols
-            .iter()
-            .any(|p| p.is_empty() || !p.bytes().all(is_token_char))
+    if subprotocols
+        .iter()
+        .any(|p| p.is_empty() || !p.bytes().all(is_token_char))
     {
         return Err(fail("subprotocol refused (invalid characters)"));
     }
     let mut request = url
         .into_client_request()
         .map_err(|_| fail("request could not be built"))?;
-    let proto = HeaderValue::from_str(&subprotocols.join(", "))
-        .map_err(|_| fail("subprotocol refused (invalid characters)"))?;
-    request
-        .headers_mut()
-        .insert("Sec-WebSocket-Protocol", proto);
+    if !subprotocols.is_empty() {
+        let proto = HeaderValue::from_str(&subprotocols.join(", "))
+            .map_err(|_| fail("subprotocol refused (invalid characters)"))?;
+        request
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", proto);
+    }
 
     // DNS has no timeout of its own: resolve on a helper thread and stop waiting
     // at the deadline (the thread is abandoned; the process exits soon after).

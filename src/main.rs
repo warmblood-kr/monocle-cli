@@ -427,7 +427,7 @@ enum CraftCommand {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Send one message to a Craft agent and print its answer (openworker lane only)
+    /// Send one message to a Craft agent and print its answer (both lanes; --workspace, --agent, --approve and --no-delegation apply to openworker only)
     Turn {
         /// The message to send
         text: String,
@@ -449,6 +449,9 @@ enum CraftCommand {
         /// Do not attach your Stark delegation to the session first
         #[arg(long)]
         no_delegation: bool,
+        /// Title for the new session (sdk lane only; default "CLI turn")
+        #[arg(long)]
+        title: Option<String>,
         /// Answer for permission prompts (a CLI turn cannot ask interactively)
         #[arg(long, value_enum, default_value = "deny")]
         approve: Approve,
@@ -1056,6 +1059,7 @@ fn main() {
                 agent,
                 timeout,
                 no_delegation,
+                title,
                 approve,
                 json,
             } => craft_turn_command(
@@ -1064,6 +1068,7 @@ fn main() {
                 &selection,
                 lane,
                 no_delegation,
+                title,
                 TurnOpts {
                     text,
                     session,
