@@ -1098,3 +1098,38 @@ fn diagnostics_file_records_phases_without_token_or_content() {
         .collect();
     assert_eq!(names, ["connect", "first_event", "first_text", "done"]);
 }
+
+#[test]
+fn diagnostics_records_ws_close_code_but_not_server_text() {
+    let (addr, _) = start(
+        ws_script(|s, log| {
+            frame(s, READY);
+            recv(s, log);
+            let _ = s.close(Some(tungstenite::protocol::CloseFrame {
+                code: 1011.into(),
+                reason: "SECRET-REASON".into(),
+            }));
+            let _ = s.flush();
+        }),
+        Arc::new(rest_default),
+    );
+    let home = setup(&addr);
+    let path = home.path().join("d.jsonl");
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &[
+            "x",
+            "--no-delegation",
+            "--diagnostics-file",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(!o.status.success());
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("SECRET-REASON"), "{raw}");
+    let last: serde_json::Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+    assert_eq!(last["event"], "error");
+    assert_eq!(last["ws_close_code"], 1011);
+    assert!(last["status"].is_null());
+}

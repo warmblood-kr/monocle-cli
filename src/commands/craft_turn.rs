@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::commands::redact::Redactor;
 use crate::craft_server as craft;
 use crate::error::{AppError, Result};
-use crate::instrument::{ErrorKind, Lane, Timings};
+use crate::instrument::{Lane, Timings};
 use crate::jarvice_chats::is_valid_chat_id;
 use crate::net::Client;
 use crate::util::percent_encode;
@@ -173,11 +173,7 @@ pub fn run_turn(
     );
     let res = run_inner(t, opts, delegate, &r, deadline, &mut tm);
     t.client.set_request_cap(None);
-    tm.finish(
-        res.as_ref()
-            .err()
-            .map(|e| ErrorKind::classify(&e.to_string())),
-    );
+    tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
     if opts.timings {
         eprintln!("{}", tm.line());
     }

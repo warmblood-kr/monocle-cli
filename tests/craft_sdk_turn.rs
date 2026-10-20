@@ -771,7 +771,9 @@ fn diagnostics_file_has_ordered_fixed_fields_and_no_secrets_even_on_error() {
                     "host",
                     "lane",
                     "run_id",
-                    "ts"
+                    "status",
+                    "ts",
+                    "ws_close_code"
                 ]
             );
         }

@@ -136,7 +136,29 @@ pub struct DiagLine<'a> {
     pub lane: Lane,
     pub host: Option<&'a str>,
     pub error_kind: Option<ErrorKind>,
+    /// HTTP status, parsed from OUR OWN fixed error text (`HTTP <n>`); never server text.
+    pub status: Option<u16>,
+    /// WebSocket close frame code (openworker lane), likewise from our own text.
+    pub ws_close_code: Option<u16>,
     pub duration_ms: Option<u64>,
+}
+
+/// Number right after `marker` in `msg` (our own error format), 3-4 digits.
+fn number_after(msg: &str, marker: &str) -> Option<u16> {
+    let rest = &msg[msg.find(marker)? + marker.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    (3..=4)
+        .contains(&digits.len())
+        .then(|| digits.parse().ok())?
+}
+
+/// `(status, ws_close_code)` of one of our errors. `Turn failed …` embeds
+/// server-provided text, so nothing is parsed from it.
+pub fn error_codes(msg: &str) -> (Option<u16>, Option<u16>) {
+    if msg.starts_with("Turn failed") {
+        return (None, None);
+    }
+    (number_after(msg, "HTTP "), number_after(msg, "close code "))
 }
 
 /// Rotate to `PATH.1` (replacing any older one) once the file would pass this.
@@ -226,7 +248,13 @@ impl Timings {
         self
     }
 
-    fn diag(&self, event: Event, error_kind: Option<ErrorKind>, duration_ms: Option<u64>) {
+    fn diag(
+        &self,
+        event: Event,
+        error_kind: Option<ErrorKind>,
+        codes: (Option<u16>, Option<u16>),
+        duration_ms: Option<u64>,
+    ) {
         let Some(d) = &self.diag else { return };
         let line = DiagLine {
             ts: to_iso(self.clock.wall_ms()),
@@ -235,6 +263,8 @@ impl Timings {
             lane: self.body.lane,
             host: d.host.as_deref(),
             error_kind,
+            status: codes.0,
+            ws_close_code: codes.1,
             duration_ms,
         };
         if let Ok(l) = serde_json::to_string(&line) {
@@ -256,21 +286,21 @@ impl Timings {
     pub fn time_connect<T>(&mut self, f: impl FnOnce() -> T) -> T {
         let (v, d) = self.time(f);
         self.body.connect_ms = Some(d);
-        self.diag(Event::Connect, None, Some(d));
+        self.diag(Event::Connect, None, (None, None), Some(d));
         v
     }
 
     pub fn time_delegation<T>(&mut self, f: impl FnOnce() -> T) -> T {
         let (v, d) = self.time(f);
         self.body.delegation_ms = Some(d);
-        self.diag(Event::Delegation, None, Some(d));
+        self.diag(Event::Delegation, None, (None, None), Some(d));
         v
     }
 
     pub fn time_session_create<T>(&mut self, f: impl FnOnce() -> T) -> T {
         let (v, d) = self.time(f);
         self.body.session_create_ms = Some(d);
-        self.diag(Event::SessionCreate, None, Some(d));
+        self.diag(Event::SessionCreate, None, (None, None), Some(d));
         v
     }
 
@@ -291,7 +321,7 @@ impl Timings {
     pub fn event(&mut self) {
         if let (None, Some(d)) = (self.body.ttfe_ms, self.since_sent()) {
             self.body.ttfe_ms = Some(d);
-            self.diag(Event::FirstEvent, None, Some(d));
+            self.diag(Event::FirstEvent, None, (None, None), Some(d));
         }
     }
 
@@ -300,16 +330,21 @@ impl Timings {
         self.event();
         if let (None, Some(d)) = (self.body.ttft_ms, self.since_sent()) {
             self.body.ttft_ms = Some(d);
-            self.diag(Event::FirstText, None, Some(d));
+            self.diag(Event::FirstText, None, (None, None), Some(d));
         }
     }
 
     /// End of turn; `error` is the failure class, if it failed.
-    pub fn finish(&mut self, error: Option<ErrorKind>) {
+    pub fn finish(&mut self, error: Option<&str>) {
         self.body.total_ms = self.since_sent();
         match error {
-            None => self.diag(Event::Done, None, self.body.total_ms),
-            Some(k) => self.diag(Event::Error, Some(k), self.body.total_ms),
+            None => self.diag(Event::Done, None, (None, None), self.body.total_ms),
+            Some(m) => self.diag(
+                Event::Error,
+                Some(ErrorKind::classify(m)),
+                error_codes(m),
+                self.body.total_ms,
+            ),
         }
     }
 
@@ -406,6 +441,8 @@ mod tests {
                         lane,
                         host: Some("h.example.com"),
                         error_kind: k,
+                        status: Some(500),
+                        ws_close_code: Some(1006),
                         duration_ms: Some(1),
                     };
                     let v = serde_json::to_value(&l).unwrap();
@@ -420,7 +457,9 @@ mod tests {
                             "host",
                             "lane",
                             "run_id",
-                            "ts"
+                            "status",
+                            "ts",
+                            "ws_close_code"
                         ]
                     );
                     // The only strings are: ts, run_id, host, and snake_case enum names.
@@ -445,6 +484,24 @@ mod tests {
             Some("jarvice.example.com")
         );
         assert_eq!(host_of("not a url"), None);
+    }
+
+    #[test]
+    fn codes_come_only_from_our_own_text() {
+        assert_eq!(
+            error_codes("Delegation failed: HTTP 502 (bad_gateway)."),
+            (Some(502), None)
+        );
+        assert_eq!(
+            error_codes("WebSocket closed by the server (close code 1011)"),
+            (None, Some(1011))
+        );
+        assert_eq!(
+            error_codes("Turn failed (error): HTTP 418 close code 1000"),
+            (None, None)
+        );
+        assert_eq!(error_codes("HTTP 99999 nope"), (None, None));
+        assert_eq!(error_codes("no codes here"), (None, None));
     }
 
     #[test]
@@ -499,7 +556,7 @@ mod tests {
         std::fs::write(&path, vec![b'x'; DIAG_CAP_BYTES as usize]).unwrap();
         let (tm2, _) = fake();
         tm2.with_diagnostics(Some(path.clone()), None)
-            .finish(Some(ErrorKind::Timeout));
+            .finish(Some("Timed out after 3s waiting for the turn."));
         let rotated = dir.path().join("d.jsonl.1");
         assert_eq!(std::fs::metadata(rotated).unwrap().len(), DIAG_CAP_BYTES);
         let fresh = std::fs::read_to_string(&path).unwrap();

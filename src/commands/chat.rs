@@ -21,7 +21,7 @@ use crate::config::{Config, ConfigData};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
-use crate::instrument::{ErrorKind, Lane, Timings};
+use crate::instrument::{Lane, Timings};
 use crate::net::Client;
 use crate::origin::auth_headers;
 use crate::responses_api::ResponsesClient;
@@ -438,11 +438,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             &files,
             options.timings.then_some(&mut tm),
         );
-        tm.finish(
-            res.as_ref()
-                .err()
-                .map(|e| ErrorKind::classify(&e.to_string())),
-        );
+        tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
         if options.timings {
             eprintln!("{}", tm.line());
         }
@@ -975,11 +971,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                 tm.text();
             }
         }
-        tm.finish(
-            res.as_ref()
-                .err()
-                .map(|e| ErrorKind::classify(&e.to_string())),
-        );
+        tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
         if options.timings {
             eprintln!("{}", tm.line());
         }
