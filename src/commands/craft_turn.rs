@@ -77,10 +77,21 @@ fn short(t: &str) -> String {
 /// The ONE output boundary: everything the command writes to stdout/stderr goes
 /// through here, so a server echoing a secret (the access token) never reaches a
 /// terminal or a pipe. Empty secrets are ignored.
+///
+/// Threat model: ACCIDENTAL reflection only (a server/proxy echoing headers or
+/// tokens in errors/messages, logs, CI capture). A malicious Craft server already
+/// holds the token; adversarial splitting is out of scope. So: a secret split
+/// across deltas is caught by the hold-back; a split across a delta and a later
+/// non-delta text is caught by `partial_redacted` (the held-back tail ending in a
+/// secret prefix is redacted at flush, and the next text loses a leading run that
+/// is a secret suffix of >= 8 chars). Accepted false positive: a tail that merely
+/// ends in the secret's first char is redacted too.
 pub struct Redactor {
     forms: Vec<String>,
     /// Hold-back tail of the assistant delta stream (see [`Redactor::delta`]).
     hold: std::cell::RefCell<String>,
+    /// A flush redacted a possible secret prefix; the next text may start with its rest.
+    partial_redacted: std::cell::Cell<bool>,
 }
 
 impl Redactor {
@@ -98,6 +109,7 @@ impl Redactor {
         Self {
             forms: all,
             hold: Default::default(),
+            partial_redacted: Default::default(),
         }
     }
 
@@ -124,12 +136,25 @@ impl Redactor {
         let cut = s.chars().count().saturating_sub(keep);
         let at = s.char_indices().nth(cut).map_or(s.len(), |(i, _)| i);
         *b = s[at..].to_string();
+        if at > 0 {
+            self.partial_redacted.set(false); // unrelated text went out
+        }
         s[..at].to_string()
     }
 
     /// Emit the held-back tail (scrubbed). Text mode: raw; `--json`: a synthetic delta frame.
     fn flush_stream(&self, json: bool) -> bool {
-        let tail = self.scrub(&std::mem::take(&mut *self.hold.borrow_mut()));
+        let mut tail = self.scrub(&std::mem::take(&mut *self.hold.borrow_mut()));
+        // Longest suffix of the tail that is a prefix of a secret form (char boundary).
+        let cut = tail
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| self.forms.iter().any(|f| f.starts_with(&tail[i..])));
+        if let Some(i) = cut {
+            tail.truncate(i);
+            tail.push_str("[REDACTED]");
+            self.partial_redacted.set(true);
+        }
         if tail.is_empty() {
             return false;
         }
@@ -140,6 +165,32 @@ impl Redactor {
             self.out(&tail);
         }
         true
+    }
+
+    /// Non-delta text: if a partial secret was redacted, also drop a leading run of
+    /// `t` that is a secret suffix (>= 8 chars, longest match). Clears the flag.
+    fn lead(&self, t: &str) -> String {
+        if !self.partial_redacted.replace(false) {
+            return t.to_string();
+        }
+        let n = self
+            .forms
+            .iter()
+            .flat_map(|f| f.char_indices().map(move |(i, _)| &f[i..]))
+            .filter(|s| s.chars().count() >= 8 && t.starts_with(s))
+            .map(str::len)
+            .max();
+        n.map_or(t.to_string(), |n| format!("[REDACTED]{}", &t[n..]))
+    }
+
+    /// `--json`: [`Redactor::lead`] on the text-ish string fields of an object.
+    fn lead_json(&self, v: &mut Value) {
+        for k in ["text", "message", "content", "error"] {
+            if let Some(t) = v[k].as_str() {
+                v[k] = json!(self.lead(t));
+            }
+        }
+        self.partial_redacted.set(false);
     }
 
     fn out(&self, t: &str) {
@@ -324,8 +375,9 @@ fn drive(
             continue;
         };
         let kind = frame["type"].as_str().unwrap_or("");
+        // --json: the frame as emitted (delta scrubbed, lead redacted).
+        let mut f = frame.clone();
         if opts.json {
-            let mut f = frame.clone();
             if kind == "assistant_delta" {
                 if let Some(k) = ["text", "delta", "content"]
                     .into_iter()
@@ -344,10 +396,12 @@ fn drive(
                     | "interrupted"
             ) {
                 r.flush_stream(true);
+                r.lead_json(&mut f["data"]);
             }
             r.emit("ws", "frame", &f);
         }
         let data = &frame["data"];
+        let shown = if opts.json { &f["data"] } else { data };
         match kind {
             "ready" if !sent => {
                 // Messages already in the session, so polling can tell new from old.
@@ -372,7 +426,7 @@ fn drive(
                 }
                 if !opts.json && !streamed {
                     if let Some(t) = data_text(data) {
-                        r.out(t);
+                        r.out(&r.lead(t));
                         wrote_text = true;
                     }
                 }
@@ -402,6 +456,7 @@ fn drive(
                 send(ws, json!({"type": "interrupt"}))?;
             }
             "turn_accepted" => {
+                r.flush_stream(opts.json);
                 r.errln("Turn accepted (queued); polling for the answer.");
                 return poll(t, opts, r, id, baseline, deadline);
             }
@@ -416,13 +471,20 @@ fn drive(
             }
             "interrupted" => return Err(AppError::new("The turn was interrupted.")),
             "error" | "input_rejected" => {
+                if !opts.json {
+                    r.flush_stream(false);
+                }
                 let why = ["error", "message"]
                     .iter()
-                    .find_map(|k| data[*k].as_str())
+                    .find_map(|k| shown[*k].as_str())
                     .unwrap_or("no details");
                 return Err(AppError::new(format!(
                     "Turn failed ({kind}): {}",
-                    short(why)
+                    short(&if opts.json {
+                        why.to_string()
+                    } else {
+                        r.lead(why)
+                    })
                 )));
             }
             _ => {}
@@ -465,10 +527,11 @@ fn poll(
         };
         let after = &new[u + 1..];
         if opts.json {
-            after
-                .iter()
-                .skip(printed)
-                .for_each(|m| r.emit("poll", "message", m));
+            after.iter().skip(printed).for_each(|m| {
+                let mut m = m.clone();
+                r.lead_json(&mut m);
+                r.emit("poll", "message", &m)
+            });
             printed = after.len();
         }
         if let Some(n) = after
@@ -477,7 +540,7 @@ fn poll(
         {
             return Err(AppError::new(format!(
                 "Turn failed (notice): {}",
-                short(msg_text(n))
+                short(&r.lead(msg_text(n)))
             )));
         }
         let answers: Vec<&Value> = after.iter().filter(|m| m["role"] == "assistant").collect();
@@ -486,7 +549,7 @@ fn poll(
         if !answers.is_empty() && stable {
             if !opts.json {
                 for m in answers {
-                    r.out(&format!("{}\n", msg_text(m)));
+                    r.out(&format!("{}\n", r.lead(msg_text(m))));
                 }
             }
             return Ok(());

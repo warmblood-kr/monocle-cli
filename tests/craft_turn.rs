@@ -908,7 +908,66 @@ fn buffered_tail_is_flushed_scrubbed_on_timeout() {
         );
         no_token(&o);
         let shown = if json { frame_texts(&o) } else { out(&o) };
-        // Without the flush the held-back partial token would be silently dropped.
-        assert_eq!(shown.trim_end(), format!("ok {a}"), "{shown}");
+        // The partial-token tail is flushed, but redacted, not shown.
+        assert!(
+            shown.contains("ok [REDACTED]") && !shown.contains(a),
+            "{shown}"
+        );
     }
+}
+
+// ---- a token split between a delta tail and a later non-delta text ----
+
+fn run_frames(frames: Vec<String>, extra: &[&str]) -> Output {
+    let ws = ws_script(move |s, log| {
+        frame(s, READY);
+        recv(s, log);
+        for f in &frames {
+            frame(s, f);
+        }
+    });
+    run_reflect(ws, Arc::new(rest_default), extra)
+}
+
+fn delta_then(kind: &str, key: &str, text: &str) -> Vec<String> {
+    let d = serde_json::json!({"type": "assistant_delta", "data": {"text": "hi SECRET-ACCESS-"}});
+    let n = serde_json::json!({"type": kind, "data": {key: text}});
+    vec![d.to_string(), n.to_string()]
+}
+
+fn assert_pieces_gone(o: &Output) {
+    no_token(o);
+    let all = format!("{}{}", out(o), err(o));
+    assert!(all.contains("[REDACTED]"), "{all}");
+    for piece in ["SECRET-ACCESS-", "TOK.abc_def"] {
+        assert!(!all.contains(piece), "{piece} in {all}");
+    }
+}
+
+#[test]
+fn prefix_in_delta_then_suffix_in_error_is_redacted() {
+    for json in [false, true] {
+        let extra: &[&str] = if json { &["--json"] } else { &[] };
+        let o = run_frames(delta_then("error", "error", "TOK.abc_def rest"), extra);
+        assert!(!o.status.success());
+        assert_pieces_gone(&o);
+    }
+}
+
+#[test]
+fn prefix_in_delta_then_suffix_in_assistant_message_is_redacted() {
+    let mut f = delta_then("assistant_message", "text", "TOK.abc_def rest");
+    f.push(r#"{"type":"turn_end","data":{}}"#.into());
+    let o = run_frames(f, &["--json"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_pieces_gone(&o);
+    assert!(out(&o).contains("[REDACTED] rest"), "{}", out(&o));
+}
+
+#[test]
+fn delta_ending_in_unrelated_char_is_not_redacted() {
+    let o = run_deltas(&["well-", "known -"], true, &[]);
+    assert_eq!(out(&o), "well-known -\n");
+    let o = run_frames(delta_then("error", "error", "TOK is fine"), &[]);
+    assert!(err(&o).contains("TOK is fine"), "{}", err(&o)); // flag set, but no >=8 suffix match
 }
