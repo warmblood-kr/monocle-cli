@@ -293,6 +293,119 @@ fn update_changes_only_given_fields() {
     assert_eq!(b["access_control"], Value::Null);
 }
 
+fn update_body(state: &Shared, home: &Path, args: &[&str]) -> Value {
+    let mut a = vec!["workspace-model", "update", "m1"];
+    a.extend_from_slice(args);
+    let o = run(home, &a);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    last_body(state, "POST", "/api/v1/models/model/update?id=m1")
+}
+
+#[test]
+fn access_flags_set_public_private_and_shared() {
+    let (state, home) = setup();
+    seed(&state, "m1", true);
+    let b = update_body(&state, home.path(), &["--access", "private"]);
+    assert_eq!(b["access_control"], json!({}));
+    let b = update_body(&state, home.path(), &["--access", "public"]);
+    assert_eq!(b["access_control"], Value::Null);
+    let b = update_body(
+        &state,
+        home.path(),
+        &[
+            "--read-group",
+            "g1",
+            "--read-group",
+            "g2",
+            "--write-user",
+            "u9",
+        ],
+    );
+    assert_eq!(
+        b["access_control"],
+        json!({
+            "read": {"group_ids": ["g1", "g2"], "user_ids": []},
+            "write": {"group_ids": [], "user_ids": ["u9"]},
+        })
+    );
+    let o = run(
+        home.path(),
+        &[
+            "workspace-model",
+            "create",
+            "n",
+            "--base",
+            "b",
+            "--access",
+            "public",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let b = last_body(&state, "POST", "/api/v1/models/create");
+    assert_eq!(b["access_control"], Value::Null);
+}
+
+#[test]
+fn access_conflicts_with_share_lists() {
+    let (state, home) = setup();
+    seed(&state, "m1", true);
+    let o = run(
+        home.path(),
+        &[
+            "workspace-model",
+            "update",
+            "m1",
+            "--access",
+            "public",
+            "--read-user",
+            "u",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert_eq!(saw(&state, "POST", "/api/v1/models/model/update"), 0);
+}
+
+#[test]
+fn update_file_merges_meta_and_params_keywise() {
+    let (state, home) = setup();
+    seed(&state, "m1", true);
+    let f = home.path().join("m.json");
+    std::fs::write(
+        &f,
+        json!({"meta": {"capabilities": {"vision": true}}, "params": {"top_p": 1}}).to_string(),
+    )
+    .unwrap();
+    let b = update_body(&state, home.path(), &["--file", f.to_str().unwrap()]);
+    assert_eq!(b["meta"]["capabilities"], json!({"vision": true}));
+    assert_eq!(b["meta"]["toolIds"], json!(["mcp:old"]), "stored meta kept");
+    assert_eq!(b["meta"]["description"], "keep me");
+    assert_eq!(b["params"]["top_p"], 1);
+    assert_eq!(b["params"]["temperature"], 0.2, "stored params kept");
+    assert_eq!(b["params"]["system"], "old prompt");
+}
+
+#[test]
+fn clear_flags_detach_tools_and_knowledge() {
+    let (state, home) = setup();
+    seed(&state, "m1", true);
+    let b = update_body(&state, home.path(), &["--clear-tools", "--clear-knowledge"]);
+    assert_eq!(b["meta"]["toolIds"], json!([]));
+    assert_eq!(b["meta"]["knowledge"], json!([]));
+    assert_eq!(b["meta"]["custom"], 1, "other meta kept");
+    let o = run(
+        home.path(),
+        &[
+            "workspace-model",
+            "update",
+            "m1",
+            "--clear-tools",
+            "--tool",
+            "x",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+}
+
 #[test]
 fn toggle_and_delete_hit_their_endpoints() {
     let (state, home) = setup();

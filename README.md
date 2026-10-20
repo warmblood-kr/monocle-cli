@@ -69,8 +69,8 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle knowledge delete <collection>` | Delete a collection **and its files** (kept if any file can't be deleted, so you can retry) |
 | `monocle workspace-model list` | List workspace (custom) models: id, name, base model, active |
 | `monocle workspace-model show <id>` | Print one model as JSON |
-| `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment) |
-| `monocle workspace-model update <id> [same flags]` | Change only the given fields (`--tool`/`--knowledge` replace the lists) |
+| `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment). Access: `--access private\|public`, or `--read-group/--write-group/--read-user/--write-user ID` (repeatable) to share |
+| `monocle workspace-model update <id> [same flags]` | Change only the given fields (`--tool`/`--knowledge` replace the lists; `--clear-tools`/`--clear-knowledge` detach all; `--file` `meta`/`params` merge key-wise onto the stored ones) |
 | `monocle workspace-model toggle <id>` / `delete <id>` | Flip active/inactive; delete |
 | `monocle craft [--lane openworker\|sdk] session list\|show <id>\|history <id>\|files <id>\|download <id> <path>\|delete <id>\|delegate <id>`, `craft workspace list\|open <path> [--create]`, `craft agent list` | Inspect and delete Craft sessions, list/open workspaces, list agents, attach delegation; see [Craft sessions](#-craft-sessions) |
 | `monocle router models` | List available models from the router (with modality) |

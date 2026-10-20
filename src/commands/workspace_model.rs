@@ -23,6 +23,37 @@ pub struct WriteArgs {
     pub system: Option<String>,
     pub tools: Vec<String>,
     pub knowledge: Vec<String>,
+    pub clear_tools: bool,
+    pub clear_knowledge: bool,
+    /// `private` | `public`; mutually exclusive with the share lists (clap-enforced).
+    pub access: Option<String>,
+    pub read_groups: Vec<String>,
+    pub write_groups: Vec<String>,
+    pub read_users: Vec<String>,
+    pub write_users: Vec<String>,
+}
+
+/// `--access` / share lists -> jarvice `access_control`: null = public,
+/// {} = private, {read,write: {group_ids,user_ids}} = shared.
+fn access_control(a: &WriteArgs) -> Option<Value> {
+    match a.access.as_deref() {
+        Some("public") => return Some(Value::Null),
+        Some(_) => return Some(serde_json::json!({})),
+        None => {}
+    }
+    let lists = [
+        &a.read_groups,
+        &a.write_groups,
+        &a.read_users,
+        &a.write_users,
+    ];
+    if lists.iter().all(|l| l.is_empty()) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "read": {"group_ids": a.read_groups, "user_ids": a.read_users},
+        "write": {"group_ids": a.write_groups, "user_ids": a.write_users},
+    }))
 }
 
 fn s(v: &Value, key: &str) -> String {
@@ -67,6 +98,9 @@ fn overrides(client: &Client, url: &str, bearer: &str, a: &WriteArgs) -> Result<
         system: a.system.clone(),
         tool_ids: a.tools.clone(),
         knowledge: knowledge_entries(client, url, bearer, &a.knowledge)?,
+        clear_tools: a.clear_tools,
+        clear_knowledge: a.clear_knowledge,
+        access_control: access_control(a),
     })
 }
 
