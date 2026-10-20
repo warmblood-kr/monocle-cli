@@ -530,6 +530,11 @@ enum ChatCommand {
         /// add a structured `tool_calls` list per message
         #[arg(long = "show-tools")]
         show_tools: bool,
+        /// Keep the `<user_memory>` and `<past_conversations>` blocks jarvice
+        /// injects into user messages (removed by default: they are your stored
+        /// personal memory and past-chat snippets, not part of the conversation)
+        #[arg(long = "include-memory")]
+        include_memory: bool,
     },
     /// Permanently delete one chat (not undoable, never retried)
     ///
@@ -1106,10 +1111,14 @@ enum WorkspaceModelCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Print one model as JSON
+    /// Print one model as JSON (data: URLs over 1 KiB, e.g. the profile image,
+    /// are shown as `<data:MIME, N bytes>`; `--full` prints the exact body)
     Show {
         /// Workspace model ID (see `monocle workspace-model list`)
         id: String,
+        /// Print the server body unchanged, including large data: URLs
+        #[arg(long)]
+        full: bool,
     },
     /// Create a private, active model; prints its id to stdout
     Create(ModelWriteArgs),
@@ -1380,6 +1389,23 @@ fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), 
     Ok((deprecation(old, new), rc))
 }
 
+/// Asking for help by omission (`monocle`, `monocle craft`) prints the help to
+/// stdout and exits 0, like `--help`. Real usage errors keep going to stderr
+/// with exit 2.
+fn print_help_by_omission(e: &clap::Error) -> ! {
+    use std::io::IsTerminal;
+    let help = e.render();
+    if std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && !std::env::args().any(|a| a == "--no-color")
+    {
+        print!("{}", help.ansi());
+    } else {
+        print!("{help}");
+    }
+    std::process::exit(0)
+}
+
 /// If the first non-global token is `claude`, return its index: everything after it
 /// belongs to Claude Code verbatim (including `-v/--verbose`).
 fn claude_split(argv: &[String]) -> Option<usize> {
@@ -1403,6 +1429,9 @@ fn main() {
     let head = &argv[..split.map_or(argv.len(), |i| i + 1)];
     let cli = Cli::try_parse_from(head).unwrap_or_else(|e| {
         use clap::error::ErrorKind;
+        if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+            print_help_by_omission(&e);
+        }
         let _ = e.print();
         // `chat "text"`: the prompt is read from stdin, not taken as an argument.
         let wants_pipe = matches!(
@@ -1488,7 +1517,9 @@ fn main() {
         Commands::Setup => setup_command(&creds, &home),
         Commands::Unset => unset_command(&home),
         Commands::Status { json } => {
-            status_command(&creds, &home, &selection, json);
+            if !status_command(&creds, &home, &selection, json) {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Commands::Whoami { server, json } => {
@@ -1519,7 +1550,16 @@ fn main() {
                 id,
                 format,
                 show_tools,
-            }) => chat_content_command(&client, &creds, &selection, &id, format, show_tools),
+                include_memory,
+            }) => chat_content_command(
+                &client,
+                &creds,
+                &selection,
+                &id,
+                format,
+                show_tools,
+                include_memory,
+            ),
             Some(ChatCommand::Delete { id }) => {
                 chat_delete_command(&client, &creds, &selection, &id)
             }
@@ -1681,9 +1721,11 @@ fn main() {
             }
         },
         Commands::WorkspaceModel { command } => match command {
-            WorkspaceModelCommand::List { json } => wm::list_command(&client, &creds, &selection, json),
-            WorkspaceModelCommand::Show { id } => {
-                wm::show_command(&client, &creds, &selection, &id)
+            WorkspaceModelCommand::List { json } => {
+                wm::list_command(&client, &creds, &selection, json)
+            }
+            WorkspaceModelCommand::Show { id, full } => {
+                wm::show_command(&client, &creds, &selection, &id, full)
             }
             WorkspaceModelCommand::Create(a) => {
                 wm::create_command(&client, &creds, &selection, &a.into())

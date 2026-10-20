@@ -43,7 +43,7 @@ environments it falls back automatically to device-code login (or force it with
 monocle status
 ```
 
-Shows your tenant, user, access/refresh token validity, and whether Claude Code is globally configured to route through Monocle. Read-only — it does not refresh tokens.
+Shows your tenant, user, access/refresh token validity, and whether Claude Code is globally configured to route through Monocle. Read-only — it does not refresh tokens. The block is printed to stdout; `monocle status` exits 1 when the profile is not logged in (the reason goes to stderr).
 
 ## 📖 Commands
 
@@ -65,7 +65,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle knowledge list [COLLECTION] --json` | `[{id,name,files}]`, or `[{id,name}]` for one collection's files |
 | `monocle workspace-model list --json` | `[{id,name,base_model_id,active}]` |
 | `monocle router models --json` | `[{id,name,modality,owned_by,context_window}]` |
-| `monocle chat content <chat-id> [--format text\|json] [--show-tools]` | Print one hosted Chat thread's active message path to stdout (text only, attachments omitted, control characters stripped, untrusted content, 1 MiB cap). `--show-tools` replaces each raw tool-call block with a one-line summary (tool name, sub-agent `model_id`, `report_to_parent`); with `--format json` it adds a structured `tool_calls` list per message |
+| `monocle chat content <chat-id> [--format text\|json] [--show-tools] [--include-memory]` | Print one hosted Chat thread's active message path to stdout (text only, attachments omitted, control characters stripped, untrusted content, 1 MiB cap). The `<user_memory>` and `<past_conversations>` blocks jarvice injects into user messages are removed unless `--include-memory` is given. `--show-tools` replaces each raw tool-call block with a one-line summary (tool name, sub-agent `model_id`, `report_to_parent`); with `--format json` it adds a structured `tool_calls` list per message |
 | `monocle chat delete <chat-id>` | Permanently delete one hosted Chat thread (single attempt, never retried; prints `Deleted chat <id>` to stderr). jarvice answers HTTP 401 (not 404) for a chat id that does not exist or is not yours, so a 401 here can mean "not found / not yours" |
 | `monocle knowledge create <name>` | Create an empty knowledge collection (name must be new); prints its id |
 | `monocle knowledge upload <collection> <file-or-dir>...` | Upload and index pdf/docx/md/txt files into a collection (a directory contributes its top-level supported files). A failed file is reported and the rest continue (exit `1`); files already in the collection (same name) are skipped, so re-runs are safe. Prints `file-id<TAB>name` per stored file |
@@ -95,7 +95,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle schedule create --model ID (--prompt TEXT \| --prompt-file PATH \| --prompt -) (--at WHEN \| --rrule RULE --dtstart WHEN) [--timezone TZ] [--name N] [--thread-mode new\|continue] [--target-chat CHAT_ID] [--expires-at WHEN] [--disabled] [--catchup skip_missed\|run_missed] [--web-search] [--mcp-server ID]... [--dry-run] [--json]` | Create a schedule and print its id on stdout (`Created schedule <id>` on stderr; `--json` prints the body). `WHEN` is RFC3339 with an offset or relative (`+30s`, `+10m`, `+2h`, `+1d`). `--at` and `--rrule` are mutually exclusive. `--mcp-server` sets the schedule's MCP servers in a follow-up request; if that fails the schedule exists, its id is in the error, and the exit code is non-zero. `--dry-run` only calls the preview endpoint and prints the next fire times. Rule validity, past times and chat ownership are judged by the server |
 | `monocle schedule update <id> [same flags] [--enabled] [--no-web-search]` | Change only the flags you pass: the CLI reads the stored schedule, overlays them and sends the full form (the endpoint overwrites every field), so untouched fields are kept. The next fire time is recomputed by the server. `--expires-at none` / `--target-chat none` clear those fields |
 | `monocle workspace-model list` | List workspace (custom) models: id, name, base model, active |
-| `monocle workspace-model show <id>` | Print one model as JSON |
+| `monocle workspace-model show <id> [--full]` | Print one model as JSON. `data:` URLs over 1 KiB (the profile image) are shown as `<data:image/png, N bytes>`; `--full` prints the exact server body. `update --file` ignores those placeholders, so `show > m.json` then `update --file m.json` keeps the stored image |
 | `monocle workspace-model create <id> --base <base-model> [--system <prompt>] [--tool <id>]... [--knowledge <collection>]... [--name N] [--description D] [--file m.json]` | Create a private, active model; prints its id. Flags override fields from `--file` (a JSON `ModelForm` fragment). Access: `--access private\|public`, or `--read-group/--write-group/--read-user/--write-user ID` (repeatable) to share |
 | `monocle workspace-model update <id> [same flags]` | Change only the given fields (`--tool`/`--knowledge` replace the lists; `--clear-tools`/`--clear-knowledge` detach all; `--file` `meta`/`params` merge key-wise onto the stored ones) |
 | `monocle workspace-model toggle <id>` / `delete <id>` | Flip active/inactive; delete |
@@ -137,6 +137,18 @@ These root forms still work and print a one-line warning on stderr (stdout is un
 
 `monocle model list` has been removed; use `monocle router models`.
 
+### Upgrading from 1.13
+
+These changes affect scripts that parse stdout/stderr or exit codes. `--json` output is unchanged everywhere.
+
+| Change | What to do |
+|--------|------------|
+| `monocle chat content` removes the `<user_memory>` and `<past_conversations>` blocks jarvice injects into user messages (text and `--format json`; also the `chat --resume` history replay) | Pass `--include-memory` to `chat content` for the old output |
+| `monocle workspace-model show` prints `data:` URLs over 1 KiB (the profile image) as `<data:image/png, N bytes>` | Pass `--full` for the exact server body. `update --file` ignores those placeholders, so `show > m.json` then `update --file m.json` keeps the stored image |
+| `monocle status` prints its block to **stdout** (it was stderr) and exits **1** when the profile is not logged in (it was 0) | Read stdout instead of stderr; check the exit code if you used `status` to detect a missing login |
+| `monocle` and a group without a subcommand (`monocle craft`, `monocle knowledge`, …) print help to **stdout** and exit **0** (they printed to stderr and exited 2) | Nothing for interactive use. Wrong usage (missing argument, unknown command) still exits 2 on stderr |
+| List tables: times are `YYYY-MM-DD HH:MM` in UTC with `(UTC)` in the header (`chat list`, `craft session list`, `schedule list/runs`); booleans are `yes`/`no` (`schedule list`, `craft workspace list`, `craft agent list`); the id column is headed `ID` (was `THREAD ID`, `SESSION ID`, `COLLECTION ID`, `FILE ID`, `MODEL ID`) | Use `--json` where a command has it, instead of parsing the table |
+
 ### Upgrading from 1.7 to 1.8
 
 | Change | What to do |
@@ -162,7 +174,7 @@ List what your tenant has:
 
 ```console
 $ monocle router models
-MODEL ID                  NAME                  MODALITY  OWNER       CONTEXT
+ID                        NAME                  MODALITY  OWNER       CONTEXT
 ────────────────────────  ────────────────────  ────────  ──────────  ───────
 claude-sonnet-4-6         Claude Sonnet 4.6     chat      anthropic   200k
 claude-opus-4-7           Claude Opus 4.7       chat      anthropic   200k

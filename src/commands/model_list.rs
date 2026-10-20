@@ -191,7 +191,7 @@ pub fn model_list_command(client: &Client, creds: &Credentials, json: bool) -> R
     writeln!(
         out,
         "{}  {}  {}  {}  CONTEXT",
-        pad("MODEL ID", id_width),
+        pad("ID", id_width),
         pad("NAME", name_width),
         pad("MODALITY", modality_width),
         pad("OWNER", 10)

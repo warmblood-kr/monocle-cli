@@ -169,6 +169,48 @@ fn obj<'a>(form: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, V
     v.as_object_mut().unwrap()
 }
 
+/// `data:` URLs longer than this are replaced by a one-line placeholder in
+/// `workspace-model show` (a model's profile image is a base64 PNG of hundreds
+/// of KB on a single line).
+const MAX_INLINE_DATA_URL_BYTES: usize = 1024;
+
+/// Replace every string value that is a `data:` URL longer than 1 KiB (at any
+/// depth, `meta.profile_image_url` in practice) with `<data:MIME, N bytes>`.
+pub fn elide_data_urls(v: &mut Value) {
+    match v {
+        Value::String(s) if s.starts_with("data:") && s.len() > MAX_INLINE_DATA_URL_BYTES => {
+            let mime = s[5..].split([';', ',']).next().unwrap_or("");
+            *v = Value::String(format!("<data:{mime}, {} bytes>", s.len()));
+        }
+        Value::Array(a) => a.iter_mut().for_each(elide_data_urls),
+        Value::Object(o) => o.values_mut().for_each(elide_data_urls),
+        _ => {}
+    }
+}
+
+/// True for a placeholder written by [`elide_data_urls`].
+fn is_elided_placeholder(s: &str) -> bool {
+    s.strip_prefix("<data:")
+        .and_then(|r| r.strip_suffix(" bytes>"))
+        .and_then(|r| r.rsplit_once(", "))
+        .is_some_and(|(mime, n)| {
+            !mime.contains(['<', '>']) && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// Remove placeholder values so `show | update --file -` cannot overwrite a
+/// stored image with the placeholder text.
+fn drop_elided_placeholders(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            o.retain(|_, x| !matches!(x, Value::String(s) if is_elided_placeholder(s)));
+            o.values_mut().for_each(drop_elided_placeholders);
+        }
+        Value::Array(a) => a.iter_mut().for_each(drop_elided_placeholders),
+        _ => {}
+    }
+}
+
 /// Build the full `ModelForm` for create/update: start from `stored` (update) or
 /// empty (create), overlay the top-level keys of `file` (a JSON `ModelForm`
 /// fragment; `meta` and `params` are merged key-wise, other keys replaced), then the flags. A new model defaults to `name = id`, private
@@ -200,7 +242,11 @@ pub fn build_form(
             m
         }
     };
-    if let Some(f) = file {
+    let mut file_clean = file.cloned();
+    if let Some(f) = file_clean.as_mut() {
+        drop_elided_placeholders(f);
+    }
+    if let Some(f) = file_clean.as_ref() {
         let f = f
             .as_object()
             .ok_or_else(|| AppError::new("The --file JSON must be an object."))?;

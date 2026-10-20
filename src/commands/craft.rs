@@ -9,6 +9,7 @@ use clap::{Subcommand, ValueEnum};
 use serde_json::Value;
 
 use crate::auth::get_access_token;
+use crate::commands::cells::{time_from_iso, yes_no};
 use crate::commands::chat::resolve_jarvice;
 use crate::commands::craft_sdk_turn::{self, SdkTurn};
 use crate::commands::craft_turn::{is_queue_full, run_turn_id, Target, TurnOpts};
@@ -160,6 +161,11 @@ fn text(v: &Value) -> String {
     }
 }
 
+/// Boolean table cell as `yes`/`no`; non-booleans fall back to [`text`].
+fn flag(v: &Value) -> String {
+    v.as_bool().map_or_else(|| text(v), |b| yes_no(b).into())
+}
+
 fn one_line(t: &str) -> String {
     t.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -241,16 +247,16 @@ pub fn craft_session_command(
                         vec![
                             s(x, "session_id").into(),
                             text(&x["messages"]),
-                            s(x, "updated_at").into(),
+                            time_from_iso(s(x, "updated_at")),
                             one_line(s(x, "title")),
                         ]
                     }
                 })
                 .collect();
             let headers = if sdk_lane {
-                ["SESSION ID", "STATUS", "UPDATED", "TITLE"]
+                ["ID", "STATUS", "UPDATED (UTC)", "TITLE"]
             } else {
-                ["SESSION ID", "MSGS", "UPDATED", "TITLE"]
+                ["ID", "MSGS", "UPDATED (UTC)", "TITLE"]
             };
             print_table(&headers, &rows);
         }
@@ -671,7 +677,7 @@ pub fn craft_workspace_command(
                 .map(|x| {
                     vec![
                         one_line(s(x, "name")),
-                        text(&x["exists"]),
+                        flag(&x["exists"]),
                         s(x, "path").into(),
                     ]
                 })
@@ -710,13 +716,8 @@ pub fn craft_agent_command(
         .map(|x| {
             vec![
                 s(x, "name").into(),
-                if x["default"].as_bool() == Some(true) {
-                    "yes"
-                } else {
-                    ""
-                }
-                .into(),
-                text(&x["needs_workspace"]),
+                yes_no(x["default"].as_bool() == Some(true)).into(),
+                flag(&x["needs_workspace"]),
                 one_line(s(x, "title")),
                 one_line(s(x, "tagline")),
             ]

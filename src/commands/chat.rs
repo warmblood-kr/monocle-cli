@@ -3,8 +3,6 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use chrono::TimeZone;
-
 use crate::agent::providers::{
     ChatRequest, ChatResponse, FileAttachment, ImageAttachment, LlmProvider, Message,
     MonocleProvider, ToolCall,
@@ -686,11 +684,19 @@ pub fn chat_content_command(
     id: &str,
     format: crate::jarvice_chats::ContentFormat,
     show_tools: bool,
+    include_memory: bool,
 ) -> Result<()> {
     let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
     selection.announce(creds);
-    let output =
-        crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format, show_tools)?;
+    let output = crate::jarvice_chats::fetch_content(
+        client,
+        &jarvice_url,
+        &bearer,
+        id,
+        format,
+        show_tools,
+        include_memory,
+    )?;
     print!("{output}");
     Ok(())
 }
@@ -1110,7 +1116,10 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                     eprintln!("--- prior history ---");
                     for node in turns {
                         match node.role.as_str() {
-                            "user" => eprintln!("> {}", node.content),
+                            "user" => eprintln!(
+                                "> {}",
+                                crate::jarvice_chats::strip_injected_context(&node.content)
+                            ),
                             "assistant" => eprintln!("{}", node.content),
                             _ => {}
                         }
@@ -1269,15 +1278,14 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
     let rows: Vec<Vec<String>> = threads
         .iter()
         .map(|t| {
-            let updated = chrono::Utc
-                .timestamp_opt(t.updated_at, 0)
-                .single()
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_else(|| "-".to_string());
-            vec![t.id.clone(), t.title.clone(), updated]
+            vec![
+                t.id.clone(),
+                t.title.clone(),
+                crate::commands::cells::time_from_unix(t.updated_at),
+            ]
         })
         .collect();
-    crate::table::print(&["THREAD ID", "TITLE", "UPDATED"], &rows, Some(16), Some(1));
+    crate::table::print(&["ID", "TITLE", "UPDATED (UTC)"], &rows, Some(16), Some(1));
     crate::note!("\n{} thread(s).", threads.len());
 }
 
