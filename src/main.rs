@@ -315,7 +315,7 @@ struct ChatArgs {
     stream: bool,
     /// One-shot only: print one JSON timings line to stderr (stdout unchanged). t0 is the moment
     /// the request is sent; the reply is one blocking response, so ttfe = ttft = total (no
-    /// streaming). Includes a random run_id (= trace_id, sent as `traceparent` to Monocle hosts only; disable with MONOCLE_NO_TRACEPARENT=1) and started_at (UTC); never tokens, prompts or text
+    /// streaming) unless `--stream` is set (then ttfe = first SSE event, ttft = first answer text, total = stream end). Includes a random run_id (= trace_id, sent as `traceparent` to Monocle hosts only; disable with MONOCLE_NO_TRACEPARENT=1) and started_at (UTC); never tokens, prompts or text
     #[arg(long)]
     timings: bool,
     /// One-shot only: append one JSON line per phase to this file (also MONOCLE_DIAGNOSTICS_FILE);
