@@ -10,7 +10,8 @@ use monocle_cli::commands::audio_transcribe_azure::{
     audio_transcribe_azure_command, AudioTranscribeAzureOptions,
 };
 use monocle_cli::commands::chat::{
-    chat_command, chat_content_command, chat_list_command, ChatOptions, ToolFiringExpectation,
+    chat_command, chat_content_command, chat_delete_command, chat_list_command, ChatOptions,
+    ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::craft::{
@@ -423,6 +424,14 @@ enum ChatCommand {
         /// add a structured `tool_calls` list per message
         #[arg(long = "show-tools")]
         show_tools: bool,
+    },
+    /// Permanently delete one hosted Chat thread (not undoable, never retried).
+    /// Note: jarvice answers HTTP 401 (not 404) for a chat id that does not
+    /// exist or is not yours, so a 401 here can mean "not found / not yours".
+    Delete {
+        /// Hosted Chat thread ID (see `monocle chat list`)
+        #[arg(value_name = "CHAT_ID")]
+        id: String,
     },
 }
 
@@ -1077,6 +1086,9 @@ fn main() {
                 format,
                 show_tools,
             }) => chat_content_command(&client, &creds, &selection, &id, format, show_tools),
+            Some(ChatCommand::Delete { id }) => {
+                chat_delete_command(&client, &creds, &selection, &id)
+            }
             None => chat_command(&client, &creds, args.into()),
         },
         Commands::Mcp { command } => match command {
