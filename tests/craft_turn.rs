@@ -221,7 +221,7 @@ fn streams_text_sends_token_as_subprotocol_and_never_leaks_it() {
     assert_eq!(out(&o), "Hello\n");
     assert!(err(&o).contains("Session: cli-"), "{}", err(&o));
     assert!(
-        err(&o).contains(r#"continue with: monocle craft turn --session cli-"#),
+        err(&o).contains(r#"continue with: monocle craft turn --env local --session cli-"#),
         "{}",
         err(&o)
     );
@@ -546,7 +546,7 @@ fn opts() -> TurnOpts {
         follow_up: false,
         last: None,
         continue_last: false,
-        hint_prefix: "monocle craft turn".into(),
+        hint_prefix: Some("monocle craft turn".into()),
         text: "hi there".into(),
         session: Some("sess-1".into()),
         workspace: None,
@@ -1216,6 +1216,9 @@ fn turn_records_session_and_continue_reuses_it() {
         "{}",
         err(&o)
     );
+    // --continue: no duplicate `Session:` line and no continue hint.
+    assert!(!err(&o).contains("Session: "), "{}", err(&o));
+    assert!(!err(&o).contains("continue with"), "{}", err(&o));
     let l = lines(&log);
     assert!(
         l.iter().any(|x| x.contains("/ws/session/cli-1-abcd")),
@@ -1379,7 +1382,7 @@ fn interactive_two_lines_share_one_session_and_answer_in_order() {
     assert_eq!(ids[0], ids[1]);
     let e = err(&o);
     assert_eq!(e.matches("Session: ").count(), 1, "{e}");
-    assert_eq!(e.matches("continue with").count(), 1, "{e}");
+    assert_eq!(e.matches("continue with").count(), 0, "{e}");
     assert!(!e.contains("> "), "no prompt when piped: {e}");
     let runs: Vec<&str> = e
         .lines()
@@ -1511,4 +1514,34 @@ fn one_shot_still_requires_text() {
     let o = turn(home.path(), "http://127.0.0.1:9", &[]);
     assert!(!o.status.success());
     assert!(err(&o).contains("required"), "{}", err(&o));
+}
+
+#[test]
+fn hint_only_after_first_turn_of_a_new_session() {
+    let (addr, _) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let url = format!("http://{addr}");
+    let first = turn(home.path(), &url, &["hi there", "--no-delegation"]);
+    assert!(first.status.success(), "{}", err(&first));
+    assert_eq!(
+        err(&first).matches("continue with: ").count(),
+        1,
+        "{}",
+        err(&first)
+    );
+    // An explicit --session: the user already knows how to continue.
+    let again = turn(
+        home.path(),
+        &url,
+        &["--session", "cli-1-abcd", "hi there", "--no-delegation"],
+    );
+    assert!(again.status.success(), "{}", err(&again));
+    assert!(!err(&again).contains("continue with"), "{}", err(&again));
+    // Protocol chatter stays hidden without -v.
+    assert!(!err(&again).contains("Turn accepted"), "{}", err(&again));
+    assert!(
+        !err(&again).contains("Delegation attached"),
+        "{}",
+        err(&again)
+    );
 }

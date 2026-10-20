@@ -26,20 +26,52 @@ pub enum Approve {
     Once,
 }
 
-/// `monocle craft [--lane sdk] [--profile P] [--env E] turn`: only flags the user passed.
-pub fn hint_prefix(sdk: bool, profile: Option<&str>, env: Option<&str>) -> String {
-    let mut s = String::from("monocle craft");
+/// `monocle craft turn [--lane sdk] [--env E] [--profile P]`: the same shape for both
+/// lanes, flags after the subcommand; `--lane` only for sdk, `--env`/`--profile` only
+/// when not the defaults (prod / default).
+pub fn hint_prefix(sdk: bool, profile: &str, env: &str) -> String {
+    let mut s = String::from("monocle craft turn");
     if sdk {
         s.push_str(" --lane sdk");
     }
-    if let Some(p) = profile {
-        s.push_str(&format!(" --profile {p}"));
+    if env != "prod" {
+        s.push_str(&format!(" --env {env}"));
     }
-    if let Some(e) = env {
-        s.push_str(&format!(" --env {e}"));
+    if profile != "default" {
+        s.push_str(&format!(" --profile {profile}"));
     }
-    s.push_str(" turn");
     s
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn hint_shape_is_canonical_for_both_lanes() {
+        assert_eq!(hint_prefix(false, "default", "prod"), "monocle craft turn");
+        assert_eq!(
+            hint_prefix(true, "default", "prod"),
+            "monocle craft turn --lane sdk"
+        );
+        assert_eq!(
+            hint_prefix(true, "work", "stg"),
+            "monocle craft turn --lane sdk --env stg --profile work"
+        );
+        assert_eq!(
+            continue_hint(&hint_prefix(false, "default", "stg"), "cli-1"),
+            r#"continue with: monocle craft turn --env stg --session cli-1 "...""#
+        );
+    }
+
+    #[test]
+    fn interrupt_notice_names_the_session() {
+        assert_eq!(
+            interrupt_message(Some("cli-1")),
+            "Interrupted. The server turn may still finish; session cli-1."
+        );
+        assert!(interrupt_message(None).starts_with("Interrupted."));
+    }
 }
 
 /// The runnable hint printed to stderr right after the session id.
@@ -49,7 +81,7 @@ pub fn continue_hint(prefix: &str, id: &str) -> String {
 
 #[derive(Clone)]
 pub struct TurnOpts {
-    /// `-i`: this turn is part of an interactive loop; the loop prints the continue hint once at the end.
+    /// `-i`: this turn is part of an interactive loop (no continue hint at all).
     pub interactive: bool,
     /// A later turn of the loop on an already announced session: no `Session:` line.
     pub follow_up: bool,
@@ -57,8 +89,9 @@ pub struct TurnOpts {
     pub continue_last: bool,
     /// Records the session id for `--continue` once it is known.
     pub last: Option<crate::craft_state::LastSession>,
-    /// Command prefix for the "continue with:" hint (see [`hint_prefix`]).
-    pub hint_prefix: String,
+    /// Command prefix for the "continue with:" hint (see [`hint_prefix`]); `None` = no
+    /// hint (only the first turn of a new, non-interactive session prints one).
+    pub hint_prefix: Option<String>,
     pub text: String,
     pub session: Option<String>,
     pub workspace: Option<String>,
@@ -82,6 +115,32 @@ pub struct Target<'a> {
     pub base: &'a str,
     pub ws_base: &'a str,
     pub bearer: &'a str,
+}
+
+static ACTIVE_SESSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Remember the session of the running turn so Ctrl-C can name it.
+pub fn note_session(id: &str) {
+    if let Ok(mut s) = ACTIVE_SESSION.lock() {
+        *s = Some(id.to_string());
+    }
+}
+
+/// The Ctrl-C notice (stderr). The server turn is not cancelled by exiting.
+pub fn interrupt_message(session: Option<&str>) -> String {
+    match session {
+        Some(id) => format!("Interrupted. The server turn may still finish; session {id}."),
+        None => "Interrupted. The server turn may still finish.".to_string(),
+    }
+}
+
+/// Replace the default SIGINT kill with the notice above; exit status stays 130.
+pub fn install_interrupt_notice() {
+    let _ = ctrlc::set_handler(|| {
+        let id = ACTIVE_SESSION.lock().ok().and_then(|s| s.clone());
+        eprintln!("\n{}", interrupt_message(id.as_deref()));
+        std::process::exit(130);
+    });
 }
 
 fn new_session_id() -> String {
@@ -223,8 +282,8 @@ pub fn run_turn_id(
         if let Some(last) = &opts.last {
             last.set(id);
         }
-        if !opts.interactive {
-            r.errln(&continue_hint(&opts.hint_prefix, id));
+        if let Some(prefix) = &opts.hint_prefix {
+            r.errln(&continue_hint(prefix, id));
         }
     }
     // Server-provided text can sit inside any error: scrub at the boundary.
@@ -255,6 +314,7 @@ fn run_inner(
         r.errln(&format!("Session: {id}"));
     }
     *sid = Some(id.clone());
+    note_session(&id);
     if opts.delegates {
         tm.time_delegation(|| http(t, opts, deadline, || delegate(&id)))?;
     } else {
@@ -417,7 +477,9 @@ fn drive(
             }
             "turn_accepted" => {
                 r.flush_stream(opts.json);
-                r.errln("Turn accepted (queued); polling for the answer.");
+                if crate::util::verbose() {
+                    r.errln("Turn accepted (queued); polling for the answer.");
+                }
                 return poll(t, opts, r, id, baseline, deadline, tm);
             }
             "turn_end" | "turn_done" => {
