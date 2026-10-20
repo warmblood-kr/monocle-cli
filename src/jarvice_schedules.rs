@@ -9,6 +9,9 @@
 //! - `GET /{id}/runs?limit=50` -> `ScheduleRunModel[]`, newest `scheduled_for` first
 //!   (`models/schedules.py:671-682`).
 //! - `GET|PUT /{id}/mcp-servers` -> `{"server_ids":[..],"ever_set":bool}`; PUT replaces the set.
+//! - `POST /create` and `POST /{id}/update` with a `ScheduleForm` -> `ScheduleModel`
+//!   (`routers/schedules.py:101-118`, `:157-170`; 403 for a `target_chat_id` the caller does
+//!   not own, 400 when the insert/update fails).
 //! - `POST /preview?count=5` with a `ScheduleForm` -> `int[]` of next-fire epochs.
 //! - Every epoch is **seconds** (`int(time.time())`, `routers/schedules.py:127-136`).
 
@@ -104,6 +107,25 @@ pub fn mcp_servers(
     let resp = client.put_json_once(&u, &auth_headers(bearer), &json!({ "server_ids": ids }))?;
     if !resp.ok() {
         return Err(api_error("Updating the schedule's MCP servers", &resp));
+    }
+    resp.json()
+}
+
+/// `POST /create` (once-only: a retry could duplicate the schedule).
+pub fn create(client: &Client, url: &str, bearer: &str, form: &Value) -> Result<Value> {
+    let resp =
+        client.post_json_once(&format!("{url}{BASE}/create"), &auth_headers(bearer), form)?;
+    if !resp.ok() {
+        return Err(api_error("Creating the schedule", &resp));
+    }
+    resp.json()
+}
+
+/// `POST /{id}/update`; `form` is the FULL `ScheduleForm` (every field is overwritten).
+pub fn update(client: &Client, url: &str, bearer: &str, id: &str, form: &Value) -> Result<Value> {
+    let resp = client.post_json_once(&id_url(url, id, "/update")?, &auth_headers(bearer), form)?;
+    if !resp.ok() {
+        return Err(api_error("Updating the schedule", &resp));
     }
     resp.json()
 }
