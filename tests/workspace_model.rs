@@ -151,7 +151,7 @@ fn list_prints_table_and_show_prints_json() {
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     let t = out(&o);
     assert!(
-        t.contains("MODEL ID") && t.contains("m1") && t.contains("gpt-x"),
+        t.starts_with("ID ") && t.contains("m1") && t.contains("gpt-x"),
         "{t}"
     );
     assert!(t.contains("no"), "inactive shown: {t}");

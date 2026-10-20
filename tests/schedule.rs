@@ -133,10 +133,18 @@ fn list_and_show_render_utc_and_json_is_passthrough() {
     let (o, seen, _h) = run("", &["schedule", "list"]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(
-        out(&o).contains("Daily") && out(&o).contains("2023-11-14 22:13:20Z"),
+        out(&o).contains("Daily") && out(&o).contains("2023-11-14 22:13"),
         "{}",
         out(&o)
     );
+    // Table cells: minute precision and yes/no (`show` and `--json` keep the full values).
+    let row = out(&o)
+        .lines()
+        .find(|l| l.contains("Daily"))
+        .unwrap()
+        .to_string();
+    assert!(row.contains(" yes ") && !row.contains("true"), "{row}");
+    assert!(!row.contains("22:13:20"), "{row}");
     let (o, seen2, _h) = run("", &["schedule", "show", "s-1"]);
     assert!(out(&o).contains("FREQ=DAILY"), "{}", out(&o));
     let (o, _s, _h) = run("", &["schedule", "show", "s-1", "--json"]);

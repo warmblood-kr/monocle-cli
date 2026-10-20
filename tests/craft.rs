@@ -273,9 +273,15 @@ fn openworker_list_show_history() {
     assert!(
         out(&o).contains(OW_ID)
             && out(&o).contains("Craft one")
-            && out(&o).contains("2024-05-01T10:00:00Z"),
+            && out(&o).contains("2024-05-01 10:00")
+            && !out(&o).contains("2024-05-01T10:00:00Z"),
         "{}",
         out(&o)
+    );
+    let header = out(&o).lines().next().unwrap_or("").to_string();
+    assert!(
+        header.starts_with("ID ") && header.contains("UPDATED (UTC)"),
+        "{header}"
     );
     let o = ow(
         &addr,

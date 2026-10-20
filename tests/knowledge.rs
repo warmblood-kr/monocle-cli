@@ -349,7 +349,8 @@ fn list_shows_collections_then_files() {
     );
     let all = run(home.path(), &["knowledge", "list"]);
     let t = out(&all);
-    assert!(t.starts_with("COLLECTION ID"), "{t}");
+    assert!(t.starts_with("ID "), "{t}");
+    assert!(!t.contains("COLLECTION ID"), "{t}");
     assert!(
         t.contains("kb1") && t.contains("kb-a") && t.trim_end().ends_with('1'),
         "{t}"

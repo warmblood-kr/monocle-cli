@@ -127,7 +127,7 @@ pub fn list_command(client: &Client, creds: &Credentials, sel: &Selection) -> Re
             ]
         })
         .collect();
-    print_table(&["MODEL ID", "NAME", "BASE", "ACTIVE"], &rows);
+    print_table(&["ID", "NAME", "BASE", "ACTIVE"], &rows);
     Ok(())
 }
 

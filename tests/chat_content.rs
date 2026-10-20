@@ -160,7 +160,13 @@ fn chat_list_still_works() {
     let home = logged_in_home(&stub);
     let out = run(home.path(), &["chat", "list"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("c1"));
+    let table = String::from_utf8_lossy(&out.stdout);
+    assert!(table.contains("c1"));
+    let header = table.lines().next().unwrap_or("");
+    assert!(
+        header.starts_with("ID ") && header.contains("UPDATED (UTC)"),
+        "{header}"
+    );
 }
 
 #[test]

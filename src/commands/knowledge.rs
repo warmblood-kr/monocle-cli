@@ -155,7 +155,7 @@ pub fn knowledge_list_command(
                 .iter()
                 .map(|k| vec![k.id.clone(), k.name.clone(), k.files().len().to_string()])
                 .collect();
-            print_table(&["COLLECTION ID", "NAME", "FILES"], &rows);
+            print_table(&["ID", "NAME", "FILES"], &rows);
         }
         Some(key) => {
             let one = kb::find(&all, key)?;
@@ -167,7 +167,7 @@ pub fn knowledge_list_command(
                     .iter()
                     .map(|f| vec![f.id.clone(), f.meta.name.clone()])
                     .collect();
-                print_table(&["FILE ID", "NAME"], &rows);
+                print_table(&["ID", "NAME"], &rows);
             }
         }
     }

@@ -1270,8 +1270,8 @@ fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
     let mut out = std::io::stdout();
     let _ = writeln!(
         out,
-        "{}  {}  UPDATED",
-        pad("THREAD ID", id_width),
+        "{}  {}  UPDATED (UTC)",
+        pad("ID", id_width),
         pad("TITLE", title_width)
     );
     let _ = writeln!(

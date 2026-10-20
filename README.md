@@ -129,6 +129,18 @@ These root forms still work and print a one-line warning on stderr (stdout is un
 
 `monocle model list` has been removed; use `monocle router models`.
 
+### Upgrading from 1.13
+
+These changes affect scripts that parse stdout/stderr or exit codes. `--json` output is unchanged everywhere.
+
+| Change | What to do |
+|--------|------------|
+| `monocle chat content` removes the `<user_memory>` and `<past_conversations>` blocks jarvice injects into user messages (text and `--format json`; also the `chat --resume` history replay) | Pass `--include-memory` to `chat content` for the old output |
+| `monocle workspace-model show` prints `data:` URLs over 1 KiB (the profile image) as `<data:image/png, N bytes>` | Pass `--full` for the exact server body. `update --file` ignores those placeholders, so `show > m.json` then `update --file m.json` keeps the stored image |
+| `monocle status` prints its block to **stdout** (it was stderr) and exits **1** when the profile is not logged in (it was 0) | Read stdout instead of stderr; check the exit code if you used `status` to detect a missing login |
+| `monocle` and a group without a subcommand (`monocle craft`, `monocle knowledge`, …) print help to **stdout** and exit **0** (they printed to stderr and exited 2) | Nothing for interactive use. Wrong usage (missing argument, unknown command) still exits 2 on stderr |
+| List tables: times are `YYYY-MM-DD HH:MM` in UTC with `(UTC)` in the header (`chat list`, `craft session list`, `schedule list/runs`); booleans are `yes`/`no` (`schedule list`, `craft workspace list`, `craft agent list`); the id column is headed `ID` (was `THREAD ID`, `SESSION ID`, `COLLECTION ID`, `FILE ID`, `MODEL ID`) | Use `--json` where a command has it, instead of parsing the table |
+
 ### Upgrading from 1.7 to 1.8
 
 | Change | What to do |
@@ -154,7 +166,7 @@ List what your tenant has:
 
 ```console
 $ monocle router models
-MODEL ID                  NAME                  MODALITY  OWNER       CONTEXT
+ID                        NAME                  MODALITY  OWNER       CONTEXT
 ────────────────────────  ────────────────────  ────────  ──────────  ───────
 claude-sonnet-4-6         Claude Sonnet 4.6     chat      anthropic   200k
 claude-opus-4-7           Claude Opus 4.7       chat      anthropic   200k
