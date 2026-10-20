@@ -17,6 +17,23 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// stderr `Profile: … — tenant …` line, only for a non-default connection or `-v`.
+    pub fn announce(&self, creds: &Credentials) {
+        if crate::util::show_profile_line(
+            &self.profile,
+            &self.environment,
+            crate::util::verbose(),
+            crate::util::quiet(),
+        ) {
+            eprintln!(
+                "Profile: {} ({}) — tenant {}",
+                self.profile,
+                self.environment,
+                creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+            );
+        }
+    }
+
     pub fn store(&self, home: &Path) -> Credentials {
         Credentials::for_profile(
             home,

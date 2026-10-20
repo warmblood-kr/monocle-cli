@@ -422,8 +422,8 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
 
     // Non-interactive: stdin was piped (input + attachments already resolved above).
     if let Some((text, images, files)) = one_shot_input {
-        eprintln!("Using model: {model}");
-        eprintln!("Router: {router_url}");
+        crate::note!("Using model: {model}");
+        crate::note!("Router: {router_url}");
         let provider = MonocleProvider::new(token, router_url.clone());
         let mut messages = Vec::new();
         if let Some(sp) = &system_prompt {
@@ -462,12 +462,12 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
     let mut provider = MonocleProvider::new(token, router_url.clone());
 
     // Interactive REPL.
-    eprintln!("{}", repl_banner(&model));
-    eprintln!("Router: {router_url}");
+    crate::note!("{}", repl_banner(&model));
+    crate::note!("Router: {router_url}");
     if let Some(sp) = &system_prompt {
-        eprintln!("System prompt loaded ({} chars)", sp.chars().count());
+        crate::note!("System prompt loaded ({} chars)", sp.chars().count());
     }
-    eprintln!("{}", mode_banner("chat", crate::colors::cyan));
+    crate::note!("{}", mode_banner("chat", crate::colors::cyan));
 
     // Separate history file from `monocle agent`'s — the two REPLs' histories
     // stay independent. The Editor build, bracketed-paste config, history
@@ -631,15 +631,32 @@ pub fn chat_list_command(
     client: &Client,
     creds: &Credentials,
     selection: &crate::profiles::Selection,
+    limit: Option<usize>,
+    json: bool,
 ) -> Result<()> {
     let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
-    let threads = crate::jarvice_chats::list_threads(client, &jarvice_url, &bearer)?;
-    eprintln!(
-        "Profile: {} ({}) — tenant {}",
-        selection.profile,
-        selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
-    );
+    let mut threads = crate::jarvice_chats::list_threads(client, &jarvice_url, &bearer)?;
+    selection.announce(creds);
+    if let Some(n) = limit {
+        // `--limit N` = the N newest, newest first (server order is kept without it).
+        threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
+        threads.truncate(n);
+    }
+    if json {
+        let v: Vec<serde_json::Value> = threads
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "updated_at": crate::util::to_iso(t.updated_at * 1000),
+                    "created_at": crate::util::to_iso(t.created_at * 1000),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(());
+    }
     print_threads_table(&threads);
     Ok(())
 }
@@ -653,12 +670,7 @@ pub fn chat_delete_command(
     id: &str,
 ) -> Result<()> {
     let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
-    eprintln!(
-        "Profile: {} ({}) — tenant {}",
-        selection.profile,
-        selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
-    );
+    selection.announce(creds);
     crate::jarvice_chats::delete_thread(client, &jarvice_url, &bearer, id)?;
     eprintln!("Deleted chat {id}");
     Ok(())
@@ -676,12 +688,7 @@ pub fn chat_content_command(
     show_tools: bool,
 ) -> Result<()> {
     let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
-    eprintln!(
-        "Profile: {} ({}) — tenant {}",
-        selection.profile,
-        selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
-    );
+    selection.announce(creds);
     let output =
         crate::jarvice_chats::fetch_content(client, &jarvice_url, &bearer, id, format, show_tools)?;
     print!("{output}");
@@ -955,8 +962,8 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     let one_shot_input = read_one_shot_input(stdin_is_tty, &options.files)?;
 
     if let Some((text, images, files)) = one_shot_input {
-        eprintln!("Using model: {model}");
-        eprintln!("Tenant: {}", tenant_host(&jarvice_url));
+        crate::note!("Using model: {model}");
+        crate::note!("Tenant: {}", tenant_host(&jarvice_url));
         let mut redactor = crate::commands::redact::Redactor::new(&[]);
         redactor.add_secret(&session.token);
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
@@ -1027,8 +1034,8 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
             println!("{}", reply.content);
         }
         if let Some(id) = reply.thread_id {
-            eprintln!("Thread: {id}");
-            eprintln!("{}", resume_hint(&id));
+            crate::note!("Thread: {id}");
+            crate::note!("{}", resume_hint(&id));
         }
         if options.show_tools {
             eprintln!(
@@ -1060,8 +1067,8 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
     }
 
     // Interactive REPL.
-    eprintln!("{}", repl_banner(&model));
-    eprintln!("Tenant: {}", tenant_host(&jarvice_url));
+    crate::note!("{}", repl_banner(&model));
+    crate::note!("Tenant: {}", tenant_host(&jarvice_url));
 
     let history_path = home_dir().join(".monocle").join("chat_history");
     // Not a `Vec<Message>` like `run_completions_chat`'s `convo` — the server
@@ -1117,7 +1124,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         }
     }
 
-    eprintln!("{}", mode_banner("chat", crate::colors::cyan));
+    crate::note!("{}", mode_banner("chat", crate::colors::cyan));
 
     let repl_result = run_repl(helper, history_path, PROMPT, |trimmed| {
         if let Some(control) =
@@ -1191,7 +1198,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
                 if reply.thread_id.is_some() && thread_id != reply.thread_id {
                     thread_id = reply.thread_id;
                     if let Some(id) = &thread_id {
-                        eprintln!("Thread: {id}");
+                        crate::note!("Thread: {id}");
                     }
                 }
                 if options.show_tools {
@@ -1227,7 +1234,7 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         Ok(LoopControl::Continue)
     });
     if let Some(id) = &thread_id {
-        eprintln!("{}", resume_hint(id));
+        crate::note!("{}", resume_hint(id));
     }
     repl_result
 }
@@ -1254,55 +1261,24 @@ fn resume_hint(id: &str) -> String {
 /// print-and-exit command (like `monocle models`), so stdout is the correct
 /// channel here, unlike the history-replay path below.
 fn print_threads_table(threads: &[crate::jarvice_chats::ChatSummary]) {
-    use crate::commands::model_list::pad;
-
     if threads.is_empty() {
-        eprintln!("No threads found.");
+        crate::note!("No threads found.");
         return;
     }
 
-    let id_width = threads
+    let rows: Vec<Vec<String>> = threads
         .iter()
-        .map(|t| t.id.chars().count())
-        .chain([9])
-        .max()
-        .unwrap();
-    let title_width = threads
-        .iter()
-        .map(|t| t.title.chars().count())
-        .chain([5])
-        .max()
-        .unwrap();
-
-    let mut out = std::io::stdout();
-    let _ = writeln!(
-        out,
-        "{}  {}  UPDATED",
-        pad("THREAD ID", id_width),
-        pad("TITLE", title_width)
-    );
-    let _ = writeln!(
-        out,
-        "{}  {}  {}",
-        "─".repeat(id_width),
-        "─".repeat(title_width),
-        "─".repeat(16)
-    );
-    for t in threads {
-        let updated = chrono::Utc
-            .timestamp_opt(t.updated_at, 0)
-            .single()
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let _ = writeln!(
-            out,
-            "{}  {}  {}",
-            pad(&t.id, id_width),
-            pad(&t.title, title_width),
-            updated
-        );
-    }
-    eprintln!("\n{} thread(s).", threads.len());
+        .map(|t| {
+            let updated = chrono::Utc
+                .timestamp_opt(t.updated_at, 0)
+                .single()
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "-".to_string());
+            vec![t.id.clone(), t.title.clone(), updated]
+        })
+        .collect();
+    crate::table::print(&["THREAD ID", "TITLE", "UPDATED"], &rows, Some(16), Some(1));
+    crate::note!("\n{} thread(s).", threads.len());
 }
 
 #[cfg(test)]

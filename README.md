@@ -50,14 +50,21 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | Command | Description |
 |---------|-------------|
 | `monocle login [--tenant <domain>] [--env <prod\|stg\|local>] [--device-code]` | Sign in to the selected profile/environment slot |
-| `monocle -v` / `--verbose` (global) | Show protocol detail on stderr that is hidden by default (delegation attached, "turn accepted", sandbox status frames, the HTTP 500 quirk of Craft session delete) |
+| `monocle -v` / `--verbose` (global) | Show protocol detail (also always prints the `Profile: … — tenant …` line, which is otherwise shown only for a non-default profile or environment) on stderr that is hidden by default (delegation attached, "turn accepted", sandbox status frames, the HTTP 500 quirk of Craft session delete) |
 | `monocle --profile <name> [--env <env>] <command>` | Select a saved profile and, when specified, its separate environment credential slot |
 | `monocle profile list` / `show [name]` / `use <name>` | List connections, inspect profile/environment, or set the default profile |
 | `monocle status` | Show login, token, and Claude Code configuration status |
+| `monocle -q` / `--quiet` (global) | Hide non-essential stderr: banners, hints (`Resume:`, `continue with:`), `Thread:` lines, counts, "No … found" notes and the `Profile: … — tenant …` line. Errors and warnings still print; `-v` still adds protocol detail (and wins for the Profile line) |
+| `monocle --no-color` (global) | Disable ANSI colors, same as `NO_COLOR` |
 | `monocle whoami [--server] [--json]` | Show profile, environment, tenant, email, id_token claims (`sub`/`iss`/`aud`/`email` when present) and token expiry from local credentials (no network, no refresh, token strings never printed). `--server` also calls `GET /api/v1/auths/`, which creates a server-side session token as a side effect (the CLI discards it), and shows jarvice's id/email/name/role and whether the email matches. HTTP 401/403 means the tenant does not accept this login token or it lacks an email claim (a known staging issue). `--json` prints the same fields as JSON |
 | `monocle token` | Print current access token (auto-refreshed when near expiry) |
 | `monocle chat [--model <id>] [--file <path\|url>]... [--resume <id>] [--tool-ids <id,...>] [--verify-tool-firing[=<tool>]] [--show-tools] [--stream]` | Chat with Monocle hosted Chat (REPL or stdin): the server owns the thread, so it shows up in the web UI; attach files/images with `--file` (one-shot only); `--resume <id>` continues a thread; `--tool-ids <id,...>` activates MCP/connected-app servers for the turn; `--verify-tool-firing[=<tool>]` (one-shot) asserts a server-executed tool actually ran — name a tool to require that one — as an exit code (`0` ran / `1` did not / `2` cannot determine); `--show-tools` prints the tools the server ran this turn (`Tools: a, b` / `none` / `unknown`) to stderr; `--stream` (experimental, one-shot) streams the answer to stdout as it arrives over the headless path (no `X-Session-Id`; the thread title may appear a moment later in the web UI), so `--timings` reports a real `ttfe`/`ttft`. For the direct router (streaming, system prompt, token stats) use `monocle router chat` |
-| `monocle chat list` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI |
+| `monocle chat list [--limit N] [--json]` | List existing jarvice chat threads (id/title/last-updated) — including threads created in jarvice's own web UI. `--limit N` shows the N newest, newest first; `--json` prints `[{id,title,updated_at,created_at}]` (ISO-8601) |
+| `monocle status --json` | Local status as JSON: `logged_in`, `profile`, `environment`, `tenant_domain`, `tenant_name`, `email`, `access_token_valid`/`_expires_at`, `refresh_token_valid`/`_expires_at`, `claude_code_configured` (no tokens); exits 1 when not logged in (the JSON is still printed) |
+| `monocle profile list --json` | `[{name,environment,logged_in,default}]` |
+| `monocle knowledge list [COLLECTION] --json` | `[{id,name,files}]`, or `[{id,name}]` for one collection's files |
+| `monocle workspace-model list --json` | `[{id,name,base_model_id,active}]` |
+| `monocle router models --json` | `[{id,name,modality,owned_by,context_window}]` |
 | `monocle chat content <chat-id> [--format text\|json] [--show-tools]` | Print one hosted Chat thread's active message path to stdout (text only, attachments omitted, control characters stripped, untrusted content, 1 MiB cap). `--show-tools` replaces each raw tool-call block with a one-line summary (tool name, sub-agent `model_id`, `report_to_parent`); with `--format json` it adds a structured `tool_calls` list per message |
 | `monocle chat delete <chat-id>` | Permanently delete one hosted Chat thread (single attempt, never retried; prints `Deleted chat <id>` to stderr). jarvice answers HTTP 401 (not 404) for a chat id that does not exist or is not yours, so a 401 here can mean "not found / not yours" |
 | `monocle knowledge create <name>` | Create an empty knowledge collection (name must be new); prints its id |
@@ -70,7 +77,7 @@ Shows your tenant, user, access/refresh token validity, and whether Claude Code 
 | `monocle knowledge content <collection> <file>` | Print the text the server extracted from the file (to check parsing before testing search) |
 | `monocle knowledge ask <collection> <question> [--model M] [--json]` | Ask one question with the collection attached (one model turn, not saved to your threads). Answer on stdout; the files it was grounded in on stderr (or `{"answer","sources"}` with `--json`). jarvice has no retrieval endpoint, so this is the only way to see whether stored content is used |
 | `monocle knowledge delete <collection>` | Delete a collection **and its files** (kept if any file can't be deleted, so you can retry) |
-| `monocle mcp ls [--json]` | List your MCP servers (name, enabled, auth state `none`/`connected`/`needed`/`failed`, tool count); `--json` prints the server body unchanged |
+| `monocle mcp ls [--json]` (alias `mcp list`) | List your MCP servers (name, enabled, auth state `none`/`connected`/`needed`/`failed`, tool count); `--json` prints the server body unchanged |
 | `monocle mcp show <server> [--json]` | Show one server (name or id) and its tools with each tool's enabled state |
 | `monocle mcp attention [--json]` | Print how many servers need re-authentication |
 | `monocle mcp enable <server>` / `disable <server>` | Turn a server on or off for your account |

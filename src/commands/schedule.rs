@@ -74,7 +74,7 @@ pub fn schedule_list_command(
         .as_array()
         .ok_or_else(|| AppError::new("Unexpected schedule list from the server."))?;
     if all.is_empty() {
-        eprintln!("No schedules found.");
+        crate::note!("No schedules found.");
         return Ok(());
     }
     let rows: Vec<Vec<String>> = all
