@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod model_list;
 pub mod redact;
 pub mod repl;
+pub mod schedule;
 pub mod setup;
 pub mod status;
 pub mod token;

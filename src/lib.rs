@@ -21,6 +21,7 @@ pub mod jarvice_chats;
 pub mod jarvice_knowledge;
 pub mod jarvice_mcp;
 pub mod jarvice_models;
+pub mod jarvice_schedules;
 pub mod net;
 pub mod oidc;
 pub mod origin;

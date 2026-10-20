@@ -33,6 +33,10 @@ use monocle_cli::commands::mcp::{
     mcp_thread_command,
 };
 use monocle_cli::commands::model_list::model_list_command;
+use monocle_cli::commands::schedule::{
+    schedule_delete_command, schedule_list_command, schedule_mcp_command, schedule_preview_command,
+    schedule_runs_command, schedule_show_command,
+};
 use monocle_cli::commands::setup::setup_command;
 use monocle_cli::commands::status::status_command;
 use monocle_cli::commands::token::token_command;
@@ -76,6 +80,7 @@ Commands:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
     mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
+    schedule Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
     craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
 
@@ -165,6 +170,11 @@ enum Commands {
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
+    },
+    /// Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview)
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
     },
     /// Manage workspace (custom) models: system prompt, tools, knowledge (then `chat --model <id>`)
     WorkspaceModel {
@@ -610,6 +620,92 @@ enum McpThreadCommand {
         /// Explicitly clear the set (required when no servers are given)
         #[arg(long, conflicts_with_all = ["servers", "servers_flag"])]
         none: bool,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    /// List your schedules
+    List {
+        /// Print the server's JSON body unchanged (epochs in seconds)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one schedule
+    Show {
+        /// Schedule id (see `monocle schedule list`)
+        id: String,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Switch a schedule on (`enable`) or off (`disable`)
+    Toggle {
+        id: String,
+        #[arg(value_enum)]
+        state: Toggle,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Permanently delete a schedule (single attempt, never retried)
+    Delete { id: String },
+    /// List a schedule's runs, newest first. With --verify, exit code (judged on
+    /// the latest finished run, or --run): 0 a tool ran, 1 none did, 2 cannot
+    /// tell (run unfinished, no tool summary, or unrecognized shape). `--verify=TOOL`
+    /// expects that tool (`server__tool` sanitized as in `mcp exec`, or the bare tool name)
+    Runs {
+        id: String,
+        /// Number of runs to fetch
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+        /// Assert from the run's tool summary that a tool fired (optionally TOOL)
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TOOL")]
+        verify: Option<String>,
+        /// Judge this run id instead of the latest finished run
+        #[arg(long, requires = "verify")]
+        run: Option<String>,
+    },
+    /// Per-schedule MCP server selection: a display/selection set for the schedule
+    /// (it does NOT prove a tool fires; check with `schedule runs --verify`).
+    /// Without --set/--none it prints the set; --set REPLACES the whole set with
+    /// catalog ids from `monocle mcp ls` (the server does not reject unknown ids)
+    McpServers {
+        id: String,
+        /// Server ids to set (space or comma separated)
+        #[arg(long, num_args = 0.., value_delimiter = ',')]
+        set: Option<Vec<String>>,
+        /// Explicitly clear the set (required to empty it)
+        #[arg(long, conflicts_with = "set")]
+        none: bool,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the next fire times (UTC) of an unsaved schedule; nothing is stored
+    #[command(group(clap::ArgGroup::new("when").required(true).args(["recurrence", "run_at"])))]
+    Preview {
+        /// RFC 5545 RRULE, e.g. FREQ=DAILY (needs --dtstart)
+        #[arg(long, requires = "dtstart")]
+        recurrence: Option<String>,
+        /// First occurrence, epoch seconds
+        #[arg(long)]
+        dtstart: Option<i64>,
+        /// One-off run time, epoch seconds
+        #[arg(long, conflicts_with_all = ["recurrence", "dtstart"])]
+        run_at: Option<i64>,
+        /// IANA timezone
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        /// How many fire times
+        #[arg(long, default_value_t = 5)]
+        count: u32,
         /// Print the server's JSON body unchanged
         #[arg(long)]
         json: bool,
@@ -1185,6 +1281,38 @@ fn main() {
                     }
                 }
             },
+        },
+        Commands::Schedule { command } => match command {
+            ScheduleCommand::List { json } => schedule_list_command(&client, &creds, &selection, json),
+            ScheduleCommand::Show { id, json } => {
+                schedule_show_command(&client, &creds, &selection, &id, None, json)
+            }
+            ScheduleCommand::Toggle { id, state, json } => schedule_show_command(
+                &client,
+                &creds,
+                &selection,
+                &id,
+                Some(matches!(state, Toggle::Enable)),
+                json,
+            ),
+            ScheduleCommand::Delete { id } => {
+                schedule_delete_command(&client, &creds, &selection, &id)
+            }
+            ScheduleCommand::Runs { id, limit, json, verify, run } => schedule_runs_command(
+                &client, &creds, &selection, &id, limit, json, verify.as_deref(), run.as_deref(),
+            ),
+            ScheduleCommand::McpServers { id, set, none, json } => match set {
+                Some(s) if s.is_empty() => Err(monocle_cli::error::AppError::new(
+                    "No servers given to --set: list server ids, or pass --none to clear the schedule's MCP servers.",
+                )),
+                None if none => schedule_mcp_command(&client, &creds, &selection, &id, Some(&[]), json),
+                s => schedule_mcp_command(&client, &creds, &selection, &id, s.as_deref(), json),
+            },
+            ScheduleCommand::Preview { recurrence, dtstart, run_at, timezone, count, json } => {
+                schedule_preview_command(
+                    &client, &creds, &selection, recurrence.as_deref(), dtstart, run_at, &timezone, count, json,
+                )
+            }
         },
         Commands::Knowledge { command } => match command {
             KnowledgeCommand::Create { name } => {
