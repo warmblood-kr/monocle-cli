@@ -27,6 +27,8 @@ pub struct SdkTurn<'a> {
     pub json: bool,
     /// Print one timings JSON line to stderr after the turn.
     pub timings: bool,
+    /// Diagnostics JSONL file (already resolved from flag/env), if any.
+    pub diagnostics_file: Option<std::path::PathBuf>,
 }
 
 /// Server error strings that are safe and useful to show; anything else is generic.
@@ -93,10 +95,13 @@ pub fn run(t: &SdkTurn) -> Result<()> {
     };
     let deadline = Instant::now() + t.timeout;
     let mut r = Redactor::new(&[t.bearer.strip_prefix("Bearer ").unwrap_or(t.bearer)]);
-    let mut tm = Timings::new(Lane::Sdk);
+    let mut tm = Timings::new(Lane::Sdk).with_diagnostics(
+        t.diagnostics_file.clone(),
+        crate::instrument::host_of(t.base),
+    );
     let res = run_inner(t, &origin, id, &mut r, deadline, &mut tm);
     t.client.set_request_cap(None);
-    tm.finish();
+    tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
     if t.timings {
         eprintln!("{}", tm.line());
     }
