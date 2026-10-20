@@ -194,7 +194,14 @@ impl WsConn {
                 .map_err(|_| fail("receive failed"))?;
             match self.sock.read() {
                 Ok(Message::Text(t)) => return Ok(Some(t.as_str().to_string())),
-                Ok(Message::Close(_)) => return Err(fail("closed by the server")),
+                Ok(Message::Close(f)) => {
+                    return Err(fail(&match f {
+                        Some(f) => {
+                            format!("closed by the server (close code {})", u16::from(f.code))
+                        }
+                        None => "closed by the server".into(),
+                    }))
+                }
                 Ok(Message::Ping(_)) => {
                     let _ = self.sock.flush();
                 }

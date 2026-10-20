@@ -444,6 +444,8 @@ pub fn craft_turn_command(
             title: title.as_deref(),
             timeout: opts.timeout,
             json: opts.json,
+            timings: opts.timings,
+            diagnostics_file: opts.diagnostics_file.clone(),
         });
     }
     if title.is_some() {

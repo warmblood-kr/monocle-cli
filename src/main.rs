@@ -10,7 +10,8 @@ use monocle_cli::commands::audio_transcribe_azure::{
     audio_transcribe_azure_command, AudioTranscribeAzureOptions,
 };
 use monocle_cli::commands::chat::{
-    chat_command, chat_content_command, chat_list_command, ChatOptions, ToolFiringExpectation,
+    chat_command, chat_content_command, chat_delete_command, chat_list_command, ChatOptions,
+    ToolFiringExpectation,
 };
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::craft::{
@@ -27,6 +28,10 @@ use monocle_cli::commands::knowledge::{
     knowledge_upload_command,
 };
 use monocle_cli::commands::login::login_command;
+use monocle_cli::commands::mcp::{
+    mcp_attention_command, mcp_exec_command, mcp_ls_command, mcp_set_command, mcp_show_command,
+    mcp_thread_command,
+};
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
 use monocle_cli::commands::status::status_command;
@@ -70,6 +75,7 @@ Commands:
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
+    mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
     craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
 
@@ -154,6 +160,11 @@ enum Commands {
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommand,
+    },
+    /// Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
     /// Manage workspace (custom) models: system prompt, tools, knowledge (then `chat --model <id>`)
     WorkspaceModel {
@@ -273,6 +284,15 @@ struct ChatArgs {
     /// (`tools_used`) to stderr, e.g. `Tools: web_search, model_designer__delegate_model`.
     #[arg(long = "show-tools")]
     show_tools: bool,
+    /// One-shot only: print one JSON timings line to stderr (stdout unchanged). t0 is the moment
+    /// the request is sent; the reply is one blocking response, so ttfe = ttft = total (no
+    /// streaming). Includes a random run_id and started_at (UTC); never tokens, prompts or text
+    #[arg(long)]
+    timings: bool,
+    /// One-shot only: append one JSON line per phase to this file (also MONOCLE_DIAGNOSTICS_FILE);
+    /// off by default; fixed fields only, never tokens/prompts/text/headers/URLs; 0600; rotates at 1 MiB
+    #[arg(long = "diagnostics-file", value_name = "PATH")]
+    diagnostics_file: Option<std::path::PathBuf>,
 }
 
 impl From<ChatArgs> for ChatOptions {
@@ -292,6 +312,8 @@ impl From<ChatArgs> for ChatOptions {
                 None => ToolFiringExpectation::Any,
             }),
             show_tools: a.show_tools,
+            timings: a.timings,
+            diagnostics_file: a.diagnostics_file,
         }
     }
 }
@@ -316,6 +338,10 @@ struct RouterChatArgs {
     /// (piped stdin) only — see also inband `file:<path>` tokens in the text.
     #[arg(long = "file")]
     file: Vec<String>,
+    /// One-shot only: print one JSON timings line to stderr (stdout unchanged). Streamed, so
+    /// ttfe = ttft = first answer chunk after the request is sent; total = stream end
+    #[arg(long)]
+    timings: bool,
 }
 
 impl From<RouterChatArgs> for ChatOptions {
@@ -331,6 +357,8 @@ impl From<RouterChatArgs> for ChatOptions {
             tool_ids: Vec::new(),
             verify_tool_firing: None,
             show_tools: false,
+            timings: a.timings,
+            diagnostics_file: None,
         }
     }
 }
@@ -408,6 +436,14 @@ enum ChatCommand {
         #[arg(long = "show-tools")]
         show_tools: bool,
     },
+    /// Permanently delete one hosted Chat thread (not undoable, never retried).
+    /// Note: jarvice answers HTTP 401 (not 404) for a chat id that does not
+    /// exist or is not yours, so a 401 here can mean "not found / not yours".
+    Delete {
+        /// Hosted Chat thread ID (see `monocle chat list`)
+        #[arg(value_name = "CHAT_ID")]
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -456,6 +492,125 @@ enum CraftCommand {
         #[arg(long, value_enum, default_value = "deny")]
         approve: Approve,
         /// Print each received frame / polled message as one JSON line instead of text
+        #[arg(long)]
+        json: bool,
+        /// After the turn, print one JSON timings line to stderr (stdout unchanged). t0 is the
+        /// moment the user message is handed to the socket; ttfe = first server frame after t0,
+        /// ttft = first non-empty assistant text, total = turn end (all ms from t0, monotonic;
+        /// null if it never happened). t_request_ms = ms from command start to t0; connect_ms,
+        /// delegation_ms, session_create_ms are setup phases. Includes a random run_id and
+        /// started_at (UTC); never tokens, prompts or text. If the answer is polled, ttft is accurate to the 2 s poll interval
+        #[arg(long)]
+        timings: bool,
+        /// Append one JSON line per phase (connect, delegation, session_create, first_event,
+        /// first_text, done/error) to this file; also set by MONOCLE_DIAGNOSTICS_FILE. Off by
+        /// default. Fixed fields only (ts, run_id, event, lane, host, error_kind, duration_ms): never
+        /// tokens, prompts, text, headers or URLs. Created 0600; rotated to PATH.1 at 1 MiB
+        #[arg(long = "diagnostics-file", value_name = "PATH")]
+        diagnostics_file: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Toggle {
+    Enable,
+    Disable,
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// List MCP servers (name, enabled, auth state, tool count)
+    Ls {
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one server and its tools with their enabled state
+    Show {
+        /// Server name or id (see `monocle mcp ls`)
+        server: String,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Count servers whose authentication failed and needs attention
+    Attention {
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable a server for your account
+    Enable {
+        /// Server name (see `monocle mcp ls`)
+        server: String,
+    },
+    /// Disable a server for your account
+    Disable {
+        /// Server name (see `monocle mcp ls`)
+        server: String,
+    },
+    /// Run an MCP server's tool through one Hosted Chat turn (LLM-driven; there
+    /// is no direct tool-invoke API). Prints the reply to stdout, the thread id
+    /// to stderr. With --verify, exit code: 0 a tool of it ran, 1 none did
+    /// (or a dropped tool call), 2 server cannot report `tools_used`.
+    /// Pre-flight failures (unknown/disabled/unauthenticated) also exit 1.
+    Exec {
+        /// `SERVER` (any one tool) or `SERVER/TOOL`
+        target: String,
+        /// Prompt (replaces the built-in "call the tool now" instruction)
+        prompt: Vec<String>,
+        /// Assert from the server's `tools_used` that the tool actually ran
+        #[arg(long)]
+        verify: bool,
+        /// Model id (default: the CLI default)
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Switch one tool of an enabled server on or off (does not run the tool)
+    Tool {
+        /// Server name
+        server: String,
+        /// Tool name (see `monocle mcp show`)
+        tool: String,
+        /// New state
+        #[arg(value_enum)]
+        state: Toggle,
+    },
+    /// Per-chat MCP server selection (a display mirror, not proof a tool fired)
+    Thread {
+        #[command(subcommand)]
+        command: McpThreadCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpThreadCommand {
+    /// Print the MCP server ids set on a chat. This is a display mirror (the
+    /// ChatMcpEnabled table): it does NOT prove a tool fires; to confirm, run
+    /// `chat --tool-ids mcp:SERVER --verify-tool-firing`
+    Get {
+        /// Chat id (see `monocle chat list`)
+        chat_id: String,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// REPLACE the whole MCP server set of a chat. This is a display mirror (the
+    /// ChatMcpEnabled table): it does NOT guarantee the tool is called; to confirm,
+    /// run `chat --tool-ids mcp:SERVER --verify-tool-firing`. Ids are catalog ids
+    /// from `monocle mcp ls`; the server does not reject unknown ids
+    Set {
+        /// Chat id (see `monocle chat list`)
+        chat_id: String,
+        /// Server ids to set
+        servers: Vec<String>,
+        /// Comma-separated server ids to set (same as listing them)
+        #[arg(long = "servers", value_delimiter = ',')]
+        servers_flag: Vec<String>,
+        /// Explicitly clear the set (required when no servers are given)
+        #[arg(long, conflicts_with_all = ["servers", "servers_flag"])]
+        none: bool,
+        /// Print the server's JSON body unchanged
         #[arg(long)]
         json: bool,
     },
@@ -965,7 +1120,71 @@ fn main() {
                 format,
                 show_tools,
             }) => chat_content_command(&client, &creds, &selection, &id, format, show_tools),
+            Some(ChatCommand::Delete { id }) => {
+                chat_delete_command(&client, &creds, &selection, &id)
+            }
             None => chat_command(&client, &creds, args.into()),
+        },
+        Commands::Mcp { command } => match command {
+            McpCommand::Ls { json } => mcp_ls_command(&client, &creds, &selection, json),
+            McpCommand::Show { server, json } => {
+                mcp_show_command(&client, &creds, &selection, &server, json)
+            }
+            McpCommand::Attention { json } => {
+                mcp_attention_command(&client, &creds, &selection, json)
+            }
+            McpCommand::Enable { server } => {
+                mcp_set_command(&client, &creds, &selection, &server, None, true)
+            }
+            McpCommand::Disable { server } => {
+                mcp_set_command(&client, &creds, &selection, &server, None, false)
+            }
+            McpCommand::Exec {
+                target,
+                prompt,
+                verify,
+                model,
+            } => mcp_exec_command(&client, &creds, &target, &prompt, verify, model.as_deref()),
+            McpCommand::Tool {
+                server,
+                tool,
+                state,
+            } => mcp_set_command(
+                &client,
+                &creds,
+                &selection,
+                &server,
+                Some(&tool),
+                matches!(state, Toggle::Enable),
+            ),
+            McpCommand::Thread { command } => match command {
+                McpThreadCommand::Get { chat_id, json } => {
+                    mcp_thread_command(&client, &creds, &selection, &chat_id, None, json)
+                }
+                McpThreadCommand::Set {
+                    chat_id,
+                    mut servers,
+                    servers_flag,
+                    none,
+                    json,
+                } => {
+                    servers.extend(servers_flag);
+                    if servers.is_empty() && !none {
+                        Err(monocle_cli::error::AppError::new(
+                            "No servers given: list server ids, or pass --none to clear the chat's MCP servers.",
+                        ))
+                    } else {
+                        mcp_thread_command(
+                            &client,
+                            &creds,
+                            &selection,
+                            &chat_id,
+                            Some(&servers),
+                            json,
+                        )
+                    }
+                }
+            },
         },
         Commands::Knowledge { command } => match command {
             KnowledgeCommand::Create { name } => {
@@ -1062,6 +1281,8 @@ fn main() {
                 title,
                 approve,
                 json,
+                timings,
+                diagnostics_file,
             } => craft_turn_command(
                 &client,
                 &creds,
@@ -1079,6 +1300,9 @@ fn main() {
                     approve,
                     json,
                     poll_every: std::time::Duration::from_secs(2),
+                    timings,
+                    delegates: !no_delegation,
+                    diagnostics_file: monocle_cli::instrument::diagnostics_path(diagnostics_file),
                 },
             ),
         },

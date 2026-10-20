@@ -149,6 +149,34 @@ pub fn get_thread(
     })
 }
 
+/// `DELETE /api/v1/chats/{id}` — single attempt (never auto-retried). jarvice
+/// answers `true`/`false`; `false` is a failure. A missing or foreign id yields
+/// HTTP 401 (not 404), and a non-owner's delete may be reported as success while
+/// removing nothing, so 401 is surfaced as "not found / not yours".
+pub fn delete_thread(client: &Client, jarvice_url: &str, bearer: &str, id: &str) -> Result<()> {
+    // Same path-splice guard as `get_thread`; valid ids need no percent-encoding.
+    if !is_valid_chat_id(id) {
+        return Err(AppError::new("Invalid chat thread ID."));
+    }
+    let resp = client.delete_once(
+        &format!("{jarvice_url}/api/v1/chats/{id}"),
+        &auth_headers(bearer),
+    )?;
+    if !resp.ok() {
+        let mut err = crate::jarvice_knowledge::api_error("Deleting the chat", &resp).to_string();
+        if resp.status == 401 {
+            err.push_str(" HTTP 401 can mean the chat was not found or is not yours.");
+        }
+        return Err(AppError::new(err));
+    }
+    if resp.json::<bool>().ok() != Some(true) {
+        return Err(AppError::new(
+            "Deleting the chat failed: the server did not confirm the deletion.",
+        ));
+    }
+    Ok(())
+}
+
 /// Walk `parentId` links from `current_id` back to the root, then reverse —
 /// the Rust port of jarvice's own `utils/misc.py::get_message_list`. Follows
 /// only the single active ancestry; a message that isn't on that path (an

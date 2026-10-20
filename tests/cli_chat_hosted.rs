@@ -228,3 +228,72 @@ fn show_tools_distinguishes_none_from_unknown() {
     let home = logged_in_home(&unknown);
     assert!(stderr(&run_piped(home.path(), &["chat", "--show-tools"])).contains("Tools: unknown"));
 }
+
+#[test]
+fn chat_timings_line_on_stderr_only() {
+    let (stub, _) = counting_stub();
+    let home = logged_in_home(&stub);
+    let plain = run_piped(home.path(), &["chat"]);
+    let timed = run_piped(home.path(), &["chat", "--timings"]);
+    assert_eq!(timed.status.code(), Some(0), "{}", stderr(&timed));
+    assert_eq!(stdout(&plain), stdout(&timed));
+    assert!(!stderr(&plain).contains(r#"{"timings""#));
+    let e = stderr(&timed);
+    let l = e
+        .lines()
+        .find(|l| l.starts_with(r#"{"timings""#))
+        .expect(&e);
+    let t = &serde_json::from_str::<serde_json::Value>(l).unwrap()["timings"];
+    assert_eq!(t["lane"], "chat");
+    let n = |k: &str| {
+        t[k].as_u64()
+            .unwrap_or_else(|| panic!("{k} missing in {t}"))
+    };
+    assert!(n("ttfe_ms") <= n("ttft_ms") && n("ttft_ms") <= n("total_ms"));
+    assert!(!l.contains(ANSWER) && !l.contains("Bearer"));
+}
+
+#[test]
+fn chat_diagnostics_file_has_no_content() {
+    let (stub, _) = counting_stub();
+    let home = logged_in_home(&stub);
+    let path = home.path().join("d.jsonl");
+    let o = run_piped(
+        home.path(),
+        &["chat", "--diagnostics-file", path.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains(ANSWER) && !raw.contains("Bearer"), "{raw}");
+    let ev: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let names: Vec<_> = ev.iter().map(|e| e["event"].as_str().unwrap()).collect();
+    assert_eq!(names, ["first_event", "first_text", "done"]);
+    assert_eq!(ev[0]["lane"], "chat");
+}
+
+#[test]
+fn router_chat_timings_line_on_stderr_only() {
+    let (stub, _) = counting_stub();
+    let home = logged_in_home(&stub);
+    let plain = run_piped(home.path(), &["router", "chat"]);
+    let timed = run_piped(home.path(), &["router", "chat", "--timings"]);
+    assert_eq!(timed.status.code(), Some(0), "{}", stderr(&timed));
+    assert_eq!(stdout(&plain), stdout(&timed));
+    assert!(!stderr(&plain).contains(r#"{"timings""#));
+    let e = stderr(&timed);
+    let l = e
+        .lines()
+        .find(|l| l.starts_with(r#"{"timings""#))
+        .expect(&e);
+    let t = &serde_json::from_str::<serde_json::Value>(l).unwrap()["timings"];
+    assert_eq!(t["lane"], "router");
+    let n = |k: &str| {
+        t[k].as_u64()
+            .unwrap_or_else(|| panic!("{k} missing in {t}"))
+    };
+    assert!(n("ttfe_ms") <= n("ttft_ms") && n("ttft_ms") <= n("total_ms"));
+    assert!(!l.contains("router answer") && !l.contains("Bearer"));
+}

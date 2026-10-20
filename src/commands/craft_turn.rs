@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use crate::commands::redact::Redactor;
 use crate::craft_server as craft;
 use crate::error::{AppError, Result};
+use crate::instrument::{Lane, Timings};
 use crate::jarvice_chats::is_valid_chat_id;
 use crate::net::Client;
 use crate::util::percent_encode;
@@ -35,6 +36,12 @@ pub struct TurnOpts {
     pub approve: Approve,
     pub json: bool,
     pub poll_every: Duration,
+    /// Print one timings JSON line to stderr after the turn.
+    pub timings: bool,
+    /// Whether `delegate` does real work (false = `--no-delegation`); only affects `delegation_ms`.
+    pub delegates: bool,
+    /// Diagnostics JSONL file (already resolved from flag/env), if any.
+    pub diagnostics_file: Option<std::path::PathBuf>,
 }
 
 /// Where the turn talks. `ws_base` must come from [`craft::ws_base`].
@@ -160,8 +167,16 @@ pub fn run_turn(
     let deadline = Instant::now() + opts.timeout;
     let token = t.bearer.strip_prefix("Bearer ").unwrap_or(t.bearer);
     let r = Redactor::new(&[token]);
-    let res = run_inner(t, opts, delegate, &r, deadline);
+    let mut tm = Timings::new(Lane::Openworker).with_diagnostics(
+        opts.diagnostics_file.clone(),
+        crate::instrument::host_of(t.base),
+    );
+    let res = run_inner(t, opts, delegate, &r, deadline, &mut tm);
     t.client.set_request_cap(None);
+    tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
+    if opts.timings {
+        eprintln!("{}", tm.line());
+    }
     // Server-provided text can sit inside any error: scrub at the boundary.
     res.map_err(|e| AppError::new(r.scrub(&e.to_string())))
 }
@@ -172,6 +187,7 @@ fn run_inner(
     delegate: impl FnOnce(&str) -> Result<()>,
     r: &Redactor,
     deadline: Instant,
+    tm: &mut Timings,
 ) -> Result<()> {
     let id = match &opts.session {
         Some(s) if is_valid_chat_id(s) => s.clone(),
@@ -179,7 +195,11 @@ fn run_inner(
         None => new_session_id(),
     };
     r.errln(&format!("Session: {id}"));
-    http(t, opts, deadline, || delegate(&id))?;
+    if opts.delegates {
+        tm.time_delegation(|| http(t, opts, deadline, || delegate(&id)))?;
+    } else {
+        http(t, opts, deadline, || delegate(&id))?;
+    }
     let workspace = resolve_workspace(t, opts, r, deadline)?;
     let token = t
         .bearer
@@ -197,19 +217,22 @@ fn run_inner(
     if left.is_zero() {
         return Err(timed_out(opts, "the turn"));
     }
-    let mut conn = ws::connect(
-        &url,
-        &["openworker", token],
-        left.min(Duration::from_secs(15)),
-    )
-    .map_err(|e| {
-        if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(200) {
-            timed_out(opts, "the turn")
-        } else {
-            e
-        }
-    })?;
-    let res = drive(t, opts, r, &id, &mut conn, deadline);
+    let mut conn = tm
+        .time_connect(|| {
+            ws::connect(
+                &url,
+                &["openworker", token],
+                left.min(Duration::from_secs(15)),
+            )
+        })
+        .map_err(|e| {
+            if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(200) {
+                timed_out(opts, "the turn")
+            } else {
+                e
+            }
+        })?;
+    let res = drive(t, opts, r, &id, &mut conn, deadline, tm);
     // Every exit (end, error, timeout, interrupt) flushes the held-back tail.
     r.flush_stream(opts.json);
     conn.close();
@@ -223,6 +246,7 @@ fn drive(
     id: &str,
     ws: &mut WsConn,
     deadline: Instant,
+    tm: &mut Timings,
 ) -> Result<()> {
     let timeout = || timed_out(opts, "the turn");
     let mut baseline = 0;
@@ -241,6 +265,9 @@ fn drive(
             continue;
         };
         let kind = frame["type"].as_str().unwrap_or("");
+        if sent {
+            tm.event();
+        }
         // --json: the frame as emitted (delta scrubbed, lead redacted).
         let mut f = frame.clone();
         if opts.json {
@@ -276,17 +303,24 @@ fn drive(
                 })
                 .map(|h| h["messages"].as_array().map_or(0, Vec::len))
                 .unwrap_or(0);
+                tm.sent();
                 send(ws, json!({"type": "user_message", "text": opts.text}))?;
                 sent = true;
             }
             "assistant_delta" => {
                 streamed = true;
+                if data_text(data).is_some_and(|x| !x.is_empty()) {
+                    tm.text();
+                }
                 if let (false, Some(t)) = (opts.json, data_text(data)) {
                     r.out(&r.delta(t));
                     wrote_text = true;
                 }
             }
             "assistant_message" => {
+                if data_text(data).is_some_and(|x| !x.is_empty()) {
+                    tm.text();
+                }
                 if !opts.json && r.flush_stream(false) {
                     wrote_text = true;
                 }
@@ -324,7 +358,7 @@ fn drive(
             "turn_accepted" => {
                 r.flush_stream(opts.json);
                 r.errln("Turn accepted (queued); polling for the answer.");
-                return poll(t, opts, r, id, baseline, deadline);
+                return poll(t, opts, r, id, baseline, deadline, tm);
             }
             "turn_end" | "turn_done" => {
                 if !opts.json {
@@ -368,6 +402,7 @@ fn poll(
     id: &str,
     baseline: usize,
     deadline: Instant,
+    tm: &mut Timings,
 ) -> Result<()> {
     let mut printed = 0; // json mode: new messages already emitted
     let mut last_len = None;
@@ -412,6 +447,9 @@ fn poll(
         let answers: Vec<&Value> = after.iter().filter(|m| m["role"] == "assistant").collect();
         let stable = last_len == Some(after.len());
         last_len = Some(after.len());
+        if answers.iter().any(|m| !msg_text(m).is_empty()) {
+            tm.text(); // polled: resolution is one poll interval
+        }
         if !answers.is_empty() && stable {
             if !opts.json {
                 for m in answers {

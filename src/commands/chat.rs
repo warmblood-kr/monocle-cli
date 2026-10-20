@@ -21,6 +21,7 @@ use crate::config::{Config, ConfigData};
 use crate::credentials::Credentials;
 use crate::endpoints;
 use crate::error::Result;
+use crate::instrument::{Lane, Timings};
 use crate::net::Client;
 use crate::origin::auth_headers;
 use crate::responses_api::ResponsesClient;
@@ -49,6 +50,10 @@ pub struct ChatOptions {
     /// `--show-tools`: after each reply, print the tool names the server
     /// reports it executed (`tools_used`) to stderr.
     pub show_tools: bool,
+    /// `--timings`: one-shot hosted Chat only; one JSON line to stderr.
+    pub timings: bool,
+    /// `--diagnostics-file` / `MONOCLE_DIAGNOSTICS_FILE` (one-shot hosted Chat only).
+    pub diagnostics_file: Option<std::path::PathBuf>,
 }
 
 /// Resolve the `--max-tokens` flag to an output-token limit. Returns `Some(n)`
@@ -80,6 +85,7 @@ fn call_chat(
     max_tokens: Option<i64>,
     images: &[ImageAttachment],
     files: &[FileAttachment],
+    mut tm: Option<&mut Timings>,
 ) -> Result<(ChatResponse, Option<Duration>)> {
     let req = ChatRequest {
         model: model.to_string(),
@@ -95,9 +101,15 @@ fn call_chat(
     let mut out = std::io::stdout().lock();
     let started = std::time::Instant::now();
     let mut ttfb: Option<Duration> = None;
+    if let Some(tm) = tm.as_deref_mut() {
+        tm.sent();
+    }
     let resp = provider.chat_stream(&req, &mut |delta| {
         if ttfb.is_none() {
             ttfb = Some(started.elapsed());
+            if let Some(tm) = tm.as_deref_mut() {
+                tm.text();
+            }
         }
         let _ = out.write_all(delta.as_bytes());
         let _ = out.flush();
@@ -318,6 +330,8 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
 /// this REPL accumulating the growing conversation itself (see `convo` below)
 /// and resending it in full each turn.
 fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    // Starts with the command (see `run_responses_chat`); one-shot only.
+    let mut tm = Timings::new(Lane::Router);
     let mut model = options
         .model
         .as_deref()
@@ -415,7 +429,20 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         }
         messages.push(Message::user(&text));
         // One-shot mode has no `/diag` to show — TTFB is discarded here.
-        let (resp, _ttfb) = call_chat(&provider, &model, messages, max_tokens, &images, &files)?;
+        let res = call_chat(
+            &provider,
+            &model,
+            messages,
+            max_tokens,
+            &images,
+            &files,
+            options.timings.then_some(&mut tm),
+        );
+        tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
+        if options.timings {
+            eprintln!("{}", tm.line());
+        }
+        let (resp, _ttfb) = res?;
         if let Some(msg) = dropped_tool_calls_message(&resp.tool_calls, 0, "monocle chat") {
             eprintln!("{msg}");
         }
@@ -537,6 +564,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             max_tokens,
             &images,
             &files,
+            None,
         ) {
             Ok((resp, ttfb)) => {
                 diagnostics = Some(TurnDiagnostics::for_chat(
@@ -616,6 +644,26 @@ pub fn chat_list_command(
     Ok(())
 }
 
+/// `monocle chat delete <id>` — permanently delete one hosted thread (once-only
+/// request; confirmation on stderr, stdout stays empty).
+pub fn chat_delete_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &crate::profiles::Selection,
+    id: &str,
+) -> Result<()> {
+    let (_session, jarvice_url, bearer) = resolve_jarvice(client, creds)?;
+    eprintln!(
+        "Profile: {} ({}) — tenant {}",
+        selection.profile,
+        selection.environment,
+        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+    );
+    crate::jarvice_chats::delete_thread(client, &jarvice_url, &bearer, id)?;
+    eprintln!("Deleted chat {id}");
+    Ok(())
+}
+
 /// `monocle chat content <id>` — print one hosted thread's active message
 /// path to stdout (profile banner on stderr, like `chat list`). Nothing
 /// reaches stdout on error.
@@ -668,7 +716,7 @@ fn tools_line(tools_used: &[String], unparsed: usize, present: bool) -> String {
     )
 }
 
-fn dropped_tool_calls_message(
+pub(crate) fn dropped_tool_calls_message(
     tool_calls: &[ToolCall],
     unparsed: usize,
     mode: &str,
@@ -769,7 +817,7 @@ fn unparsed_note(unparsed_tools_used: usize) -> String {
     )
 }
 
-fn tool_firing_verification(
+pub(crate) fn tool_firing_verification(
     expected: &ToolFiringExpectation,
     tools_used: &[String],
     unparsed_tools_used: usize,
@@ -857,6 +905,9 @@ fn router_flag_hint(flag: &str) -> String {
 /// `--system-prompt`/`--max-tokens` support (the endpoint has no such
 /// fields) — each is warned-and-ignored rather than silently dropped.
 fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    // Starts with the command, like the craft lanes: t_request_ms covers auth,
+    // input and attachment prep up to the request.
+    let mut tm = Timings::new(Lane::Chat);
     let mut model = options
         .model
         .as_deref()
@@ -899,14 +950,32 @@ fn run_responses_chat(client: &Client, creds: &Credentials, options: ChatOptions
         eprintln!("Using model: {model}");
         eprintln!("jarvice: {jarvice_url}");
         let rc = ResponsesClient::new(client, session.token, jarvice_url.clone());
-        let reply = rc.respond(
+        tm = tm.with_diagnostics(
+            crate::instrument::diagnostics_path(options.diagnostics_file.clone()),
+            crate::instrument::host_of(&jarvice_url),
+        );
+        tm.sent();
+        let res = rc.respond(
             &model,
             &text,
             &images,
             &files,
             options.resume.as_deref(),
             &options.tool_ids,
-        )?;
+        );
+        // Non-streaming: the whole reply arrives as one response.
+        if let Ok(r) = &res {
+            if r.content.is_empty() {
+                tm.event();
+            } else {
+                tm.text();
+            }
+        }
+        tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
+        if options.timings {
+            eprintln!("{}", tm.line());
+        }
+        let reply = res?;
         let dropped_msg = dropped_tool_calls_message(
             &reply.tool_calls,
             reply.unparsed_tool_calls,
