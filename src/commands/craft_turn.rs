@@ -47,7 +47,12 @@ pub fn continue_hint(prefix: &str, id: &str) -> String {
     format!("continue with: {prefix} --session {id} \"...\"")
 }
 
+#[derive(Clone)]
 pub struct TurnOpts {
+    /// `-i`: this turn is part of an interactive loop; the loop prints the continue hint once at the end.
+    pub interactive: bool,
+    /// A later turn of the loop on an already announced session: no `Session:` line.
+    pub follow_up: bool,
     /// `--continue`: resolve `session` from the last session of this lane/profile/env.
     pub continue_last: bool,
     /// Records the session id for `--continue` once it is known.
@@ -191,6 +196,15 @@ pub fn run_turn(
     opts: &TurnOpts,
     delegate: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
+    run_turn_id(t, opts, delegate).0
+}
+
+/// [`run_turn`] that also returns the session id once it is known (even on failure).
+pub fn run_turn_id(
+    t: &Target,
+    opts: &TurnOpts,
+    delegate: impl FnOnce(&str) -> Result<()>,
+) -> (Result<()>, Option<String>) {
     let deadline = Instant::now() + opts.timeout;
     let token = t.bearer.strip_prefix("Bearer ").unwrap_or(t.bearer);
     let r = Redactor::new(&[token]);
@@ -209,10 +223,18 @@ pub fn run_turn(
         if let Some(last) = &opts.last {
             last.set(id);
         }
-        r.errln(&continue_hint(&opts.hint_prefix, id));
+        if !opts.interactive {
+            r.errln(&continue_hint(&opts.hint_prefix, id));
+        }
     }
     // Server-provided text can sit inside any error: scrub at the boundary.
-    res.map_err(|e| AppError::new(r.scrub(&e.to_string())))
+    (res.map_err(|e| AppError::new(r.scrub(&e.to_string()))), sid)
+}
+
+/// The server refused the message (`input_rejected: queue_full`, craft#225) before
+/// accepting it, so sending it again cannot duplicate it.
+pub fn is_queue_full(e: &AppError) -> bool {
+    e.to_string().ends_with("(input_rejected): queue_full")
 }
 
 fn run_inner(
@@ -229,7 +251,9 @@ fn run_inner(
         Some(_) => return Err(AppError::new("Invalid session ID.")),
         None => new_session_id(),
     };
-    r.errln(&format!("Session: {id}"));
+    if !opts.follow_up {
+        r.errln(&format!("Session: {id}"));
+    }
     *sid = Some(id.clone());
     if opts.delegates {
         tm.time_delegation(|| http(t, opts, deadline, || delegate(&id)))?;
