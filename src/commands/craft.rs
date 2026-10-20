@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::auth::get_access_token;
 use crate::commands::chat::resolve_jarvice;
 use crate::commands::craft_sdk_turn::{self, SdkTurn};
-use crate::commands::craft_turn::{run_turn, Target, TurnOpts};
+use crate::commands::craft_turn::{continue_hint, is_queue_full, run_turn_id, Target, TurnOpts};
 use crate::commands::knowledge::print_table;
 use crate::craft_server as craft;
 use crate::craft_state::LastSession;
@@ -491,19 +491,23 @@ pub fn craft_turn_command(
                 sdk::session_exists(client, &base, &bearer, id)
             })?);
         }
-        return craft_sdk_turn::run(&SdkTurn {
-            last: Some(&last),
-            hint_prefix: &opts.hint_prefix,
-            client,
-            base: &base,
-            bearer: &bearer,
-            text: &opts.text,
-            session: opts.session.as_deref(),
-            title: title.as_deref(),
-            timeout: opts.timeout,
-            json: opts.json,
-            timings: opts.timings,
-            diagnostics_file: opts.diagnostics_file.clone(),
+        return turn_loop(&opts, |o| {
+            craft_sdk_turn::run_id(&SdkTurn {
+                interactive: o.interactive,
+                follow_up: o.follow_up,
+                last: Some(&last),
+                hint_prefix: &o.hint_prefix,
+                client,
+                base: &base,
+                bearer: &bearer,
+                text: &o.text,
+                session: o.session.as_deref(),
+                title: title.as_deref(),
+                timeout: o.timeout,
+                json: o.json,
+                timings: o.timings,
+                diagnostics_file: o.diagnostics_file.clone(),
+            })
         });
     }
     if title.is_some() {
@@ -522,12 +526,108 @@ pub fn craft_turn_command(
             craft::session_exists(client, &base, &bearer, id)
         })?);
     }
-    run_turn(&target, &opts, |id| {
-        if no_delegation {
-            return Ok(());
-        }
-        delegate(client, creds, selection, lane, id, false)
+    turn_loop(&opts, |o| {
+        run_turn_id(&target, o, |id| {
+            if no_delegation {
+                return Ok(());
+            }
+            delegate(client, creds, selection, lane, id, false)
+        })
     })
+}
+
+/// The prompt `> ` is for a person: only when stdin AND stderr are terminals.
+fn prompt_visible(stdin_tty: bool, stderr_tty: bool) -> bool {
+    stdin_tty && stderr_tty
+}
+
+const BUSY_RETRIES: usize = 3;
+const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `turn -i` loop (plain lines, no raw mode) over any lane; `run` is one existing
+/// one-shot turn (connection re-established per turn) returning the session id.
+fn turn_loop(
+    opts: &TurnOpts,
+    run: impl FnMut(&TurnOpts) -> (Result<()>, Option<String>),
+) -> Result<()> {
+    use std::io::IsTerminal;
+    if !opts.interactive {
+        let mut run = run;
+        return run(opts).0;
+    }
+    let prompt = prompt_visible(
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    );
+    lines_loop(opts, std::io::stdin().lock(), prompt, BUSY_WAIT, run)
+}
+
+fn lines_loop(
+    opts: &TurnOpts,
+    mut input: impl std::io::BufRead,
+    prompt: bool,
+    wait: std::time::Duration,
+    mut run: impl FnMut(&TurnOpts) -> (Result<()>, Option<String>),
+) -> Result<()> {
+    let mut sid: Option<String> = None;
+    let mut pending = Some(opts.text.clone()).filter(|t| !t.is_empty());
+    let mut outcome = Ok(());
+    let mut first = true;
+    loop {
+        let text = match pending.take() {
+            Some(t) => t,
+            None => {
+                if prompt {
+                    eprint!("> ");
+                }
+                let mut line = String::new();
+                if input.read_line(&mut line).map_err(AppError::from)? == 0 {
+                    break;
+                }
+                let line = line.trim();
+                if matches!(line, "/exit" | "/quit") {
+                    break;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                line.to_string()
+            }
+        };
+        let mut o = opts.clone();
+        o.text = text;
+        let mut attempt = 0;
+        let res = loop {
+            if sid.is_some() {
+                o.session = sid.clone();
+                o.follow_up = true;
+            }
+            let (res, id) = run(&o);
+            sid = id.or(sid);
+            match res {
+                // Rejected before it was accepted: safe to resend, never a duplicate.
+                Err(e) if is_queue_full(&e) && attempt < BUSY_RETRIES => {
+                    attempt += 1;
+                    eprintln!("server busy, retrying…");
+                    std::thread::sleep(wait);
+                }
+                res => break res,
+            }
+        };
+        if let Err(e) = res {
+            if !first {
+                eprintln!("Error: {e}"); // a later turn: the conversation goes on
+            } else {
+                outcome = Err(e);
+                break;
+            }
+        }
+        first = false;
+    }
+    if let Some(id) = &sid {
+        eprintln!("{}", continue_hint(&opts.hint_prefix, id));
+    }
+    outcome
 }
 
 pub fn craft_workspace_command(
@@ -624,4 +724,16 @@ fn sdk_event_line(e: &serde_json::Value) -> String {
         one_line(&e.to_string()).chars().take(120).collect()
     };
     format!("{kind}\t{body}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_visible;
+
+    #[test]
+    fn prompt_only_when_both_ends_are_terminals() {
+        assert!(prompt_visible(true, true));
+        assert!(!prompt_visible(false, true));
+        assert!(!prompt_visible(true, false));
+    }
 }

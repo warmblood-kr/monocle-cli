@@ -968,3 +968,44 @@ fn continue_conflicts_with_session() {
     assert!(err(&o).contains("cannot be used with"), "{}", err(&o));
     assert!(lines(&log).is_empty());
 }
+
+#[test]
+fn interactive_lines_reuse_the_session_created_by_the_first_turn() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_monocle"))
+        .args(["craft", "--lane", "sdk", "turn", "-i"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("MONOCLE_PROFILE")
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin
+        .take()
+        .unwrap()
+        .write_all(b"one\n\ntwo\n/exit\nthree\n")
+        .unwrap();
+    let o = c.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "Hello\nHello\n");
+    let l = lines(&log);
+    let creates = l
+        .iter()
+        .filter(|x| x.starts_with("POST /api/v1/agent/sessions "))
+        .count();
+    assert_eq!(creates, 1, "{l:?}");
+    assert_eq!(
+        l.iter().filter(|x| x.starts_with("WS connect")).count(),
+        2,
+        "{l:?}"
+    );
+    assert_eq!(err(&o).matches("Session: sess-1").count(), 1, "{}", err(&o));
+    assert_eq!(err(&o).matches("continue with").count(), 1, "{}", err(&o));
+    no_secret(&o);
+}

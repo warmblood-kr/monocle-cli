@@ -487,7 +487,13 @@ Examples:
 
   Continue a conversation with --session ID (the ID is printed on stderr after each turn):
     monocle craft turn --session ID \"and then?\"
-    monocle craft turn --lane sdk --session ID \"and then?\"";
+    monocle craft turn --lane sdk --session ID \"and then?\"
+
+  Talk interactively (one line per message, one session; /exit or Ctrl-D ends):
+    monocle craft turn -i
+    monocle craft turn -i \"hello\"             # TEXT is the first message
+    monocle craft turn -i --continue            # resume the last session and keep talking
+    printf 'hi\\nand then?\\n' | monocle craft turn -i --json";
 
 #[derive(Subcommand)]
 enum CraftCommand {
@@ -509,8 +515,18 @@ enum CraftCommand {
     /// Send one message to a Craft agent and print its answer (both lanes; --workspace, --agent, --approve and --no-delegation apply to openworker only)
     #[command(after_long_help = TURN_EXAMPLES)]
     Turn {
-        /// The message to send
-        text: String,
+        /// The message to send (optional with -i)
+        #[arg(required_unless_present = "interactive")]
+        text: Option<String>,
+        /// Interactive: read one message per line from stdin on ONE session (the first creates it,
+        /// or --session/--continue resumes it; TEXT, if given, is the first message). `/exit`, `/quit`
+        /// or EOF ends it. Blank lines are skipped; `> ` is shown only on a terminal. Options apply
+        /// per turn (--timeout, --timings, --diagnostics-file). A failed first turn exits non-zero;
+        /// a later failure is printed to stderr and the loop continues. This is a flag on `turn`
+        /// (not a `craft chat` command) so all turn options stay in one place. The connection is
+        /// re-established for every turn. A queue_full rejection is retried up to 3 times (3 s apart)
+        #[arg(short = 'i', long)]
+        interactive: bool,
         /// Continue this session (default: a fresh `cli-<time>-<hex>` id, printed to stderr)
         #[arg(long)]
         session: Option<String>,
@@ -1470,6 +1486,7 @@ fn main() {
             }
             CraftCommand::Turn {
                 text,
+                interactive,
                 session,
                 continue_last,
                 workspace,
@@ -1497,7 +1514,9 @@ fn main() {
                         explicit_profile.as_deref(),
                         explicit_env.as_deref(),
                     ),
-                    text,
+                    interactive,
+                    follow_up: false,
+                    text: text.unwrap_or_default(),
                     session,
                     workspace,
                     create_workspace,
