@@ -203,3 +203,96 @@ pub fn delete(client: &Client, base: &str, bearer: &str, id: &str) -> Result<Val
     }
     Ok(v)
 }
+
+/// `GET /v1/workspaces/recent` → `[{path,name,exists}]`.
+pub fn list_workspaces(client: &Client, base: &str, bearer: &str) -> Result<Vec<Value>> {
+    let url = format!("{base}/v1/workspaces/recent");
+    let v: Value = check("Listing workspaces", client.get(&url, &auth(bearer))?)?.json()?;
+    Ok(v["workspaces"].as_array().cloned().unwrap_or_default())
+}
+
+/// `POST /v1/workspaces/open`; the response shape is unverified, so it is returned
+/// as-is (`Null` if the body is not JSON). One attempt: opening may create a folder.
+pub fn open_workspace(
+    client: &Client,
+    base: &str,
+    bearer: &str,
+    path: &str,
+    create: bool,
+) -> Result<Value> {
+    let url = format!("{base}/v1/workspaces/open");
+    let body = serde_json::json!({"path": path, "create": create});
+    let resp = client.post_json_once(&url, &auth(bearer), &body)?;
+    Ok(check("Opening workspace", resp)?
+        .json()
+        .unwrap_or(Value::Null))
+}
+
+/// `GET /v1/agents` → `[{name,title,needs_workspace,default,tagline}]`.
+pub fn list_agents(client: &Client, base: &str, bearer: &str) -> Result<Vec<Value>> {
+    let url = format!("{base}/v1/agents");
+    let v: Value = check("Listing agents", client.get(&url, &auth(bearer))?)?.json()?;
+    Ok(v["agents"].as_array().cloned().unwrap_or_default())
+}
+
+/// Craft host for sending the Stark id_token: exactly `https://<env host>` (default
+/// port). Unlike [`base_url`], a `MONOCLE_CRAFT_URL` override is only tolerated if it
+/// normalizes to that same host — loopback and every other host are refused, and
+/// envs without a Craft host (local) are refused outright.
+pub fn delegation_base(environment: &str) -> Result<String> {
+    let only = || {
+        AppError::new(
+            "Delegation is only allowed against the Craft host of the selected environment (stg|prod).",
+        )
+    };
+    let host = env_host(environment).ok_or_else(only)?;
+    let allowed = format!("https://{host}");
+    if std::env::var("MONOCLE_CRAFT_URL").is_ok() {
+        let url = base_url(environment)?;
+        if url != allowed && url != format!("{allowed}:443") {
+            return Err(only());
+        }
+    }
+    Ok(allowed)
+}
+
+/// `POST /v1/sessions/{id}/delegation` with the user's Stark `id_token`. Returns
+/// `{"ok":true,"expires_at":N}`. The token only ever lives in the request body: it is
+/// never formatted into an error, no redirect is followed with it, and a 3xx is an
+/// error. Callers must pass a `base` from [`delegation_base`] (tests pass a stub).
+pub fn attach_delegation(
+    client: &Client,
+    base: &str,
+    bearer: &str,
+    id: &str,
+    id_token: &str,
+) -> Result<Value> {
+    let url = format!("{base}/v1/sessions/{}/delegation", checked_id(id)?);
+    let body = serde_json::json!({"id_token": id_token});
+    let resp = client.post_json_once_no_redirect(&url, &auth(bearer), &body)?;
+    match resp.status {
+        300..=399 => {
+            return Err(AppError::new(
+                "Attaching delegation failed: unexpected redirect (not followed).",
+            ))
+        }
+        400 => {
+            return Err(AppError::new(
+                "Delegation refused (stale or rejected token); run `monocle login` again.",
+            ))
+        }
+        404 => {
+            return Err(AppError::new(format!(
+                "Session '{id}' was not found (it may belong to another tenant)."
+            )))
+        }
+        _ => {}
+    }
+    let v: Value = check("Attaching delegation", resp)?.json()?;
+    if v["ok"].as_bool() != Some(true) {
+        return Err(AppError::new(
+            "Attaching delegation failed: the server did not report ok=true.",
+        ));
+    }
+    Ok(v)
+}

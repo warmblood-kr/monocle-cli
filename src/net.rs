@@ -70,6 +70,8 @@ pub type UnauthorizedRefresher = Arc<dyn Fn(&Client, &str) -> Option<String> + S
 
 pub struct Client {
     inner: reqwest::blocking::Client,
+    /// Same settings but never follows redirects — for requests carrying secrets.
+    no_redirect: reqwest::blocking::Client,
     refresher: Mutex<Option<UnauthorizedRefresher>>,
 }
 
@@ -81,13 +83,24 @@ impl Default for Client {
 
 impl Client {
     pub fn new() -> Self {
+        Self {
+            inner: build_inner(reqwest::redirect::Policy::default()),
+            no_redirect: build_inner(reqwest::redirect::Policy::none()),
+            refresher: Mutex::new(None),
+        }
+    }
+}
+
+fn build_inner(redirect: reqwest::redirect::Policy) -> reqwest::blocking::Client {
+    {
         // Timeout split: `connect_timeout` bounds only connection establishment,
         // so a hung/unreachable endpoint fails fast — but it does NOT limit body
         // read time, which keeps it safe for long streaming generations. The total
         // per-request `.timeout()` is applied only to non-streaming calls in
         // `send()`; the streaming path (`post_json_stream`) deliberately gets no
         // total timeout, since one would cut a long generation mid-stream.
-        let inner = reqwest::blocking::Client::builder()
+        reqwest::blocking::Client::builder()
+            .redirect(redirect)
             // Lets server logs tell CLI versions apart (GitHub also requires a UA).
             .user_agent(concat!("monocle-cli/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(30))
@@ -104,13 +117,11 @@ impl Client {
             // the backstop for whatever this doesn't catch.
             .pool_idle_timeout(std::time::Duration::from_secs(50))
             .build()
-            .expect("failed to build HTTP client");
-        Self {
-            inner,
-            refresher: Mutex::new(None),
-        }
+            .expect("failed to build HTTP client")
     }
+}
 
+impl Client {
     /// Install the hook used to replay a request once after a 401 (see
     /// [`UnauthorizedRefresher`]). Installed by `auth::ensure_fresh_token`.
     pub fn set_unauthorized_refresher(&self, hook: UnauthorizedRefresher) {
@@ -314,6 +325,23 @@ impl Client {
             req = req.header(*k, *v);
         }
         self.send_opt("POST", url, req, false)
+    }
+
+    /// [`post_json_once`](Self::post_json_once) that never follows a redirect (a
+    /// 3xx comes back as a plain response) and never replays after a 401. For
+    /// bodies carrying a secret that must reach only the named host.
+    pub fn post_json_once_no_redirect(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Resp> {
+        let mut req = self.no_redirect.post(url).json(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = req.timeout(std::time::Duration::from_secs(120));
+        finish("POST", url, req.send())
     }
 
     /// POST a raw body with an explicit `Content-Type` (Azure SSML).
