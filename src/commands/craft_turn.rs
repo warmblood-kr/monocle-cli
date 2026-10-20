@@ -95,10 +95,20 @@ fn resolve_workspace(t: &Target, opts: &TurnOpts) -> Result<Option<String>> {
         return Ok(Some(path.clone()));
     }
     match craft::list_workspaces(t.client, t.base, t.bearer) {
-        Ok(all) => Ok(all
-            .iter()
-            .find(|w| w["exists"].as_bool() == Some(true))
-            .and_then(|w| w["path"].as_str().map(str::to_string))),
+        Ok(all) => {
+            let found = all
+                .iter()
+                .find(|w| w["exists"].as_bool() == Some(true))
+                .and_then(|w| w["path"].as_str().map(str::to_string));
+            if found.is_none() {
+                // Observed on stg: without a workspace the cowork turn is accepted
+                // but never produces a message.
+                eprintln!(
+                    "No existing workspace found; the turn may stall. Pass --workspace PATH [--create-workspace]."
+                );
+            }
+            Ok(found)
+        }
         Err(_) => {
             eprintln!("Could not list recent workspaces; using the server default.");
             Ok(None)
