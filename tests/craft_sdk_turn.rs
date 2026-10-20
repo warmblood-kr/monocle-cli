@@ -84,6 +84,15 @@ fn start(script: Script) -> (String, Log) {
 
 /// `stall`: a `METHOD /path` whose response is delayed 10s.
 fn start_with(script: Script, stall: Option<&'static str>) -> (String, Log) {
+    start_inner(script, stall, Duration::ZERO)
+}
+
+/// `upgrade_delay`: how long the server sits on the WebSocket upgrade before answering.
+fn start_inner(
+    script: Script,
+    stall: Option<&'static str>,
+    upgrade_delay: Duration,
+) -> (String, Log) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let log = Log::default();
@@ -102,6 +111,7 @@ fn start_with(script: Script, stall: Option<&'static str>) -> (String, Log) {
                             log.lock()
                                 .unwrap()
                                 .push(format!("WS connect {}", req.uri()));
+                            thread::sleep(upgrade_delay);
                             Ok(resp)
                         };
                     if let Ok(mut sock) = tungstenite::accept_hdr(s, cb) {
@@ -608,4 +618,20 @@ fn stalled_http_calls_respect_the_overall_deadline() {
             lines(&log)
         );
     }
+}
+
+#[test]
+fn slow_upgrade_then_stalled_engine_open_respects_the_deadline() {
+    // The upgrade eats 1.5s of a 3s budget, then the engine.io open never arrives:
+    // the handshake must get only what is left, not a fresh full step.
+    let stall: Script = Arc::new(|_s, _log| thread::sleep(Duration::from_secs(10)));
+    let (addr, log) = start_inner(stall, None, Duration::from_millis(1500));
+    let home = setup(&addr);
+    let t0 = Instant::now();
+    let o = turn(home.path(), &["x", "--timeout", "3"]);
+    let took = t0.elapsed();
+    assert!(!o.status.success());
+    assert!(took < Duration::from_millis(3800), "{took:?}");
+    assert!(err(&o).contains("Timed out after 3s"), "{}", err(&o));
+    assert!(lines(&log).iter().any(|l| l.starts_with("WS connect")));
 }

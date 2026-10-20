@@ -86,10 +86,11 @@ impl SocketIo {
     /// `{"token": token}`. Fails on `connect_error` without echoing its body.
     pub fn connect(origin: &str, token: &str, step: Duration) -> Result<Self> {
         let url = format!("{origin}/ws/socket.io/?EIO=4&transport=websocket");
+        // `step` bounds the WS connect AND the engine/namespace handshake together.
+        let deadline = Instant::now() + step;
         let mut me = SocketIo {
             ws: ws::connect_with(&url, &[], step)?,
         };
-        let deadline = Instant::now() + step;
         let mut sent = false;
         loop {
             let Some(raw) = me
