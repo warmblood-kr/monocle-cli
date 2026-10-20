@@ -461,6 +461,20 @@ mod tests {
     }
 
     #[test]
+    fn realistic_tools_used_entry_without_result_text_is_parsed() {
+        // Real server shape: {id, name, arguments, result, files?}; the
+        // result may carry no text at all.
+        let data = body_with_tools_used(
+            "hi",
+            Some(json!([{"id": "call_1", "name": "law__law_get",
+                "arguments": "{\"id\":\"1\"}", "result": "", "files": []}])),
+        );
+        let reply = parse_reply(&data, None).unwrap();
+        assert_eq!(reply.tools_used, vec!["law__law_get"]);
+        assert_eq!(reply.unparsed_tools_used, 0);
+    }
+
+    #[test]
     fn tools_used_entry_without_a_name_is_counted_not_dropped() {
         // An entry we can't read is still EVIDENCE that a tool ran. Dropping
         // it would let a shape mismatch read as "nothing ran" — exactly the
