@@ -487,7 +487,9 @@ fn openworker_delete_failure_modes() {
     let o = ow(&addr, home.path(), &["delete", "del-gone"]);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(
-        err(&o).contains("is gone") && !err(&o).contains("SECRET"),
+        err(&o).contains("Deleted session del-gone.")
+            && !err(&o).contains("HTTP 500")
+            && !err(&o).contains("SECRET"),
         "{}",
         err(&o)
     );

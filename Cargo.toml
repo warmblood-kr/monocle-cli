@@ -41,6 +41,9 @@ rustyline = { version = "14", features = ["derive"] }
 # Fuzzy-matching for the REPL's `/model <TAB>` completion (skim's algorithm).
 # Small, dependency-light (adds only `thread_local`); default features only.
 fuzzy-matcher = "0.3.7"
+# Display-width padding for list tables (CJK/emoji = 2 columns). Same 0.1.x already in the
+# tree via rustyline, so this only adds the direct edge.
+unicode-width = "0.1"
 # ACP server-agent surface (Phase 3). async stays confined to src/acp.rs; the
 # core loop is sync. Pin 0.9 (trait-based `impl Agent`); 1.0 is a builder rewrite.
 agent-client-protocol = "0.9"

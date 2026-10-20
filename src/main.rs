@@ -69,34 +69,36 @@ Options:
 
 const ROOT_HELP_COMMANDS: &str = "\
 Commands:
-  Auth & setup:
-    login    Authenticate with Stark OIDC provider
-    token    Output access token to stdout (for apiKeyHelper)
-    setup    Configure Claude Code to use Monocle authentication
-    unset    Remove Monocle configuration from Claude Code
-    status   Show authentication and configuration status
-    whoami   Show who this profile is signed in as (local; --server asks jarvice)
-    claude   Launch Claude Code with Monocle authentication
-    profile  List, inspect, and select saved profiles
+  Auth & profile:
+    login            Log in to your Monocle tenant
+    token            Print the access token (for apiKeyHelper)
+    setup            Configure Claude Code to use Monocle authentication
+    unset            Remove Monocle configuration from Claude Code
+    status           Show authentication and configuration status
+    whoami           Show who this profile is signed in as
+    profile          List, inspect, and select saved profiles
+    claude           Launch Claude Code with Monocle authentication
 
-  Chat:
-    chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
-    knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
-    mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
-    schedule Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview, create, update)
-    workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
-    craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
+  Chat & agents:
+    chat             Chat with a model (REPL, or pipe a prompt on stdin)
+    craft            Run Craft agent turns and manage Craft sessions
+    agent            [Experimental] Headless agent loop with tools
+    acp              [Experimental] Run as an ACP agent over stdio
 
-  Router (direct API):
-    router   Call the OpenAI-compatible Monocle router directly (chat, models, image, audio)
+  Workspace data:
+    knowledge        Manage knowledge collections and ask questions
+    mcp              Inspect and toggle your MCP servers and their tools
+    schedule         Inspect and manage your schedules
+    workspace-model  Manage workspace (custom) models
 
-  Agent:
-    agent    [Experimental] Headless agent loop with tools (read/write/edit + shell)
-    acp      [Experimental] Run as an ACP agent over stdio (editors / desktop / Craft)
+  Router:
+    router           Call the OpenAI-compatible Monocle router directly
 
   Maintenance:
-    upgrade  Update monocle to the latest release
-    help     Print this message or the help of the given subcommand(s)";
+    upgrade          Update monocle to the latest release
+    help             Print this message or the help of a subcommand
+
+Run `monocle <command> --help` for details and examples.";
 
 #[derive(Parser)]
 #[command(
@@ -113,99 +115,138 @@ struct Cli {
     /// Select a saved environment slot (prod, stg, local)
     #[arg(long, global = true)]
     env: Option<String>,
+    /// Show protocol detail on stderr
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
+    /// Hide hints, banners and counts on stderr (errors still print; -v still adds detail)
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
+    /// Disable colored output (same as NO_COLOR)
+    #[arg(long = "no-color", global = true)]
+    no_color: bool,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authenticate with Stark OIDC provider
+    /// Log in to your Monocle tenant
     Login {
-        /// Stark tenant domain (e.g., example.monocle-ai.com)
+        /// Tenant domain (e.g., example.monocle-ai.com)
         #[arg(long)]
         tenant: Option<String>,
         /// Use Device Authorization Grant (for headless/SSH environments)
         #[arg(long = "device-code")]
         device_code: bool,
     },
-    /// Output access token to stdout (for apiKeyHelper)
+    /// Print the access token (for apiKeyHelper)
     Token,
     /// Configure Claude Code to use Monocle authentication
     Setup,
     /// Remove Monocle configuration from Claude Code
     Unset,
     /// Show authentication and configuration status
-    Status,
-    /// Show who this profile is signed in as (local, no network by default)
-    Whoami {
-        /// Also ask jarvice who it thinks you are. Calls GET /api/v1/auths/, which creates a
-        /// server-side session token as a side effect (the CLI discards it). 401/403 means the
-        /// tenant does not accept this Stark token (STARK_JWT_VERIFIER_MODE) or the token has
-        /// no email claim (stark#1061)
-        #[arg(long)]
-        server: bool,
-        /// Print machine-readable JSON
+    Status {
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
-    /// Manage saved Monocle profiles
+    /// Show who this profile is signed in as (local, no network by default)
+    Whoami {
+        /// Also ask the server who it thinks you are. Calls GET /api/v1/auths/, which creates a
+        /// server-side session token as a side effect (the CLI discards it). 401/403 means the
+        /// tenant does not accept this login token or the token has no email claim (a known
+        /// staging issue)
+        #[arg(long)]
+        server: bool,
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
+    /// List, inspect, and select saved profiles
     Profile {
         #[command(subcommand)]
         command: ProfileCommands,
     },
-    /// Launch Claude Code with Monocle authentication (clears conflicting env vars)
-    #[command(disable_help_flag = true)]
+    /// Launch Claude Code with Monocle authentication
+    ///
+    /// Clears conflicting ANTHROPIC_* env vars. Arguments are passed through to `claude`.
+    #[command(disable_help_flag = true, after_help = CLAUDE_HELP_HINT)]
     Claude {
+        /// Arguments passed to `claude` unchanged
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
     },
-    /// [Experimental] Run as an ACP agent over stdio (editors / desktop / Craft)
+    /// [Experimental] Run as an ACP agent over stdio
+    ///
+    /// For editors, the desktop app and Craft.
     Acp,
     /// [Deprecated] Use `monocle router models` instead
     #[command(hide = true)]
     Models,
-    /// Call the OpenAI-compatible Monocle router directly (debugging, evals, scripting)
+    /// Call the OpenAI-compatible Monocle router directly
+    ///
+    /// Useful for debugging, evals and scripting (chat, models, image, audio).
     Router {
         #[command(subcommand)]
         command: RouterCommands,
     },
-    /// Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
+    /// Chat with a model (REPL, or pipe a prompt on stdin)
+    ///
+    /// Chats are stored on the server and show up in the web UI. Start an interactive
+    /// REPL on a terminal, or pipe the prompt for a one-shot answer on stdout.
+    #[command(after_help = CHAT_EXAMPLES)]
     Chat {
         #[command(subcommand)]
         command: Option<ChatCommand>,
         #[command(flatten)]
         args: ChatArgs,
     },
-    /// Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
+    /// Manage knowledge collections and ask questions
+    ///
+    /// Subcommands: create, upload, list, update, remove, replace, reprocess,
+    /// content, ask, delete.
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommand,
     },
-    /// Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
+    /// Inspect and toggle your MCP servers and their tools
+    ///
+    /// Subcommands: ls, show, attention, enable, disable, exec, tool, thread.
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
     },
-    /// Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview, create, update)
+    /// Inspect and manage your schedules
+    ///
+    /// Subcommands: list, show, toggle, delete, runs, mcp-servers, preview, create,
+    /// update.
     Schedule {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
-    /// Manage workspace (custom) models: system prompt, tools, knowledge (then `chat --model <id>`)
+    /// Manage workspace (custom) models
+    ///
+    /// A workspace model bundles a system prompt, tools and knowledge; use it with
+    /// `monocle chat --model <id>`.
     WorkspaceModel {
         #[command(subcommand)]
         command: WorkspaceModelCommand,
     },
-    /// Inspect Craft sessions, workspaces and agents (session, workspace, agent)
+    /// Run Craft agent turns and manage Craft sessions
+    ///
+    /// Subcommands: turn, session, workspace, agent.
     #[command(after_long_help = CRAFT_EXAMPLES)]
     Craft {
-        /// Craft backend: the Craft server (openworker) or jarvice agent sessions (sdk)
+        /// Craft backend: the Craft server (openworker) or Claude-SDK agent sessions (sdk)
         #[arg(long, value_enum, default_value = "openworker", global = true)]
         lane: Lane,
         #[command(subcommand)]
         command: CraftCommand,
     },
-    /// [Experimental] Headless agent loop with tools (read/write/edit + shell)
+    /// [Experimental] Headless agent loop with tools
+    ///
+    /// The agent can read, write and edit files and run shell commands.
     Agent {
         /// The task/prompt (optional; omit to type it interactively, or pipe via stdin)
         prompt: Option<String>,
@@ -254,7 +295,11 @@ enum Commands {
 #[derive(Subcommand)]
 enum ProfileCommands {
     /// List saved profiles and their environments
-    List,
+    List {
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one profile and its login state
     Show { name: Option<String> },
     /// Set the default profile
@@ -283,10 +328,9 @@ struct ChatArgs {
     /// Chat (`/api/responses`).
     #[arg(long, hide = true)]
     responses: bool,
-    /// Continue this existing server-side thread id
+    /// Continue this existing chat (ID printed after each reply, or see `monocle chat list`)
     /// instead of starting a new one. When entering the interactive REPL,
-    /// its prior history is replayed to stderr before the prompt. (See also
-    /// `monocle chat list` to discover thread ids.)
+    /// its prior history is replayed to stderr before the prompt.
     #[arg(long)]
     resume: Option<String>,
     /// MCP/connected-app server ids to activate for this turn
@@ -301,7 +345,7 @@ struct ChatArgs {
     /// bare, it only requires that at least one tool ran. Exit codes: 0 = the
     /// expected tool ran, 1 = it did not (a different tool ran, none ran, or an
     /// unresolved tool_calls report leaked back), 2 = could not determine (this
-    /// jarvice does not report `tools_used`, or the entries were unreadable).
+    /// server does not report `tools_used`, or the entries were unreadable).
     /// One-shot (piped input) only. The answer is written to stdout first
     /// regardless of the verdict.
     #[arg(long = "verify-tool-firing", num_args = 0..=1)]
@@ -310,7 +354,7 @@ struct ChatArgs {
     /// (`tools_used`) to stderr, e.g. `Tools: web_search, model_designer__delegate_model`.
     #[arg(long = "show-tools")]
     show_tools: bool,
-    /// Experimental: streams the answer as it arrives (headless path). The thread title may appear a moment later in the web UI.
+    /// Experimental: streams the answer as it arrives (headless path). The chat title may appear a moment later in the web UI.
     #[arg(long)]
     stream: bool,
     /// One-shot only: print one JSON timings line to stderr (stdout unchanged). t0 is the moment
@@ -394,7 +438,7 @@ impl From<RouterChatArgs> for ChatOptions {
     }
 }
 
-fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
+fn profile_list_command(config: &Config, home: &std::path::Path, json: bool) -> Result<()> {
     let data = profiles::list_profiles(config)?;
     let selected = data.default_profile.as_deref().unwrap_or("default");
     let mut names = data
@@ -406,9 +450,19 @@ fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
     if let Some(default) = data.default_profile.as_ref() {
         names.insert(default.clone());
     }
+    let mut rows = Vec::new();
     for name in names {
         let selection = profiles::resolve_from_data(&data, home, Some(&name), None, None)?;
         let store = selection.store(home);
+        if json {
+            rows.push(serde_json::json!({
+                "name": name,
+                "environment": selection.environment,
+                "logged_in": store.read().is_some(),
+                "default": name == selected,
+            }));
+            continue;
+        }
         let state = if store.read().is_some() {
             "logged in"
         } else {
@@ -416,6 +470,9 @@ fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
         };
         let marker = if name == selected { "*" } else { " " };
         println!("{marker} {name}  {}  ({state})", selection.environment);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
     }
     Ok(())
 }
@@ -429,9 +486,9 @@ fn profile_show_command(
     let data = profiles::list_profiles(config)?;
     let profile = name.unwrap_or(&current.profile);
     if profile != "default" && !data.profiles.contains_key(profile) {
-        return Err(monocle_cli::error::AppError::new(format!(
-            "Unknown profile '{profile}'. Log in with --profile {profile} first."
-        )));
+        return Err(monocle_cli::error::AppError::new(
+            profiles::unknown_profile_message(profile),
+        ));
     }
     let selection = profiles::resolve_from_data(&data, home, Some(profile), None, None)?;
     let store = selection.store(home);
@@ -450,13 +507,20 @@ fn profile_show_command(
 
 #[derive(Subcommand)]
 enum ChatCommand {
-    /// List existing jarvice chat threads (id/title/last-updated) — including
-    /// threads created from jarvice's own web UI, since both share the same
-    /// storage. Always lists jarvice's threads.
-    List,
-    /// Print one hosted Chat thread's active message path to stdout (text only; untrusted content)
+    /// List your chats (id, title, last updated)
+    ///
+    /// Includes chats created in the web UI, since both share the same storage.
+    List {
+        /// Show only the N newest chats (newest first)
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one chat's active message path to stdout (text only; untrusted content)
     Content {
-        /// Hosted Chat thread ID (see `monocle chat list`)
+        /// Chat ID (see `monocle chat list`)
         #[arg(value_name = "CHAT_ID")]
         id: String,
         #[arg(long, value_enum, default_value = "text")]
@@ -472,28 +536,72 @@ enum ChatCommand {
         #[arg(long = "include-memory")]
         include_memory: bool,
     },
-    /// Permanently delete one hosted Chat thread (not undoable, never retried).
-    /// Note: jarvice answers HTTP 401 (not 404) for a chat id that does not
-    /// exist or is not yours, so a 401 here can mean "not found / not yours".
+    /// Permanently delete one chat (not undoable, never retried)
+    ///
+    /// The server answers with an error (HTTP 401 or 500) for a chat id that does not
+    /// exist or is not yours; that is reported as "not found or not yours".
     Delete {
-        /// Hosted Chat thread ID (see `monocle chat list`)
+        /// Chat ID (see `monocle chat list`)
         #[arg(value_name = "CHAT_ID")]
         id: String,
     },
 }
 
+const CHAT_EXAMPLES: &str = "\
+Examples:
+  monocle chat                                 # interactive REPL
+  echo \"summarize the plan\" | monocle chat    # one-shot: pipe the prompt, answer on stdout
+  monocle chat --resume CHAT_ID                # continue an earlier chat
+  monocle chat list                            # find chat IDs";
+
+const KNOWLEDGE_ASK_EXAMPLES: &str = "\
+Examples:
+  monocle knowledge ask handbook \"What is the vacation policy?\"
+  monocle knowledge ask handbook \"Who owns onboarding?\" --json";
+
+const SCHEDULE_CREATE_EXAMPLES: &str = "\
+Examples:
+  monocle schedule create --model claude-sonnet-5 --prompt \"daily digest\" --at +1h
+  monocle schedule create --model claude-sonnet-5 --prompt \"daily digest\" \\
+    --rrule FREQ=DAILY --dtstart 2030-01-02T09:00:00+09:00 --timezone Asia/Seoul
+  monocle schedule create --dry-run ...         # only print the next fire times";
+
+const MCP_EXEC_EXAMPLES: &str = "\
+Examples:
+  monocle mcp exec github                       # the model calls any tool of the server
+  monocle mcp exec github/list_issues --verify  # exit 0 only if that tool ran
+  monocle mcp exec github \"list my open issues\"  # your own prompt";
+
+const CLAUDE_WRAPPER_HELP: &str = "\
+Launch Claude Code with Monocle authentication
+
+Usage: monocle [--profile P] [--env E] claude [CLAUDE_ARGS]...
+
+Monocle points Claude Code at your tenant's router, installs a token helper and
+clears conflicting ANTHROPIC_* env vars for this process only. Everything after
+`claude` is passed to the `claude` binary unchanged. For Claude Code's own
+options run `claude --help` directly.
+
+Examples:
+  monocle claude                          # start Claude Code
+  monocle claude -p \"explain this repo\"   # Claude Code flags pass through";
+
+const CLAUDE_HELP_HINT: &str = "\
+Everything after `claude` is passed to Claude Code unchanged.
+Run `monocle claude --help` for details.";
+
 const CRAFT_EXAMPLES: &str = "\
 Examples:
-  monocle craft turn \"summarize this repo\"           # default lane: Craft server (OpenWorker)
-  monocle craft --lane sdk turn \"hello\"              # Claude-SDK lane (jarvice agent sandbox)
-  monocle craft turn --lane sdk --session ID \"more\"  # --lane works before or after the subcommand
+  monocle craft turn \"summarize this repo\"           # default lane: Craft server
+  monocle craft turn --lane sdk \"hello\"              # Claude-SDK lane (agent sandbox)
+  monocle craft turn --lane sdk --session ID \"more\"  # continue a session
   monocle craft session list                          # sessions on the chosen lane";
 
 const TURN_EXAMPLES: &str = "\
 Examples:
-  Choose the lane with --lane (before or after `turn`):
+  Choose the lane with --lane:
     monocle craft turn \"hello\"                  # openworker (default): Craft server
-    monocle craft turn --lane sdk \"hello\"       # sdk: Claude-SDK lane via the jarvice agent sandbox
+    monocle craft turn --lane sdk \"hello\"       # sdk: Claude-SDK lane via the agent sandbox
 
   Continue a conversation with --session ID (the ID is printed on stderr after each turn):
     monocle craft turn --session ID \"and then?\"
@@ -507,7 +615,7 @@ Examples:
 
 #[derive(Subcommand)]
 enum CraftCommand {
-    /// Manage sessions
+    /// Manage Craft sessions
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -522,7 +630,10 @@ enum CraftCommand {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Send one message to a Craft agent and print its answer (both lanes; --workspace, --agent, --approve and --no-delegation apply to openworker only)
+    /// Send one message to a Craft agent and print its answer
+    ///
+    /// Works on both lanes; --workspace, --agent, --approve and --no-delegation apply
+    /// to the openworker lane only.
     #[command(after_long_help = TURN_EXAMPLES)]
     Turn {
         /// The message to send (optional with -i)
@@ -537,7 +648,7 @@ enum CraftCommand {
         /// re-established for every turn. A queue_full rejection is retried up to 3 times (3 s apart)
         #[arg(short = 'i', long)]
         interactive: bool,
-        /// Continue this session (default: a fresh `cli-<time>-<hex>` id, printed to stderr)
+        /// Continue this session (default: a new session; its ID is printed to stderr)
         #[arg(long)]
         session: Option<String>,
         /// Continue the most recent session of this lane + profile + env (conflicts with --session)
@@ -555,7 +666,7 @@ enum CraftCommand {
         /// Give up after this many seconds
         #[arg(long, default_value_t = 180)]
         timeout: u64,
-        /// Do not attach your Stark delegation to the session first
+        /// Do not attach your delegation to the session first
         #[arg(long)]
         no_delegation: bool,
         /// Title for the new session (sdk lane only; default "CLI turn")
@@ -564,7 +675,9 @@ enum CraftCommand {
         /// Answer for permission prompts (a CLI turn cannot ask interactively)
         #[arg(long, value_enum, default_value = "deny")]
         approve: Approve,
-        /// Print each received frame / polled message as one JSON line instead of text
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        ///
+        /// One JSON line per received frame / polled message instead of text.
         #[arg(long)]
         json: bool,
         /// After the turn, print one JSON timings line to stderr (stdout unchanged). t0 is the
@@ -593,8 +706,9 @@ enum Toggle {
 #[derive(Subcommand)]
 enum McpCommand {
     /// List MCP servers (name, enabled, auth state, tool count)
+    #[command(alias = "list")]
     Ls {
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -602,13 +716,13 @@ enum McpCommand {
     Show {
         /// Server name or id (see `monocle mcp ls`)
         server: String,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
     /// Count servers whose authentication failed and needs attention
     Attention {
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -622,11 +736,13 @@ enum McpCommand {
         /// Server name (see `monocle mcp ls`)
         server: String,
     },
-    /// Run an MCP server's tool through one Hosted Chat turn (LLM-driven; there
-    /// is no direct tool-invoke API). Prints the reply to stdout, the thread id
-    /// to stderr. With --verify, exit code: 0 a tool of it ran, 1 none did
+    /// Run an MCP server's tool through one chat turn
+    ///
+    /// LLM-driven: there is no direct tool-invoke API. Prints the reply to stdout, the
+    /// chat id to stderr. With --verify, exit code: 0 a tool of it ran, 1 none did
     /// (or a dropped tool call), 2 server cannot report `tools_used`.
     /// Pre-flight failures (unknown/disabled/unauthenticated) also exit 1.
+    #[command(after_help = MCP_EXEC_EXAMPLES)]
     Exec {
         /// `SERVER` (any one tool) or `SERVER/TOOL`
         target: String,
@@ -658,20 +774,22 @@ enum McpCommand {
 
 #[derive(Subcommand)]
 enum McpThreadCommand {
-    /// Print the MCP server ids set on a chat. This is a display mirror (the
-    /// ChatMcpEnabled table): it does NOT prove a tool fires; to confirm, run
-    /// `chat --tool-ids mcp:SERVER --verify-tool-firing`
+    /// Print the MCP server ids set on a chat
+    ///
+    /// This is a display mirror (the ChatMcpEnabled table): it does NOT prove a tool
+    /// fires; to confirm, run `chat --tool-ids mcp:SERVER --verify-tool-firing`
     Get {
         /// Chat id (see `monocle chat list`)
         chat_id: String,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
-    /// REPLACE the whole MCP server set of a chat. This is a display mirror (the
-    /// ChatMcpEnabled table): it does NOT guarantee the tool is called; to confirm,
-    /// run `chat --tool-ids mcp:SERVER --verify-tool-firing`. Ids are catalog ids
-    /// from `monocle mcp ls`; the server does not reject unknown ids
+    /// REPLACE the whole MCP server set of a chat
+    ///
+    /// This is a display mirror (the ChatMcpEnabled table): it does NOT guarantee the
+    /// tool is called; to confirm, run `chat --tool-ids mcp:SERVER --verify-tool-firing`.
+    /// Ids are catalog ids from `monocle mcp ls`; the server does not reject unknown ids
     Set {
         /// Chat id (see `monocle chat list`)
         chat_id: String,
@@ -683,7 +801,7 @@ enum McpThreadCommand {
         /// Explicitly clear the set (required when no servers are given)
         #[arg(long, conflicts_with_all = ["servers", "servers_flag"])]
         none: bool,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -693,7 +811,9 @@ enum McpThreadCommand {
 enum ScheduleCommand {
     /// List your schedules
     List {
-        /// Print the server's JSON body unchanged (epochs in seconds)
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        ///
+        /// The server's body is passed through unchanged (epochs in seconds).
         #[arg(long)]
         json: bool,
     },
@@ -701,31 +821,38 @@ enum ScheduleCommand {
     Show {
         /// Schedule id (see `monocle schedule list`)
         id: String,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
     /// Switch a schedule on (`enable`) or off (`disable`)
     Toggle {
+        /// Schedule ID (see `monocle schedule list`)
         id: String,
         #[arg(value_enum)]
         state: Toggle,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
     /// Permanently delete a schedule (single attempt, never retried)
-    Delete { id: String },
-    /// List a schedule's runs, newest first. With --verify, exit code (judged on
-    /// the latest finished run, or --run): 0 a tool ran, 1 none did, 2 cannot
-    /// tell (run unfinished, no tool summary, or unrecognized shape). `--verify=TOOL`
-    /// expects that tool (`server__tool` sanitized as in `mcp exec`, or the bare tool name)
+    Delete {
+        /// Schedule ID (see `monocle schedule list`)
+        id: String,
+    },
+    /// List a schedule's runs, newest first
+    ///
+    /// With --verify, exit code (judged on the latest finished run, or --run): 0 a tool
+    /// ran, 1 none did, 2 cannot tell (run unfinished, no tool summary, or unrecognized
+    /// shape). `--verify=TOOL` expects that tool (`server__tool` sanitized as in
+    /// `mcp exec`, or the bare tool name)
     Runs {
+        /// Schedule ID (see `monocle schedule list`)
         id: String,
         /// Number of runs to fetch
         #[arg(long, default_value_t = 50)]
         limit: u32,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
         /// Assert from the run's tool summary that a tool fired (optionally TOOL)
@@ -735,11 +862,14 @@ enum ScheduleCommand {
         #[arg(long, requires = "verify")]
         run: Option<String>,
     },
-    /// Per-schedule MCP server selection: a display/selection set for the schedule
-    /// (it does NOT prove a tool fires; check with `schedule runs --verify`).
-    /// Without --set/--none it prints the set; --set REPLACES the whole set with
-    /// catalog ids from `monocle mcp ls` (the server does not reject unknown ids)
+    /// Show or set a schedule's MCP servers
+    ///
+    /// A display/selection set for the schedule (it does NOT prove a tool fires; check
+    /// with `schedule runs --verify`). Without --set/--none it prints the set; --set
+    /// REPLACES the whole set with catalog ids from `monocle mcp ls` (the server does
+    /// not reject unknown ids)
     McpServers {
+        /// Schedule ID (see `monocle schedule list`)
         id: String,
         /// Server ids to set (space or comma separated)
         #[arg(long, num_args = 0.., value_delimiter = ',')]
@@ -747,7 +877,7 @@ enum ScheduleCommand {
         /// Explicitly clear the set (required to empty it)
         #[arg(long, conflicts_with = "set")]
         none: bool,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -769,11 +899,14 @@ enum ScheduleCommand {
         /// How many fire times
         #[arg(long, default_value_t = 5)]
         count: u32,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
-    /// Create a schedule (needs --model, a prompt, and --at or --rrule + --dtstart); prints its id
+    /// Create a schedule and print its id
+    ///
+    /// Needs --model, a prompt, and --at or --rrule + --dtstart.
+    #[command(after_help = SCHEDULE_CREATE_EXAMPLES)]
     Create {
         #[command(flatten)]
         write: ScheduleWriteArgs,
@@ -783,16 +916,17 @@ enum ScheduleCommand {
         /// Only print the next fire times; nothing is created
         #[arg(long)]
         dry_run: bool,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
-    /// Change a schedule: only the flags you pass change, everything else is kept
+    /// Change a schedule (only the flags you pass change)
     Update {
+        /// Schedule ID (see `monocle schedule list`)
         id: String,
         #[command(flatten)]
         write: ScheduleWriteArgs,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -805,9 +939,10 @@ enum KnowledgeCommand {
         /// Collection name (must not already exist)
         name: String,
     },
-    /// Upload and index files (pdf, docx, md, txt) into a collection. A directory
-    /// contributes its supported top-level files; files already in the collection
-    /// (same name) are skipped; a failed file is reported and the rest continue
+    /// Upload and index files (pdf, docx, md, txt) into a collection
+    ///
+    /// A directory contributes its supported top-level files; files already in the
+    /// collection (same name) are skipped; a failed file is reported and the rest continue
     Upload {
         /// Collection name or id (see `monocle knowledge list`)
         collection: String,
@@ -819,6 +954,9 @@ enum KnowledgeCommand {
     List {
         /// Collection name or id; omit to list all collections
         collection: Option<String>,
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
     },
     /// Rename and/or re-describe a collection (sharing/access is left unchanged)
     Update {
@@ -829,8 +967,10 @@ enum KnowledgeCommand {
         #[arg(long)]
         description: Option<String>,
     },
-    /// Remove one file from a collection (the collection is kept). The server
-    /// also deletes the file itself unless another collection or chat still uses it
+    /// Remove one file from a collection (the collection is kept)
+    ///
+    /// The server also deletes the file itself unless another collection or chat still
+    /// uses it
     Remove {
         /// Collection name or id
         collection: String,
@@ -861,8 +1001,11 @@ enum KnowledgeCommand {
         /// File name or id within the collection
         file: String,
     },
-    /// Ask a question with a collection attached; prints the answer (stdout) and
-    /// the files its retrieved passages came from (stderr). Costs one model turn; not saved to your threads
+    /// Ask a question about a collection
+    ///
+    /// Prints the answer (stdout) and the files its retrieved passages came from
+    /// (stderr). Costs one model turn; not saved to your chats.
+    #[command(after_help = KNOWLEDGE_ASK_EXAMPLES)]
     Ask {
         /// Collection name or id
         collection: String,
@@ -871,7 +1014,9 @@ enum KnowledgeCommand {
         /// Model ID to use
         #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
         model: String,
-        /// Print {"answer", "sources"} as JSON on stdout
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        ///
+        /// Prints {"answer", "sources"}.
         #[arg(long)]
         json: bool,
     },
@@ -961,11 +1106,15 @@ impl From<ModelWriteArgs> for WriteArgs {
 #[derive(Subcommand)]
 enum WorkspaceModelCommand {
     /// List workspace models (id, name, base, active)
-    List,
+    List {
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
     /// Print one model as JSON (data: URLs over 1 KiB, e.g. the profile image,
     /// are shown as `<data:MIME, N bytes>`; `--full` prints the exact body)
     Show {
-        /// Model ID (see `monocle workspace-model list`)
+        /// Workspace model ID (see `monocle workspace-model list`)
         id: String,
         /// Print the server body unchanged, including large data: URLs
         #[arg(long)]
@@ -976,9 +1125,15 @@ enum WorkspaceModelCommand {
     /// Change a model: only the given flags/--file fields change
     Update(ModelWriteArgs),
     /// Flip a model between active and inactive
-    Toggle { id: String },
+    Toggle {
+        /// Workspace model ID (see `monocle workspace-model list`)
+        id: String,
+    },
     /// Delete a model
-    Delete { id: String },
+    Delete {
+        /// Workspace model ID (see `monocle workspace-model list`)
+        id: String,
+    },
 }
 
 #[derive(Args)]
@@ -1071,12 +1226,16 @@ struct SpeakAzureArgs {
 enum RouterAudioCommands {
     /// Synthesize speech via /v1/audio/speech (OpenAI compatible)
     Speak(SpeakArgs),
-    /// Synthesize speech via Azure /v1/azure/texttospeech/cognitiveservices/v1 (SSML body)
+    /// Synthesize speech via the Azure endpoint (SSML body)
+    ///
+    /// Uses /v1/azure/texttospeech/cognitiveservices/v1.
     #[command(name = "speak-azure")]
     SpeakAzure(SpeakAzureArgs),
     /// Transcribe audio via /v1/audio/transcriptions (OpenAI compatible)
     Transcribe(TranscribeArgs),
-    /// Transcribe via Azure Fast endpoint /v1/speechtotext/transcriptions:transcribe
+    /// Transcribe audio via the Azure Fast endpoint
+    ///
+    /// Uses /v1/speechtotext/transcriptions:transcribe.
     #[command(name = "transcribe-azure")]
     TranscribeAzure(TranscribeAzureArgs),
 }
@@ -1086,12 +1245,16 @@ enum RouterAudioCommands {
 enum AudioCommands {
     /// Transcribe audio via /v1/audio/transcriptions (OpenAI compatible)
     Transcribe(TranscribeArgs),
-    /// Transcribe via Azure Fast endpoint /v1/speechtotext/transcriptions:transcribe
+    /// Transcribe audio via the Azure Fast endpoint
+    ///
+    /// Uses /v1/speechtotext/transcriptions:transcribe.
     #[command(name = "transcribe-azure")]
     TranscribeAzure(TranscribeAzureArgs),
     /// Synthesize speech via /v1/audio/speech (OpenAI compatible)
     Speech(SpeakArgs),
-    /// Synthesize speech via Azure /v1/azure/texttospeech/cognitiveservices/v1 (SSML body)
+    /// Synthesize speech via the Azure endpoint (SSML body)
+    ///
+    /// Uses /v1/azure/texttospeech/cognitiveservices/v1.
     #[command(name = "speech-azure")]
     SpeechAzure(SpeakAzureArgs),
 }
@@ -1148,13 +1311,19 @@ enum RouterCommands {
     /// Chat via /v1/chat/completions (interactive REPL or pipe from stdin)
     Chat(RouterChatArgs),
     /// List available models from the Monocle router (with modality)
-    Models,
+    Models {
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate or edit images via /v1/images/* (OpenAI compatible)
     Image {
         #[command(subcommand)]
         command: ImageCommands,
     },
-    /// Text-to-speech (speak) and speech-to-text (transcribe), OpenAI-compatible and Azure
+    /// Text-to-speech (speak) and speech-to-text (transcribe)
+    ///
+    /// OpenAI-compatible and Azure variants.
     Audio {
         #[command(subcommand)]
         command: RouterAudioCommands,
@@ -1179,7 +1348,11 @@ fn deprecation(old: &str, new: &str) -> String {
 fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), Commands> {
     use RouterAudioCommands as R;
     let (old, new, rc) = match cmd {
-        Commands::Models => ("models", "router models", RouterCommands::Models),
+        Commands::Models => (
+            "models",
+            "router models",
+            RouterCommands::Models { json: false },
+        ),
         Commands::Model {
             command: ModelCommands::Chat(args),
         } => ("model chat", "router chat", RouterCommands::Chat(args)),
@@ -1216,30 +1389,65 @@ fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), 
     Ok((deprecation(old, new), rc))
 }
 
-/// `Cli::parse()`, except that asking for help by omission (`monocle`,
-/// `monocle craft`) prints the help to stdout and exits 0, like `--help`.
-/// Real usage errors still go to stderr with exit 2.
-fn parse_cli() -> Cli {
-    use clap::error::ErrorKind;
+/// Asking for help by omission (`monocle`, `monocle craft`) prints the help to
+/// stdout and exits 0, like `--help`. Real usage errors keep going to stderr
+/// with exit 2.
+fn print_help_by_omission(e: &clap::Error) -> ! {
     use std::io::IsTerminal;
-    match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(e) if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            let help = e.render();
-            if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
-                print!("{}", help.ansi());
-            } else {
-                print!("{help}");
-            }
-            std::process::exit(0)
-        }
-        Err(e) => e.exit(),
+    let help = e.render();
+    if std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && !std::env::args().any(|a| a == "--no-color")
+    {
+        print!("{}", help.ansi());
+    } else {
+        print!("{help}");
     }
+    std::process::exit(0)
+}
+
+/// If the first non-global token is `claude`, return its index: everything after it
+/// belongs to Claude Code verbatim (including `-v/--verbose`).
+fn claude_split(argv: &[String]) -> Option<usize> {
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-v" | "--verbose" => {}
+            "--profile" | "--env" => i += 1,
+            a if a.starts_with("--profile=") || a.starts_with("--env=") => {}
+            "claude" => return Some(i),
+            _ => return None,
+        }
+        i += 1;
+    }
+    None
 }
 
 fn main() {
-    let cli = parse_cli();
-    let (explicit_profile, explicit_env) = (cli.profile.clone(), cli.env.clone());
+    let argv: Vec<String> = std::env::args().collect();
+    let split = claude_split(&argv);
+    let head = &argv[..split.map_or(argv.len(), |i| i + 1)];
+    let cli = Cli::try_parse_from(head).unwrap_or_else(|e| {
+        use clap::error::ErrorKind;
+        if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+            print_help_by_omission(&e);
+        }
+        let _ = e.print();
+        // `chat "text"`: the prompt is read from stdin, not taken as an argument.
+        let wants_pipe = matches!(
+            e.kind(),
+            ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand
+        ) && std::env::args().any(|a| a == "chat");
+        if wants_pipe {
+            eprintln!("\n{}", monocle_cli::commands::chat::PIPE_HINT);
+        }
+        std::process::exit(e.exit_code());
+    });
+    monocle_cli::util::set_verbose(cli.verbose);
+    monocle_cli::util::set_quiet(cli.quiet);
+    if cli.no_color {
+        monocle_cli::colors::disable();
+    }
     let client = Client::new();
     let home = util::home_dir();
     let config = Config::new();
@@ -1259,8 +1467,8 @@ fn main() {
             Ok(data) if data.profiles.contains_key(&selection.profile) => {}
             Ok(_) => {
                 eprintln!(
-                    "Error: Unknown profile '{}'. Log in with --profile {} first.",
-                    selection.profile, selection.profile
+                    "Error: {}",
+                    profiles::unknown_profile_message(&selection.profile)
                 );
                 std::process::exit(1);
             }
@@ -1308,8 +1516,8 @@ fn main() {
         }
         Commands::Setup => setup_command(&creds, &home),
         Commands::Unset => unset_command(&home),
-        Commands::Status => {
-            if !status_command(&creds, &home, &selection) {
+        Commands::Status { json } => {
+            if !status_command(&creds, &home, &selection, json) {
                 std::process::exit(1);
             }
             Ok(())
@@ -1318,19 +1526,26 @@ fn main() {
             whoami_command(&client, &creds, &selection, server, json)
         }
         Commands::Profile { command } => match command {
-            ProfileCommands::List => profile_list_command(&config, &home),
+            ProfileCommands::List { json } => profile_list_command(&config, &home, json),
             ProfileCommands::Show { name } => {
                 profile_show_command(&config, &home, name.as_deref(), &selection)
             }
             ProfileCommands::Use { name } => profiles::use_profile(&config, &name),
         },
-        Commands::Claude { args } => {
+        Commands::Claude { .. } => {
+            let args: Vec<String> = split.map_or(Vec::new(), |i| argv[i + 1..].to_vec());
+            if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+                println!("{CLAUDE_WRAPPER_HELP}");
+                std::process::exit(0);
+            }
             claude_command(&creds, &args);
             Ok(())
         }
         Commands::Acp => monocle_cli::acp::serve_with_credentials(creds.clone()),
         Commands::Chat { command, args } => match command {
-            Some(ChatCommand::List) => chat_list_command(&client, &creds, &selection),
+            Some(ChatCommand::List { limit, json }) => {
+                chat_list_command(&client, &creds, &selection, limit, json)
+            },
             Some(ChatCommand::Content {
                 id,
                 format,
@@ -1456,8 +1671,8 @@ fn main() {
             KnowledgeCommand::Upload { collection, paths } => {
                 knowledge_upload_command(&client, &creds, &selection, &collection, &paths)
             }
-            KnowledgeCommand::List { collection } => {
-                knowledge_list_command(&client, &creds, &selection, collection.as_deref())
+            KnowledgeCommand::List { collection, json } => {
+                knowledge_list_command(&client, &creds, &selection, collection.as_deref(), json)
             }
             KnowledgeCommand::Update {
                 collection,
@@ -1506,7 +1721,9 @@ fn main() {
             }
         },
         Commands::WorkspaceModel { command } => match command {
-            WorkspaceModelCommand::List => wm::list_command(&client, &creds, &selection),
+            WorkspaceModelCommand::List { json } => {
+                wm::list_command(&client, &creds, &selection, json)
+            }
             WorkspaceModelCommand::Show { id, full } => {
                 wm::show_command(&client, &creds, &selection, &id, full)
             }
@@ -1558,11 +1775,14 @@ fn main() {
                 TurnOpts {
                     continue_last,
                     last: None,
-                    hint_prefix: monocle_cli::commands::craft_turn::hint_prefix(
-                        lane == Lane::Sdk,
-                        explicit_profile.as_deref(),
-                        explicit_env.as_deref(),
-                    ),
+                    // Only the first turn of a new session says how to continue it.
+                    hint_prefix: (!interactive && session.is_none() && !continue_last).then(|| {
+                        monocle_cli::commands::craft_turn::hint_prefix(
+                            lane == Lane::Sdk,
+                            &selection.profile,
+                            &selection.environment,
+                        )
+                    }),
                     interactive,
                     follow_up: false,
                     text: text.unwrap_or_default(),
@@ -1601,7 +1821,7 @@ fn main() {
         ),
         Commands::Router { command } => match command {
             RouterCommands::Chat(args) => chat_command(&client, &creds, args.into()),
-            RouterCommands::Models => model_list_command(&client, &creds),
+            RouterCommands::Models { json } => model_list_command(&client, &creds, json),
             RouterCommands::Image { command } => run_image(&client, &creds, command),
             RouterCommands::Audio { command } => run_audio(&client, &creds, command),
         },
@@ -1797,7 +2017,7 @@ mod tests {
         let cli = Cli::parse_from(["monocle", "chat", "list"]);
         match cli.command {
             Commands::Chat { command, .. } => {
-                assert!(matches!(command, Some(ChatCommand::List)));
+                assert!(matches!(command, Some(ChatCommand::List { .. })));
             }
             _ => panic!("expected Chat command"),
         }
@@ -1912,7 +2132,7 @@ mod tests {
     fn router_models_parses() {
         assert!(matches!(
             router(&["monocle", "router", "models"]),
-            RouterCommands::Models
+            RouterCommands::Models { .. }
         ));
     }
 
@@ -2001,7 +2221,7 @@ mod tests {
 
         let (warning, rc) = alias(&["monocle", "models"]);
         assert_eq!(warning, w("models", "router models"));
-        assert!(matches!(rc, RouterCommands::Models));
+        assert!(matches!(rc, RouterCommands::Models { .. }));
 
         let (warning, rc) = alias(&[
             "monocle",
@@ -2182,6 +2402,31 @@ mod tests {
         assert!(opts.responses);
         assert_eq!(opts.resume.as_deref(), Some("abc"));
         assert_eq!(opts.tool_ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn hyphen_leading_profile_and_session_parse_in_equals_form() {
+        let cli = Cli::try_parse_from([
+            "monocle",
+            "craft",
+            "turn",
+            "--profile=-work",
+            "--session=-id",
+            "hi",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("-work"));
+    }
+
+    #[test]
+    fn claude_split_finds_subcommand_after_globals_only() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(claude_split(&v(&["m", "claude", "-v"])), Some(1));
+        assert_eq!(
+            claude_split(&v(&["m", "-v", "--profile", "claude", "claude"])),
+            Some(4)
+        );
+        assert_eq!(claude_split(&v(&["m", "chat", "claude"])), None);
     }
 
     #[test]

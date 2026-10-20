@@ -56,13 +56,13 @@ fn expiry(iso: &str, now: i64) -> Value {
 fn server_identity(client: &Client, creds: &Credentials, local_email: &str) -> Result<Value> {
     let stored = creds
         .read()
-        .ok_or_else(|| AppError::new("Not logged in. Run `monocle login` first."))?;
+        .ok_or_else(|| AppError::new(creds.not_logged_in()))?;
     let bearer = format!("Bearer {}", get_access_token(client, creds).token);
     let url = format!("{}/api/v1/auths/", jarvice_url_for(&stored));
     let resp = client.get(&url, &auth_headers(&bearer))?;
     if !resp.ok() {
         let hint = if matches!(resp.status, 401 | 403) {
-            " The tenant may not accept this Stark token (STARK_JWT_VERIFIER_MODE) or the token lacks an email claim (stark#1061)."
+            " The tenant may not accept this login token, or the token lacks an email claim (a known staging issue)."
         } else {
             ""
         };
@@ -91,9 +91,9 @@ pub fn whoami_command(
     as_json: bool,
 ) -> Result<()> {
     let c = creds.read().ok_or_else(|| {
-        AppError::new(format!(
-            "Not logged in for profile '{}' ({}). Run `monocle --profile {} login --env {}` first.",
-            selection.profile, selection.environment, selection.profile, selection.environment
+        AppError::new(crate::credentials::not_logged_in_message(
+            &selection.profile,
+            &selection.environment,
         ))
     })?;
     let now = now_ms();

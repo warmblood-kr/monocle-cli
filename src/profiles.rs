@@ -17,6 +17,23 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// stderr `Profile: … — tenant …` line, only for a non-default connection or `-v`.
+    pub fn announce(&self, creds: &Credentials) {
+        if crate::util::show_profile_line(
+            &self.profile,
+            &self.environment,
+            crate::util::verbose(),
+            crate::util::quiet(),
+        ) {
+            eprintln!(
+                "Profile: {} ({}) — tenant {}",
+                self.profile,
+                self.environment,
+                creds.read().map(|c| c.tenant_domain).unwrap_or_default()
+            );
+        }
+    }
+
     pub fn store(&self, home: &Path) -> Credentials {
         Credentials::for_profile(
             home,
@@ -25,6 +42,11 @@ impl Selection {
             self.legacy_path,
         )
     }
+}
+
+/// Shared wording for a profile name that was never logged in.
+pub fn unknown_profile_message(profile: &str) -> String {
+    format!("Unknown profile '{profile}'. Log in first: monocle login --profile {profile}")
 }
 
 pub fn validate_profile(name: &str) -> Result<()> {
@@ -204,9 +226,7 @@ pub fn use_profile(config: &Config, profile: &str) -> Result<()> {
     validate_profile(profile)?;
     let mut data = config.read_strict()?;
     if profile != DEFAULT_PROFILE && !data.profiles.contains_key(profile) {
-        return Err(AppError::new(format!(
-            "Unknown profile '{profile}'. Log in with --profile {profile} first."
-        )));
+        return Err(AppError::new(unknown_profile_message(profile)));
     }
     data.default_profile = Some(profile.to_string());
     config.write(&data)

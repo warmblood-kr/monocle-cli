@@ -165,7 +165,7 @@ fn server_error_never_echoes_body() {
     assert_eq!(o.status.code(), Some(1));
     let s = all(&o);
     assert!(s.contains("HTTP 401"), "{s}");
-    assert!(s.contains("stark#1061"), "{s}");
+    assert!(s.contains("email claim"), "{s}");
     assert!(!s.contains("BODY-SECRET"), "{s}");
     no_secrets(&s);
 }

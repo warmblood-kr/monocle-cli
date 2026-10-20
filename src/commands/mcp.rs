@@ -38,7 +38,7 @@ pub fn mcp_ls_command(
     }
     let all = mcp::parse_servers(&body)?;
     if all.is_empty() {
-        eprintln!("No MCP servers found.");
+        crate::note!("No MCP servers found.");
         return Ok(());
     }
     let rows: Vec<Vec<String>> = all
@@ -81,7 +81,7 @@ pub fn mcp_show_command(
         s.auth_state()
     );
     if s.tools.is_empty() {
-        eprintln!("No tools listed.");
+        crate::note!("No tools listed.");
         return Ok(());
     }
     let rows: Vec<Vec<String>> = s
@@ -303,12 +303,12 @@ pub fn mcp_exec_command(
         prompt.join(" ")
     };
     let model = model.unwrap_or(DEFAULT_MODEL);
-    eprintln!("Using model: {model}; tool id: {tool_id}");
+    crate::note!("Using model: {model}; tool id: {tool_id}");
     let rc = ResponsesClient::new(client, session.token, url);
     let reply = rc.respond(model, &text, &[], &[], None, &[tool_id])?;
     println!("{}", reply.content);
     if let Some(id) = &reply.thread_id {
-        eprintln!("Thread: {id}");
+        crate::note!("Thread: {id}");
     }
     if verify {
         let srv = mcp::find_server(&all, server)?;
