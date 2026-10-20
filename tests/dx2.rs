@@ -166,7 +166,9 @@ fn json_shapes_are_stable_and_secret_free() {
 #[test]
 fn status_json_when_logged_out() {
     let home = tempfile::tempdir().unwrap();
-    let v = json_of(home.path(), &["status", "--json"]);
+    let o = run(home.path(), &["status", "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    let v: Value = serde_json::from_str(&out(&o)).unwrap();
     assert_eq!(v["logged_in"], false);
 }
 

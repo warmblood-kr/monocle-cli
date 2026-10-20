@@ -139,4 +139,8 @@ fn status_json(store: &Credentials, home: &Path, selection: &Selection) {
         );
     }
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    // Not logged in is a failure for scripts too; the JSON above is still printed.
+    if out["logged_in"] != true {
+        std::process::exit(1);
+    }
 }
