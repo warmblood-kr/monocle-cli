@@ -23,9 +23,12 @@ pub(crate) fn format_remaining(ms: i64) -> String {
     }
 }
 
-pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
-    eprintln!("Profile: {}", selection.profile);
-    eprintln!("Environment: {}", selection.environment);
+/// Prints the status block to stdout (it is the command's result). Returns
+/// `false` when the profile is not logged in, which the caller turns into exit 1;
+/// the "not logged in" explanation itself goes to stderr.
+pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) -> bool {
+    println!("Profile: {}", selection.profile);
+    println!("Environment: {}", selection.environment);
     let mut creds = match store.read() {
         Some(c) => c,
         None => {
@@ -33,7 +36,7 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
                 "Not logged in for profile '{}' ({}). Run `monocle --profile {} login --env {}` first.",
                 selection.profile, selection.environment, selection.profile, selection.environment
             );
-            return;
+            return false;
         }
     };
 
@@ -47,30 +50,30 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
 
     let now = now_ms();
 
-    eprintln!("Tenant: {} ({})", creds.tenant_domain, creds.tenant_name);
-    eprintln!("User: {}", creds.email);
+    println!("Tenant: {} ({})", creds.tenant_domain, creds.tenant_name);
+    println!("User: {}", creds.email);
 
     // Access token.
     match parse_iso_ms(&creds.access_token_expires_at) {
         Some(exp) if now <= exp => {
-            eprintln!(
+            println!(
                 "Access Token: Valid ({} remaining)",
                 format_remaining(exp - now)
             );
         }
-        _ => eprintln!("Access Token: Expired"),
+        _ => println!("Access Token: Expired"),
     }
 
     // Refresh token.
     match parse_iso_ms(&creds.refresh_token_expires_at) {
         Some(exp) if now <= exp => {
-            eprintln!(
+            println!(
                 "Refresh Token: Valid ({} remaining)",
                 format_remaining(exp - now)
             );
         }
         _ => {
-            eprintln!("Refresh Token: Expired");
+            println!("Refresh Token: Expired");
             eprintln!("\n⚠ Refresh token has expired. Run `monocle login --tenant <domain>` to re-authenticate.");
         }
     }
@@ -87,7 +90,7 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
         })
         .unwrap_or(false);
 
-    eprintln!(
+    println!(
         "Claude Code: {}",
         if claude_configured {
             "Configured"
@@ -95,4 +98,5 @@ pub fn status_command(store: &Credentials, home: &Path, selection: &Selection) {
             "Not configured"
         }
     );
+    true
 }

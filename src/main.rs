@@ -1216,8 +1216,29 @@ fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), 
     Ok((deprecation(old, new), rc))
 }
 
+/// `Cli::parse()`, except that asking for help by omission (`monocle`,
+/// `monocle craft`) prints the help to stdout and exits 0, like `--help`.
+/// Real usage errors still go to stderr with exit 2.
+fn parse_cli() -> Cli {
+    use clap::error::ErrorKind;
+    use std::io::IsTerminal;
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let help = e.render();
+            if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+                print!("{}", help.ansi());
+            } else {
+                print!("{help}");
+            }
+            std::process::exit(0)
+        }
+        Err(e) => e.exit(),
+    }
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let (explicit_profile, explicit_env) = (cli.profile.clone(), cli.env.clone());
     let client = Client::new();
     let home = util::home_dir();
@@ -1288,7 +1309,9 @@ fn main() {
         Commands::Setup => setup_command(&creds, &home),
         Commands::Unset => unset_command(&home),
         Commands::Status => {
-            status_command(&creds, &home, &selection);
+            if !status_command(&creds, &home, &selection) {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Commands::Whoami { server, json } => {

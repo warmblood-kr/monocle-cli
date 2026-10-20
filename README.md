@@ -43,7 +43,7 @@ environments it falls back automatically to device-code login (or force it with
 monocle status
 ```
 
-Shows your tenant, user, access/refresh token validity, and whether Claude Code is globally configured to route through Monocle. Read-only — it does not refresh tokens.
+Shows your tenant, user, access/refresh token validity, and whether Claude Code is globally configured to route through Monocle. Read-only — it does not refresh tokens. The block is printed to stdout; `monocle status` exits 1 when the profile is not logged in (the reason goes to stderr).
 
 ## 📖 Commands
 
