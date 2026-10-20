@@ -46,6 +46,17 @@ impl Resp {
         Ok(serde_json::from_slice(&self.body)?)
     }
 
+    /// Like [`Resp::json`], but the error never quotes body content (serde's
+    /// type errors echo the offending value, which may be a token).
+    pub fn json_redacted<T: DeserializeOwned>(&self, what: &str) -> Result<T> {
+        serde_json::from_slice(&self.body).map_err(|_| {
+            crate::error::AppError::new(format!(
+                "{what} response was malformed (HTTP {}).",
+                self.status
+            ))
+        })
+    }
+
     /// Look up a response header by name (case-insensitive).
     pub fn header(&self, name: &str) -> Option<&str> {
         let name = name.to_ascii_lowercase();
