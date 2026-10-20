@@ -73,6 +73,9 @@ pub struct Client {
     /// Same settings but never follows redirects — for requests carrying secrets.
     no_redirect: reqwest::blocking::Client,
     refresher: Mutex<Option<UnauthorizedRefresher>>,
+    /// Upper bound on the total time of every non-streaming request (see
+    /// [`Client::set_request_cap`]); `None` = the normal 120s only.
+    cap: Mutex<Option<std::time::Duration>>,
 }
 
 impl Default for Client {
@@ -87,6 +90,7 @@ impl Client {
             inner: build_inner(reqwest::redirect::Policy::default()),
             no_redirect: build_inner(reqwest::redirect::Policy::none()),
             refresher: Mutex::new(None),
+            cap: Mutex::new(None),
         }
     }
 }
@@ -122,6 +126,17 @@ fn build_inner(redirect: reqwest::redirect::Policy) -> reqwest::blocking::Client
 }
 
 impl Client {
+    /// Cap the total time of each following non-streaming request at
+    /// `min(its normal timeout, cap)`; `None` removes the cap. For commands that
+    /// run under one overall deadline and re-set this before every call.
+    pub fn set_request_cap(&self, cap: Option<std::time::Duration>) {
+        *self.cap.lock().unwrap() = cap;
+    }
+
+    fn request_timeout(&self, normal: std::time::Duration) -> std::time::Duration {
+        self.cap.lock().unwrap().map_or(normal, |c| c.min(normal))
+    }
+
     /// Install the hook used to replay a request once after a 401 (see
     /// [`UnauthorizedRefresher`]). Installed by `auth::ensure_fresh_token`.
     pub fn set_unauthorized_refresher(&self, hook: UnauthorizedRefresher) {
@@ -340,7 +355,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let req = req.timeout(std::time::Duration::from_secs(120));
+        let req = req.timeout(self.request_timeout(std::time::Duration::from_secs(120)));
         finish("POST", url, req.send())
     }
 
@@ -446,7 +461,7 @@ impl Client {
         retry: bool,
     ) -> Result<Resp> {
         // Total request timeout — non-streaming only (see `Client::new`).
-        let req = req.timeout(std::time::Duration::from_secs(120));
+        let req = req.timeout(self.request_timeout(std::time::Duration::from_secs(120)));
         let replay = req.try_clone();
         let sent = if retry {
             send_with_retry(method, url, req)

@@ -14,9 +14,10 @@ use monocle_cli::commands::chat::{
 };
 use monocle_cli::commands::claude::claude_command;
 use monocle_cli::commands::craft::{
-    craft_agent_command, craft_session_command, craft_workspace_command, AgentCommand, Lane,
-    SessionCommand, WorkspaceCommand,
+    craft_agent_command, craft_session_command, craft_turn_command, craft_workspace_command,
+    AgentCommand, Lane, SessionCommand, WorkspaceCommand,
 };
+use monocle_cli::commands::craft_turn::{Approve, TurnOpts};
 use monocle_cli::commands::image_edit::{image_edit_command, ImageEditOptions};
 use monocle_cli::commands::image_generate::{image_generate_command, ImageGenerateOptions};
 use monocle_cli::commands::knowledge::{
@@ -425,6 +426,35 @@ enum CraftCommand {
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// Send one message to a Craft agent and print its answer (openworker lane only)
+    Turn {
+        /// The message to send
+        text: String,
+        /// Continue this session (default: a fresh `cli-<time>-<hex>` id, printed to stderr)
+        #[arg(long)]
+        session: Option<String>,
+        /// Workspace folder to run in (opened first). Default: your most recent existing one
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Create the --workspace folder if it does not exist
+        #[arg(long, requires = "workspace")]
+        create_workspace: bool,
+        /// Agent to talk to (see `craft agent list`)
+        #[arg(long, default_value = "cowork")]
+        agent: String,
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 180)]
+        timeout: u64,
+        /// Do not attach your Stark delegation to the session first
+        #[arg(long)]
+        no_delegation: bool,
+        /// Answer for permission prompts (a CLI turn cannot ask interactively)
+        #[arg(long, value_enum, default_value = "deny")]
+        approve: Approve,
+        /// Print each received frame / polled message as one JSON line instead of text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1018,6 +1048,34 @@ fn main() {
             CraftCommand::Agent { command } => {
                 craft_agent_command(&client, &creds, &selection, lane, &command)
             }
+            CraftCommand::Turn {
+                text,
+                session,
+                workspace,
+                create_workspace,
+                agent,
+                timeout,
+                no_delegation,
+                approve,
+                json,
+            } => craft_turn_command(
+                &client,
+                &creds,
+                &selection,
+                lane,
+                no_delegation,
+                TurnOpts {
+                    text,
+                    session,
+                    workspace,
+                    create_workspace,
+                    agent,
+                    timeout: std::time::Duration::from_secs(timeout),
+                    approve,
+                    json,
+                    poll_every: std::time::Duration::from_secs(2),
+                },
+            ),
         },
         Commands::Agent {
             prompt,

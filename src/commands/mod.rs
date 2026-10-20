@@ -6,6 +6,7 @@ pub mod audio_transcribe_azure;
 pub mod chat;
 pub mod claude;
 pub mod craft;
+pub mod craft_turn;
 pub mod image_edit;
 pub mod image_generate;
 pub mod knowledge;
