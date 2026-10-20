@@ -71,14 +71,29 @@ impl Knowledge {
     }
 }
 
+/// A server-provided `detail.code` is printed only if it looks like a code,
+/// `^[a-z0-9_.-]{1,64}$` (case-insensitive): a credential or free text reflected
+/// into that field (JWT-like, long, spaced) is dropped. `instrument::http_status`
+/// accepts the same shape.
+pub(crate) fn is_safe_code(c: &str) -> bool {
+    (1..=64).contains(&c.len())
+        && c.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// `detail.code` of an error body, only if it passes [`is_safe_code`].
+pub(crate) fn safe_detail_code(body: &Value) -> Option<String> {
+    body["detail"]["code"]
+        .as_str()
+        .filter(|c| is_safe_code(c))
+        .map(str::to_string)
+}
+
 /// Render a failed response without echoing its body: jarvice's file/knowledge
-/// errors carry a stable `detail.code` envelope, which is safe and useful; any
-/// other body (stack text, proxy HTML) is not.
+/// errors carry a stable `detail.code` envelope, which is safe and useful when
+/// it passes [`is_safe_code`]; any other body (stack text, proxy HTML) is not.
 pub(crate) fn api_error(what: &str, resp: &Resp) -> AppError {
-    let code = resp
-        .json::<Value>()
-        .ok()
-        .and_then(|v| v["detail"]["code"].as_str().map(str::to_string));
+    let code = resp.json::<Value>().ok().and_then(|v| safe_detail_code(&v));
     match code {
         Some(code) => AppError::new(format!("{what} failed: HTTP {} ({code}).", resp.status)),
         None => AppError::new(format!("{what} failed: HTTP {}.", resp.status)),
@@ -242,8 +257,13 @@ pub fn upload_file(
     if let Some(code) = body["error"]["code"].as_str() {
         // Stored but unusable — remove it so it is not left orphaned.
         let _ = delete_file(client, jarvice_url, bearer, &id);
+        let code = if is_safe_code(code) {
+            format!(" ({code})")
+        } else {
+            String::new()
+        };
         return Err(AppError::new(format!(
-            "Upload failed: server could not process the file ({code})."
+            "Upload failed: server could not process the file{code}."
         )));
     }
     Ok(id)
@@ -556,7 +576,7 @@ pub fn ask(
         let status = stream.status;
         let code = serde_json::from_str::<Value>(&stream.read_all())
             .ok()
-            .and_then(|v| v["detail"]["code"].as_str().map(str::to_string));
+            .and_then(|v| safe_detail_code(&v));
         return Err(AppError::new(match code {
             Some(c) => format!("Asking the collection failed: HTTP {status} ({c})."),
             None => format!("Asking the collection failed: HTTP {status}."),
@@ -596,6 +616,43 @@ fn parse_with_idle(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsafe_detail_codes_are_dropped() {
+        use super::{is_safe_code, safe_detail_code};
+        use serde_json::json;
+        for ok in ["not_found", "FILE_TOO_LARGE", "a.b-c_9", &"a".repeat(64)] {
+            assert!(is_safe_code(ok), "{ok}");
+        }
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjEifQ.c2lnbmF0dXJl";
+        for bad in [
+            "",
+            &"a".repeat(65),
+            "has space",
+            "semi;colon",
+            "x/y",
+            jwt,
+            "a\nb",
+        ] {
+            // JWT-like values are 'safe' charset-wise only if short: the long one fails by length.
+            if bad == jwt {
+                assert_eq!(is_safe_code(bad), jwt.len() <= 64);
+                continue;
+            }
+            assert!(!is_safe_code(bad), "{bad:?}");
+        }
+        let long_jwt = format!("{jwt}{jwt}");
+        assert_eq!(safe_detail_code(&json!({"detail":{"code":long_jwt}})), None);
+        assert_eq!(
+            safe_detail_code(&json!({"detail":{"code":"two words"}})),
+            None
+        );
+        assert_eq!(
+            safe_detail_code(&json!({"detail":{"code":"not_found"}})).as_deref(),
+            Some("not_found")
+        );
+        assert_eq!(safe_detail_code(&json!({"detail":"plain"})), None);
+    }
+
     use super::*;
     use std::time::Duration;
 

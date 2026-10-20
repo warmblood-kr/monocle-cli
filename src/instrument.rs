@@ -149,7 +149,7 @@ fn all_digits(s: &str, len: std::ops::RangeInclusive<usize>) -> bool {
 
 /// Exactly our own HTTP-failure wordings, matched against the WHOLE message:
 /// `<what> failed: HTTP NNN[ (code)].` (`craft_server::api_error` and siblings;
-/// `what` is letters/spaces only, `code` is `[a-z_]{1,40}`),
+/// `what` is letters/spaces only, `code` is `[a-z0-9_.-]{1,64}`, case-insensitive),
 /// `Could not get a socket token (HTTP NNN).` and
 /// `WebSocket handshake refused: HTTP NNN.`
 fn http_status(msg: &str) -> Option<u16> {
@@ -175,9 +175,7 @@ fn http_status(msg: &str) -> Option<u16> {
             None => rest,
             Some((n, code)) => {
                 let code = code.strip_prefix('(')?.strip_suffix(')')?;
-                if !(1..=40).contains(&code.len())
-                    || !code.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
-                {
+                if !crate::jarvice_knowledge::is_safe_code(code) {
                     return None;
                 }
                 n
@@ -536,6 +534,11 @@ mod tests {
             error_codes("Responses API failed: HTTP 429 (rate_limited)."),
             (Some(429), None)
         );
+        // Codes shaped like jarvice's (`api_error` accepts `[a-z0-9_.-]{1,64}`).
+        assert_eq!(
+            error_codes("Upload failed: HTTP 404 (FILE.not-found_2)."),
+            (Some(404), None)
+        );
         assert_eq!(
             error_codes("Could not get a socket token (HTTP 401)."),
             (Some(401), None)
@@ -562,7 +565,7 @@ mod tests {
             format!("WebSocket closed by the server (close code 1011). {body}"),
             format!("WebSocket closed by the server (close code {body})."),
             "Delegation failed: HTTP 99999.".to_string(),
-            "Delegation failed: HTTP 502 (Bad-Code).".to_string(),
+            "Delegation failed: HTTP 502 (Bad Code).".to_string(),
             "no codes here".to_string(),
         ] {
             assert_eq!(error_codes(&msg), (None, None), "{msg}");
