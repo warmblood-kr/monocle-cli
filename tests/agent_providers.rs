@@ -68,7 +68,7 @@ fn same_provider_swaps_model_vendor_agnostically() {
 
 #[test]
 fn non_200_is_an_error() {
-    let s = stub(|_a, _m, _u, _b| (500, "boom".to_string()));
+    let s = stub(|_a, _m, _u, _b| (500, "SECRET-TOKEN-MARKER".to_string()));
     let provider = MonocleProvider::new("tok", s.router_url());
 
     let err = provider
@@ -80,7 +80,8 @@ fn non_200_is_an_error() {
         })
         .unwrap_err()
         .to_string();
-    assert!(err.contains("API error 500"), "got: {err}");
+    assert!(err.contains("API error: HTTP 500"), "got: {err}");
+    assert!(!err.contains("SECRET-TOKEN-MARKER"), "got: {err}");
 }
 
 #[test]

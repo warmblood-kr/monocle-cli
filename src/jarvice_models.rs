@@ -37,7 +37,7 @@ fn api_error(what: &str, resp: &Resp) -> AppError {
     let code = resp
         .json::<Value>()
         .ok()
-        .and_then(|v| v["detail"]["code"].as_str().map(str::to_string));
+        .and_then(|v| crate::jarvice_knowledge::safe_detail_code(&v));
     match code {
         Some(code) => AppError::new(format!("{what} failed: HTTP {} ({code}).", resp.status)),
         None => AppError::new(format!("{what} failed: HTTP {}.", resp.status)),

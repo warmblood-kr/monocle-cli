@@ -46,6 +46,17 @@ impl Resp {
         Ok(serde_json::from_slice(&self.body)?)
     }
 
+    /// Like [`Resp::json`], but the error never quotes body content (serde's
+    /// type errors echo the offending value, which may be a token).
+    pub fn json_redacted<T: DeserializeOwned>(&self, what: &str) -> Result<T> {
+        serde_json::from_slice(&self.body).map_err(|_| {
+            crate::error::AppError::new(format!(
+                "{what} response was malformed (HTTP {}).",
+                self.status
+            ))
+        })
+    }
+
     /// Look up a response header by name (case-insensitive).
     pub fn header(&self, name: &str) -> Option<&str> {
         let name = name.to_ascii_lowercase();
@@ -87,11 +98,38 @@ impl Default for Client {
 impl Client {
     pub fn new() -> Self {
         Self {
-            inner: build_inner(reqwest::redirect::Policy::default()),
+            inner: build_inner(redirect_policy()),
             no_redirect: build_inner(reqwest::redirect::Policy::none()),
             refresher: Mutex::new(None),
             cap: Mutex::new(None),
         }
+    }
+}
+
+/// Default redirect behaviour (max 10 hops), except that a redirect from a
+/// traceparent-registered host to an unregistered one is not followed (reqwest
+/// would forward custom headers), so the trace header never leaves Monocle hosts.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let from_registered = attempt
+            .previous()
+            .last()
+            .is_some_and(|u| crate::trace::is_registered(u.as_str()));
+        if from_registered && !crate::trace::is_registered(attempt.url().as_str()) {
+            attempt.stop()
+        } else if attempt.previous().len() > 9 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Attach a fresh-span `traceparent` when `url`'s host is registered.
+fn traced(url: &str, req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+    match crate::trace::header_for(url) {
+        Some(h) => req.header("traceparent", h),
+        None => req,
     }
 }
 
@@ -188,6 +226,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
+        let req = traced(url, req);
         let resp = req.send().map_err(|e| AppError(e.to_string()))?;
         let status = resp.status().as_u16();
         let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
@@ -237,6 +276,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
+        let req = traced(url, req);
         // Inline send (not the shared `send()`) so the 600s timeout above is the
         // only cap that applies to the download — but still goes through
         // `send_with_retry` for the same stale-connection backstop.
@@ -365,7 +405,8 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let req = req.timeout(self.request_timeout(std::time::Duration::from_secs(120)));
+        let req =
+            traced(url, req).timeout(self.request_timeout(std::time::Duration::from_secs(120)));
         finish("POST", url, req.send())
     }
 
@@ -421,6 +462,7 @@ impl Client {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
+        let req = traced(url, req);
         let replay = req.try_clone();
         let sent = if retry {
             send_with_retry("POST", url, req)
@@ -440,9 +482,11 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let headers = collect_headers(resp.headers());
         Ok(EventStream {
             status,
             content_type,
+            headers,
             reader: BufReader::new(resp),
             request_url: url.to_string(),
         })
@@ -471,7 +515,8 @@ impl Client {
         retry: bool,
     ) -> Result<Resp> {
         // Total request timeout — non-streaming only (see `Client::new`).
-        let req = req.timeout(self.request_timeout(std::time::Duration::from_secs(120)));
+        let req =
+            traced(url, req).timeout(self.request_timeout(std::time::Duration::from_secs(120)));
         let replay = req.try_clone();
         let sent = if retry {
             send_with_retry(method, url, req)
@@ -595,6 +640,7 @@ fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)
 pub struct EventStream {
     pub status: u16,
     pub content_type: String,
+    headers: Vec<(String, String)>,
     reader: BufReader<reqwest::blocking::Response>,
     /// The request URL, kept only for diagnostic logging on a mid-stream read
     /// failure (see `next_line`).
@@ -604,6 +650,15 @@ pub struct EventStream {
 impl EventStream {
     pub fn ok(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// Look up a response header by name (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
     }
 
     /// Whether the body is a Server-Sent Events stream.

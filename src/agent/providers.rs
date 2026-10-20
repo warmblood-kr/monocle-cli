@@ -526,9 +526,8 @@ impl LlmProvider for MonocleProvider {
         )?;
         if !resp.ok() {
             return Err(AppError::new(format!(
-                "API error {}: {}",
-                resp.status,
-                resp.text()
+                "API error: {}",
+                crate::jarvice_knowledge::status_label(resp.status, &resp.text())
             )));
         }
         let data: Value = resp.json()?;
@@ -550,7 +549,10 @@ impl LlmProvider for MonocleProvider {
         if !stream.ok() {
             let status = stream.status;
             let body = stream.read_all();
-            return Err(AppError::new(format!("API error {status}: {body}")));
+            return Err(AppError::new(format!(
+                "API error: {}",
+                crate::jarvice_knowledge::status_label(status, &body)
+            )));
         }
 
         // Non-SSE response (or a stub): buffer and parse as one completion.

@@ -68,6 +68,7 @@ fn serve_rest(mut s: TcpStream, log: &Log, stall: Option<&str>) {
     }
     let (status, resp) = match key.as_str() {
         "POST /api/v1/agent/sessions" => (200, r#"{"id":"sess-1","title":"t"}"#.to_string()),
+        "GET /api/v1/agent/sessions/sess-1" => (200, r#"{"id":"sess-1"}"#.to_string()),
         "GET /api/v1/auths/" => (200, format!(r#"{{"token":"{SOCKTOK}","role":"admin"}}"#)),
         _ => (404, "{}".to_string()),
     };
@@ -238,6 +239,27 @@ fn turn(home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[test]
+fn lane_flag_after_the_subcommand_selects_the_sdk_lane() {
+    let (addr, _log) = start(happy());
+    let home = setup(&addr);
+    let o = Command::new(env!("CARGO_BIN_EXE_monocle"))
+        .args(["craft", "turn", "--lane", "sdk", "hi there"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("MONOCLE_PROFILE")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "Hello\n");
+    assert!(
+        err(&o).contains("--lane sdk turn --session sess-1"),
+        "{}",
+        err(&o)
+    );
+}
+
 fn out(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
@@ -274,6 +296,20 @@ fn streams_deltas_authenticates_with_socket_token_and_never_leaks_it() {
     assert_eq!(out(&o), "Hello\n");
     let e = err(&o);
     assert!(e.contains("Session: sess-1"), "{e}");
+    assert!(
+        e.contains(r#"continue with: monocle craft --lane sdk turn --session sess-1 "...""#),
+        "{e}"
+    );
+    assert!(!out(&o).contains("continue with"), "{}", out(&o));
+    assert_eq!(e.matches("continue with").count(), 1, "{e}");
+    assert!(
+        e.trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("continue with"),
+        "{e}"
+    );
     assert!(e.contains("[session_status] connecting"), "{e}");
     assert!(e.contains("[tool_use] Bash"), "{e}");
     assert!(!e.contains("BIGRESULT"), "{e}");
@@ -407,6 +443,7 @@ fn timeout_interrupts_and_fails() {
     let o = turn(home.path(), &["x", "--timeout", "1"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("Timed out after 1s"), "{}", err(&o));
+    assert_eq!(err(&o).matches("continue with: ").count(), 1, "{}", err(&o));
     assert!(wait_for(
         &log,
         r#"WS recv 42/agent,["interrupt",{"session_id":"sess-1"}]"#
@@ -772,6 +809,7 @@ fn diagnostics_file_has_ordered_fixed_fields_and_no_secrets_even_on_error() {
                     "lane",
                     "run_id",
                     "status",
+                    "trace_id",
                     "ts",
                     "ws_close_code"
                 ]
@@ -820,4 +858,155 @@ fn diagnostics_is_off_by_default_and_env_var_enables_it() {
         .map(|e| e["event"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(names.last().map(String::as_str), Some("done"));
+}
+
+fn state_file(home: &Path) -> std::path::PathBuf {
+    home.join(".monocle/craft-last-session.json")
+}
+
+fn seed(home: &Path, key_lane: &str, id: &str) {
+    std::fs::create_dir_all(home.join(".monocle")).unwrap();
+    let k = format!("default/local/{key_lane}");
+    std::fs::write(
+        state_file(home),
+        format!(r#"{{"{k}":{{"session_id":"{id}","updated_at":"2026-01-01T00:00:00Z"}}}}"#),
+    )
+    .unwrap();
+}
+
+fn creds_bytes(home: &Path) -> Vec<u8> {
+    std::fs::read(home.join(".monocle/credentials.json")).unwrap()
+}
+
+#[test]
+fn turn_records_session_and_continue_reuses_it() {
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    let before = creds_bytes(home.path());
+    let o = turn(home.path(), &["hi there"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let st = std::fs::read_to_string(state_file(home.path())).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&st).unwrap();
+    let (k, e) = v.as_object().unwrap().iter().next().unwrap();
+    assert!(k.ends_with("/sdk"), "{k}");
+    assert_eq!(e["session_id"], "sess-1");
+    assert!(e["updated_at"].as_str().unwrap().ends_with('Z'));
+    assert!(!st.contains(ACCESS) && !st.contains(SOCKTOK));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(state_file(home.path())).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+    log.lock().unwrap().clear();
+    let o = turn(home.path(), &["--continue", "hi there"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).contains("Continuing session sess-1"), "{}", err(&o));
+    let l = lines(&log);
+    assert!(
+        !l.iter()
+            .any(|x| x.starts_with("POST /api/v1/agent/sessions ")),
+        "{l:?}"
+    );
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("GET /api/v1/agent/sessions/sess-1 ")),
+        "{l:?}"
+    );
+    assert_eq!(before, creds_bytes(home.path()));
+}
+
+#[test]
+fn continue_without_stored_session_errors_before_any_request() {
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    let o = turn(home.path(), &["--continue", "hi"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("No previous craft session for lane sdk (profile default, env "),
+        "{}",
+        err(&o)
+    );
+    assert!(lines(&log).is_empty(), "{:?}", lines(&log));
+}
+
+#[test]
+fn continue_ignores_the_other_lane_and_a_corrupt_file() {
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    seed(home.path(), "openworker", "sess-1");
+    let o = turn(home.path(), &["--continue", "hi"]);
+    assert!(err(&o).contains("No previous craft session"), "{}", err(&o));
+    std::fs::write(state_file(home.path()), "{not json").unwrap();
+    let o = turn(home.path(), &["--continue", "hi"]);
+    assert!(err(&o).contains("No previous craft session"), "{}", err(&o));
+    assert!(lines(&log).is_empty());
+}
+
+#[test]
+fn continue_on_a_gone_session_errors_and_drops_the_entry() {
+    let (addr, _log) = start(happy());
+    let home = setup(&addr);
+    seed(home.path(), "sdk", "sess-gone");
+    let o = turn(home.path(), &["--continue", "hi"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("Session sess-gone no longer exists. Start a new one without --continue."),
+        "{}",
+        err(&o)
+    );
+    assert!(!std::fs::read_to_string(state_file(home.path()))
+        .unwrap()
+        .contains("sess-gone"));
+}
+
+#[test]
+fn continue_conflicts_with_session() {
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    let o = turn(home.path(), &["--continue", "--session", "sess-1", "hi"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("cannot be used with"), "{}", err(&o));
+    assert!(lines(&log).is_empty());
+}
+
+#[test]
+fn interactive_lines_reuse_the_session_created_by_the_first_turn() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_monocle"))
+        .args(["craft", "--lane", "sdk", "turn", "-i"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("MONOCLE_PROFILE")
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin
+        .take()
+        .unwrap()
+        .write_all(b"one\n\ntwo\n/exit\nthree\n")
+        .unwrap();
+    let o = c.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "Hello\nHello\n");
+    let l = lines(&log);
+    let creates = l
+        .iter()
+        .filter(|x| x.starts_with("POST /api/v1/agent/sessions "))
+        .count();
+    assert_eq!(creates, 1, "{l:?}");
+    assert_eq!(
+        l.iter().filter(|x| x.starts_with("WS connect")).count(),
+        2,
+        "{l:?}"
+    );
+    assert_eq!(err(&o).matches("Session: sess-1").count(), 1, "{}", err(&o));
+    assert_eq!(err(&o).matches("continue with").count(), 1, "{}", err(&o));
+    no_secret(&o);
 }

@@ -122,6 +122,9 @@ pub fn connect_with(url: &str, subprotocols: &[&str], timeout: Duration) -> Resu
     let mut request = url
         .into_client_request()
         .map_err(|_| fail("request could not be built"))?;
+    if let Some(h) = crate::trace::header_for(url).and_then(|h| HeaderValue::from_str(&h).ok()) {
+        request.headers_mut().insert("traceparent", h);
+    }
     if !subprotocols.is_empty() {
         let proto = HeaderValue::from_str(&subprotocols.join(", "))
             .map_err(|_| fail("subprotocol refused (invalid characters)"))?;

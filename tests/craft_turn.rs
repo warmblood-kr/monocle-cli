@@ -220,6 +220,23 @@ fn streams_text_sends_token_as_subprotocol_and_never_leaks_it() {
     // Deltas printed live; the final assistant_message is not printed again; reasoning ignored.
     assert_eq!(out(&o), "Hello\n");
     assert!(err(&o).contains("Session: cli-"), "{}", err(&o));
+    assert!(
+        err(&o).contains(r#"continue with: monocle craft turn --session cli-"#),
+        "{}",
+        err(&o)
+    );
+    assert!(!out(&o).contains("continue with"), "{}", out(&o));
+    assert_eq!(err(&o).matches("continue with").count(), 1, "{}", err(&o));
+    assert!(
+        err(&o)
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("continue with"),
+        "{}",
+        err(&o)
+    );
     no_token(&o);
     let l = lines(&log);
     let c = l.iter().find(|x| x.starts_with("WS connect")).unwrap();
@@ -525,6 +542,11 @@ fn sdk_lane_refuses_workspace_flag() {
 
 fn opts() -> TurnOpts {
     TurnOpts {
+        interactive: false,
+        follow_up: false,
+        last: None,
+        continue_last: false,
+        hint_prefix: "monocle craft turn".into(),
         text: "hi there".into(),
         session: Some("sess-1".into()),
         workspace: None,
@@ -1011,7 +1033,7 @@ fn timings_line_has_ordered_fields_and_leaves_stdout_alone() {
     n("connect_ms");
     assert!(t["delegation_ms"].is_null(), "--no-delegation: {t}");
     assert!(t["session_create_ms"].is_null());
-    assert_eq!(t["run_id"].as_str().unwrap().len(), 16);
+    assert_eq!(t["run_id"].as_str().unwrap().len(), 32);
     assert!(t["started_at"].as_str().unwrap().ends_with('Z'));
     // Only numbers/ids/lane: no token, prompt or answer text.
     let line = err(&timed);
@@ -1132,4 +1154,361 @@ fn diagnostics_records_ws_close_code_but_not_server_text() {
     assert_eq!(last["event"], "error");
     assert_eq!(last["ws_close_code"], 1011);
     assert!(last["status"].is_null());
+}
+
+fn state_file(home: &Path) -> std::path::PathBuf {
+    home.join(".monocle/craft-last-session.json")
+}
+
+fn seed(home: &Path, lane: &str, id: &str) {
+    std::fs::create_dir_all(home.join(".monocle")).unwrap();
+    std::fs::write(
+        state_file(home),
+        format!(
+            r#"{{"default/local/{lane}":{{"session_id":"{id}","updated_at":"2026-01-01T00:00:00Z"}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+fn rest_with_sessions(ids: &'static str) -> Rest {
+    Arc::new(move |p, n| match p {
+        "GET /v1/sessions" => (200, format!(r#"{{"sessions":[{ids}]}}"#)),
+        _ => rest_default(p, n),
+    })
+}
+
+#[test]
+fn turn_records_session_and_continue_reuses_it() {
+    let (addr, log) = start(
+        happy(),
+        rest_with_sessions(r#"{"session_id":"cli-1-abcd"}"#),
+    );
+    let home = setup(&addr);
+    let url = format!("http://{addr}");
+    let creds = home.path().join(".monocle/credentials.json");
+    let before = std::fs::read(&creds).unwrap();
+    let o = turn(home.path(), &url, &["hi there", "--no-delegation"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let st = std::fs::read_to_string(state_file(home.path())).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&st).unwrap();
+    let (k, e) = v.as_object().unwrap().iter().next().unwrap();
+    assert!(k.ends_with("/openworker"), "{k}");
+    assert!(e["session_id"].as_str().unwrap().starts_with("cli-"));
+    assert!(!st.contains(TOKEN));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(state_file(home.path())).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+    // Continue a known (listed) session.
+    seed(home.path(), "openworker", "cli-1-abcd");
+    log.lock().unwrap().clear();
+    let o = turn(
+        home.path(),
+        &url,
+        &["--continue", "hi there", "--no-delegation"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        err(&o).contains("Continuing session cli-1-abcd"),
+        "{}",
+        err(&o)
+    );
+    let l = lines(&log);
+    assert!(
+        l.iter().any(|x| x.contains("/ws/session/cli-1-abcd")),
+        "{l:?}"
+    );
+    assert_eq!(before, std::fs::read(&creds).unwrap());
+}
+
+#[test]
+fn continue_without_stored_session_errors_before_any_request() {
+    let (addr, log) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    // Expired token: a refresh (stub request) would happen if auth were reached.
+    let c = home.path().join(".monocle/credentials.json");
+    let stale = std::fs::read_to_string(&c)
+        .unwrap()
+        .replace("2099-01-01T00:00:00Z", "2000-01-01T00:00:00Z");
+    std::fs::write(&c, stale).unwrap();
+    let url = format!("http://{addr}");
+    let o = turn(home.path(), &url, &["--continue", "hi", "--no-delegation"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("No previous craft session for lane openworker (profile default, env "),
+        "{}",
+        err(&o)
+    );
+    // Other lane's entry and a corrupt file count as none.
+    seed(home.path(), "sdk", "cli-1-abcd");
+    let o = turn(home.path(), &url, &["--continue", "hi", "--no-delegation"]);
+    assert!(err(&o).contains("No previous craft session"), "{}", err(&o));
+    std::fs::write(state_file(home.path()), "{not json").unwrap();
+    let o = turn(home.path(), &url, &["--continue", "hi", "--no-delegation"]);
+    assert!(err(&o).contains("No previous craft session"), "{}", err(&o));
+    assert!(lines(&log).is_empty(), "{:?}", lines(&log));
+}
+
+#[test]
+fn continue_on_a_gone_session_errors_and_drops_the_entry() {
+    let (addr, log) = start(happy(), rest_with_sessions(""));
+    let home = setup(&addr);
+    seed(home.path(), "openworker", "cli-1-gone");
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["--continue", "hi", "--no-delegation"],
+    );
+    assert!(!o.status.success());
+    assert!(
+        err(&o)
+            .contains("Session cli-1-gone no longer exists. Start a new one without --continue."),
+        "{}",
+        err(&o)
+    );
+    assert!(!std::fs::read_to_string(state_file(home.path()))
+        .unwrap()
+        .contains("cli-1-gone"));
+    assert!(!lines(&log).iter().any(|x| x.starts_with("WS")));
+}
+
+#[test]
+fn continue_conflicts_with_session() {
+    let (addr, log) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["--continue", "--session", "cli-1-a", "hi"],
+    );
+    assert!(!o.status.success());
+    assert!(err(&o).contains("cannot be used with"), "{}", err(&o));
+    assert!(lines(&log).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_monocle_dir_is_tightened_to_0700_and_credentials_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+    let (addr, _log) = start(happy(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let dir = home.path().join(".monocle");
+    let creds = dir.join("credentials.json");
+    let before = std::fs::read(&creds).unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let creds_mode = mode(&creds);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let o = turn(
+        home.path(),
+        &format!("http://{addr}"),
+        &["hi there", "--no-delegation"],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&state_file(home.path())), 0o600);
+    assert_eq!(before, std::fs::read(&creds).unwrap());
+    assert_eq!(creds_mode, mode(&creds));
+}
+
+// ---- interactive (-i) ----
+
+/// Answers every user_message with `ans:<text>`; text "boom" gets a rejected turn.
+fn echo() -> WsScript {
+    ws_script(|s, log| {
+        frame(s, READY);
+        let t = recv(s, log).unwrap()["text"].as_str().unwrap().to_string();
+        if t == "boom" {
+            frame(s, r#"{"type":"error","data":{"message":"nope"}}"#);
+            return;
+        }
+        let d = serde_json::json!({"type":"assistant_delta","data":{"text":format!("ans:{t}")}});
+        frame(s, &d.to_string());
+        frame(s, r#"{"type":"turn_end","data":{}}"#);
+        let _ = s.close(None);
+    })
+}
+
+fn turn_i(home: &Path, url: &str, args: &[&str], stdin: &str) -> Output {
+    use std::process::Stdio;
+    let mut c = Command::new(env!("CARGO_BIN_EXE_monocle"))
+        .args(["craft", "turn"])
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("MONOCLE_PROFILE")
+        .env("MONOCLE_CRAFT_URL", url)
+        .current_dir(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    c.wait_with_output().unwrap()
+}
+
+fn session_ids(log: &Log) -> Vec<String> {
+    lines(log)
+        .iter()
+        .filter(|l| l.starts_with("WS connect"))
+        .map(|l| {
+            let u = l.split('/').collect::<Vec<_>>();
+            let i = u.iter().position(|p| *p == "session").unwrap();
+            u[i + 1].split('?').next().unwrap().to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn interactive_two_lines_share_one_session_and_answer_in_order() {
+    let (addr, log) = start(echo(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let o = turn_i(
+        home.path(),
+        &format!("http://{addr}"),
+        &["-i", "--no-delegation", "--timings"],
+        "one\n\n  \ntwo\n",
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "ans:one\nans:two\n");
+    let ids = session_ids(&log);
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_eq!(ids[0], ids[1]);
+    let e = err(&o);
+    assert_eq!(e.matches("Session: ").count(), 1, "{e}");
+    assert_eq!(e.matches("continue with").count(), 1, "{e}");
+    assert!(!e.contains("> "), "no prompt when piped: {e}");
+    let runs: Vec<&str> = e
+        .lines()
+        .filter(|l| l.starts_with(r#"{"timings""#))
+        .map(|l| {
+            l.split(r#""run_id":""#)
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(runs.len(), 2, "{e}");
+    assert_ne!(runs[0], runs[1]);
+    no_token(&o);
+}
+
+#[test]
+fn interactive_text_is_first_message_and_exit_stops_reading() {
+    let (addr, log) = start(echo(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let o = turn_i(
+        home.path(),
+        &format!("http://{addr}"),
+        &["-i", "first", "--no-delegation"],
+        "second\n/exit\nthird\n",
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "ans:first\nans:second\n");
+    assert_eq!(session_ids(&log).len(), 2);
+}
+
+#[test]
+fn interactive_failed_later_turn_does_not_abort_but_failed_first_does() {
+    let (addr, _) = start(echo(), Arc::new(rest_default));
+    let home = setup(&addr);
+    let url = format!("http://{addr}");
+    let o = turn_i(
+        home.path(),
+        &url,
+        &["-i", "--no-delegation"],
+        "one\nboom\ntwo\n",
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "ans:one\nans:two\n");
+    assert!(
+        err(&o).contains("Error: Turn failed (error): nope"),
+        "{}",
+        err(&o)
+    );
+    let o = turn_i(home.path(), &url, &["-i", "--no-delegation"], "boom\ntwo\n");
+    assert!(!o.status.success());
+    assert_eq!(out(&o), "");
+}
+
+#[test]
+fn interactive_resumes_with_session_and_continue() {
+    let (addr, log) = start(echo(), rest_with_sessions(r#"{"session_id":"mine-1"}"#));
+    let home = setup(&addr);
+    let url = format!("http://{addr}");
+    let o = turn_i(
+        home.path(),
+        &url,
+        &["-i", "--no-delegation", "--session", "mine-1"],
+        "a\nb\n",
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(session_ids(&log), ["mine-1", "mine-1"]);
+    let o = turn_i(
+        home.path(),
+        &url,
+        &["-i", "--no-delegation", "--continue"],
+        "c\n",
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(session_ids(&log).last().unwrap(), "mine-1");
+}
+
+#[test]
+fn queue_full_is_retried_once_and_delivered_once() {
+    let n = Arc::new(Mutex::new(0));
+    let (addr, log) = start(
+        ws_script(move |s, log| {
+            frame(s, READY);
+            let t = recv(s, log).unwrap()["text"].as_str().unwrap().to_string();
+            let k = {
+                let mut n = n.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            if k == 1 {
+                frame(
+                    s,
+                    r#"{"type":"input_rejected","data":{"error":"queue_full"}}"#,
+                );
+                return;
+            }
+            let d =
+                serde_json::json!({"type":"assistant_delta","data":{"text":format!("ans:{t}")}});
+            frame(s, &d.to_string());
+            frame(s, r#"{"type":"turn_end","data":{}}"#);
+            let _ = s.close(None);
+        }),
+        Arc::new(rest_default),
+    );
+    let home = setup(&addr);
+    let o = turn_i(
+        home.path(),
+        &format!("http://{addr}"),
+        &["-i", "--no-delegation"],
+        "hi\n",
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "ans:hi\n");
+    assert!(err(&o).contains("server busy, retrying"), "{}", err(&o));
+    let sent = lines(&log)
+        .iter()
+        .filter(|l| l.starts_with("WS recv"))
+        .count();
+    assert_eq!(sent, 2, "one rejected send + one accepted send");
+    let ids = session_ids(&log);
+    assert_eq!(ids[0], ids[1]);
+}
+
+#[test]
+fn one_shot_still_requires_text() {
+    let home = tempfile::tempdir().unwrap();
+    let o = turn(home.path(), "http://127.0.0.1:9", &[]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("required"), "{}", err(&o));
 }

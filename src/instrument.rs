@@ -12,7 +12,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use rand::RngCore;
 use serde::Serialize;
 
 use crate::util::{now_ms, to_iso};
@@ -57,17 +56,12 @@ pub enum Lane {
     Router,
 }
 
-/// 16 hex chars from the CSPRNG. Random, non-secret, correlation only.
-pub fn new_run_id() -> String {
-    let mut b = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 /// The one printed line. Field set is fixed; `None` serializes as `null`.
 #[derive(Debug, Serialize)]
 pub struct TimingsBody {
     pub run_id: String,
+    /// Same value as `run_id`: the W3C trace id sent in `traceparent`.
+    pub trace_id: String,
     /// UTC RFC3339, when the turn began.
     pub started_at: String,
     pub lane: Lane,
@@ -132,6 +126,7 @@ impl ErrorKind {
 pub struct DiagLine<'a> {
     pub ts: String,
     pub run_id: &'a str,
+    pub trace_id: &'a str,
     pub event: Event,
     pub lane: Lane,
     pub host: Option<&'a str>,
@@ -149,7 +144,7 @@ fn all_digits(s: &str, len: std::ops::RangeInclusive<usize>) -> bool {
 
 /// Exactly our own HTTP-failure wordings, matched against the WHOLE message:
 /// `<what> failed: HTTP NNN[ (code)].` (`craft_server::api_error` and siblings;
-/// `what` is letters/spaces only, `code` is `[a-z_]{1,40}`),
+/// `what` is letters/spaces only, `code` is `[a-z0-9_.-]{1,64}`, case-insensitive),
 /// `Could not get a socket token (HTTP NNN).` and
 /// `WebSocket handshake refused: HTTP NNN.`
 fn http_status(msg: &str) -> Option<u16> {
@@ -175,9 +170,7 @@ fn http_status(msg: &str) -> Option<u16> {
             None => rest,
             Some((n, code)) => {
                 let code = code.strip_prefix('(')?.strip_suffix(')')?;
-                if !(1..=40).contains(&code.len())
-                    || !code.bytes().all(|b| b == b'_' || b.is_ascii_lowercase())
-                {
+                if !crate::jarvice_knowledge::is_safe_code(code) {
                     return None;
                 }
                 n
@@ -261,8 +254,10 @@ impl Timings {
 
     pub fn with_clock(lane: Lane, clock: Box<dyn Clock>) -> Self {
         let origin = clock.mono();
+        let run_id = crate::trace::begin_run();
         let body = TimingsBody {
-            run_id: new_run_id(),
+            trace_id: run_id.clone(),
+            run_id,
             started_at: to_iso(clock.wall_ms()),
             lane,
             t_request_ms: None,
@@ -299,6 +294,7 @@ impl Timings {
         let line = DiagLine {
             ts: to_iso(self.clock.wall_ms()),
             run_id: &self.body.run_id,
+            trace_id: &self.body.run_id,
             event,
             lane: self.body.lane,
             host: d.host.as_deref(),
@@ -476,7 +472,8 @@ mod tests {
                 for k in kinds.iter().map(|k| Some(*k)).chain([None]) {
                     let l = DiagLine {
                         ts: to_iso(0),
-                        run_id: "0123456789abcdef",
+                        run_id: "0123456789abcdef0123456789abcdef",
+                        trace_id: "0123456789abcdef0123456789abcdef",
                         event,
                         lane,
                         host: Some("h.example.com"),
@@ -498,6 +495,7 @@ mod tests {
                             "lane",
                             "run_id",
                             "status",
+                            "trace_id",
                             "ts",
                             "ws_close_code"
                         ]
@@ -506,7 +504,7 @@ mod tests {
                     for (key, val) in v.as_object().unwrap() {
                         if let Some(t) = val.as_str() {
                             assert!(
-                                matches!(key.as_str(), "ts" | "run_id" | "host")
+                                matches!(key.as_str(), "ts" | "run_id" | "trace_id" | "host")
                                     || t.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                                 "{key}={t}"
                             );
@@ -536,6 +534,11 @@ mod tests {
             error_codes("Responses API failed: HTTP 429 (rate_limited)."),
             (Some(429), None)
         );
+        // Codes shaped like jarvice's (`api_error` accepts `[a-z0-9_.-]{1,64}`).
+        assert_eq!(
+            error_codes("Upload failed: HTTP 404 (FILE.not-found_2)."),
+            (Some(404), None)
+        );
         assert_eq!(
             error_codes("Could not get a socket token (HTTP 401)."),
             (Some(401), None)
@@ -562,7 +565,7 @@ mod tests {
             format!("WebSocket closed by the server (close code 1011). {body}"),
             format!("WebSocket closed by the server (close code {body})."),
             "Delegation failed: HTTP 99999.".to_string(),
-            "Delegation failed: HTTP 502 (Bad-Code).".to_string(),
+            "Delegation failed: HTTP 502 (Bad Code).".to_string(),
             "no codes here".to_string(),
         ] {
             assert_eq!(error_codes(&msg), (None, None), "{msg}");
@@ -649,12 +652,14 @@ mod tests {
                 "started_at",
                 "t_request_ms",
                 "total_ms",
+                "trace_id",
                 "ttfe_ms",
                 "ttft_ms"
             ]
         );
         assert_eq!(v["timings"]["lane"], "sdk");
         let id = v["timings"]["run_id"].as_str().unwrap();
-        assert!(id.len() == 16 && id.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert!(id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(v["timings"]["trace_id"], id);
     }
 }

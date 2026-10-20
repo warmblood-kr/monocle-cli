@@ -33,11 +33,17 @@ use monocle_cli::commands::mcp::{
     mcp_thread_command,
 };
 use monocle_cli::commands::model_list::model_list_command;
+use monocle_cli::commands::schedule::{
+    schedule_create_command, schedule_delete_command, schedule_list_command, schedule_mcp_command,
+    schedule_preview_command, schedule_runs_command, schedule_show_command,
+    schedule_update_command, WriteArgs as ScheduleWriteArgs,
+};
 use monocle_cli::commands::setup::setup_command;
 use monocle_cli::commands::status::status_command;
 use monocle_cli::commands::token::token_command;
 use monocle_cli::commands::unset::unset_command;
 use monocle_cli::commands::upgrade::upgrade_command;
+use monocle_cli::commands::whoami::whoami_command;
 use monocle_cli::commands::workspace_model::{self as wm, WriteArgs};
 use monocle_cli::config::Config;
 use monocle_cli::credentials::Credentials;
@@ -69,6 +75,7 @@ Commands:
     setup    Configure Claude Code to use Monocle authentication
     unset    Remove Monocle configuration from Claude Code
     status   Show authentication and configuration status
+    whoami   Show who this profile is signed in as (local; --server asks jarvice)
     claude   Launch Claude Code with Monocle authentication
     profile  List, inspect, and select saved profiles
 
@@ -76,6 +83,7 @@ Commands:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
     mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
+    schedule Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview, create, update)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
     craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
 
@@ -128,6 +136,18 @@ enum Commands {
     Unset,
     /// Show authentication and configuration status
     Status,
+    /// Show who this profile is signed in as (local, no network by default)
+    Whoami {
+        /// Also ask jarvice who it thinks you are. Calls GET /api/v1/auths/, which creates a
+        /// server-side session token as a side effect (the CLI discards it). 401/403 means the
+        /// tenant does not accept this Stark token (STARK_JWT_VERIFIER_MODE) or the token has
+        /// no email claim (stark#1061)
+        #[arg(long)]
+        server: bool,
+        /// Print machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage saved Monocle profiles
     Profile {
         #[command(subcommand)]
@@ -166,15 +186,21 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview, create, update)
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
     /// Manage workspace (custom) models: system prompt, tools, knowledge (then `chat --model <id>`)
     WorkspaceModel {
         #[command(subcommand)]
         command: WorkspaceModelCommand,
     },
     /// Inspect Craft sessions, workspaces and agents (session, workspace, agent)
+    #[command(after_long_help = CRAFT_EXAMPLES)]
     Craft {
         /// Craft backend: the Craft server (openworker) or jarvice agent sessions (sdk)
-        #[arg(long, value_enum, default_value = "openworker")]
+        #[arg(long, value_enum, default_value = "openworker", global = true)]
         lane: Lane,
         #[command(subcommand)]
         command: CraftCommand,
@@ -284,9 +310,12 @@ struct ChatArgs {
     /// (`tools_used`) to stderr, e.g. `Tools: web_search, model_designer__delegate_model`.
     #[arg(long = "show-tools")]
     show_tools: bool,
+    /// Experimental: streams the answer as it arrives (headless path). The thread title may appear a moment later in the web UI.
+    #[arg(long)]
+    stream: bool,
     /// One-shot only: print one JSON timings line to stderr (stdout unchanged). t0 is the moment
     /// the request is sent; the reply is one blocking response, so ttfe = ttft = total (no
-    /// streaming). Includes a random run_id and started_at (UTC); never tokens, prompts or text
+    /// streaming) unless `--stream` is set (then ttfe = first SSE event, ttft = first answer text, total = stream end). Includes a random run_id (= trace_id, sent as `traceparent` to Monocle hosts only; disable with MONOCLE_NO_TRACEPARENT=1) and started_at (UTC); never tokens, prompts or text
     #[arg(long)]
     timings: bool,
     /// One-shot only: append one JSON line per phase to this file (also MONOCLE_DIAGNOSTICS_FILE);
@@ -312,6 +341,7 @@ impl From<ChatArgs> for ChatOptions {
                 None => ToolFiringExpectation::Any,
             }),
             show_tools: a.show_tools,
+            stream: a.stream,
             timings: a.timings,
             diagnostics_file: a.diagnostics_file,
         }
@@ -357,6 +387,7 @@ impl From<RouterChatArgs> for ChatOptions {
             tool_ids: Vec::new(),
             verify_tool_firing: None,
             show_tools: false,
+            stream: false,
             timings: a.timings,
             diagnostics_file: None,
         }
@@ -446,6 +477,29 @@ enum ChatCommand {
     },
 }
 
+const CRAFT_EXAMPLES: &str = "\
+Examples:
+  monocle craft turn \"summarize this repo\"           # default lane: Craft server (OpenWorker)
+  monocle craft --lane sdk turn \"hello\"              # Claude-SDK lane (jarvice agent sandbox)
+  monocle craft turn --lane sdk --session ID \"more\"  # --lane works before or after the subcommand
+  monocle craft session list                          # sessions on the chosen lane";
+
+const TURN_EXAMPLES: &str = "\
+Examples:
+  Choose the lane with --lane (before or after `turn`):
+    monocle craft turn \"hello\"                  # openworker (default): Craft server
+    monocle craft turn --lane sdk \"hello\"       # sdk: Claude-SDK lane via the jarvice agent sandbox
+
+  Continue a conversation with --session ID (the ID is printed on stderr after each turn):
+    monocle craft turn --session ID \"and then?\"
+    monocle craft turn --lane sdk --session ID \"and then?\"
+
+  Talk interactively (one line per message, one session; /exit or Ctrl-D ends):
+    monocle craft turn -i
+    monocle craft turn -i \"hello\"             # TEXT is the first message
+    monocle craft turn -i --continue            # resume the last session and keep talking
+    printf 'hi\\nand then?\\n' | monocle craft turn -i --json";
+
 #[derive(Subcommand)]
 enum CraftCommand {
     /// Manage sessions
@@ -464,12 +518,26 @@ enum CraftCommand {
         command: AgentCommand,
     },
     /// Send one message to a Craft agent and print its answer (both lanes; --workspace, --agent, --approve and --no-delegation apply to openworker only)
+    #[command(after_long_help = TURN_EXAMPLES)]
     Turn {
-        /// The message to send
-        text: String,
+        /// The message to send (optional with -i)
+        #[arg(required_unless_present = "interactive")]
+        text: Option<String>,
+        /// Interactive: read one message per line from stdin on ONE session (the first creates it,
+        /// or --session/--continue resumes it; TEXT, if given, is the first message). `/exit`, `/quit`
+        /// or EOF ends it. Blank lines are skipped; `> ` is shown only on a terminal. Options apply
+        /// per turn (--timeout, --timings, --diagnostics-file). A failed first turn exits non-zero;
+        /// a later failure is printed to stderr and the loop continues. This is a flag on `turn`
+        /// (not a `craft chat` command) so all turn options stay in one place. The connection is
+        /// re-established for every turn. A queue_full rejection is retried up to 3 times (3 s apart)
+        #[arg(short = 'i', long)]
+        interactive: bool,
         /// Continue this session (default: a fresh `cli-<time>-<hex>` id, printed to stderr)
         #[arg(long)]
         session: Option<String>,
+        /// Continue the most recent session of this lane + profile + env (conflicts with --session)
+        #[arg(long = "continue", conflicts_with = "session")]
+        continue_last: bool,
         /// Workspace folder to run in (opened first). Default: your most recent existing one
         #[arg(long)]
         workspace: Option<String>,
@@ -498,13 +566,13 @@ enum CraftCommand {
         /// moment the user message is handed to the socket; ttfe = first server frame after t0,
         /// ttft = first non-empty assistant text, total = turn end (all ms from t0, monotonic;
         /// null if it never happened). t_request_ms = ms from command start to t0; connect_ms,
-        /// delegation_ms, session_create_ms are setup phases. Includes a random run_id and
-        /// started_at (UTC); never tokens, prompts or text. If the answer is polled, ttft is accurate to the 2 s poll interval
+        /// delegation_ms, session_create_ms are setup phases. Includes a random run_id (= trace_id, sent as
+        /// `traceparent` to Monocle hosts only; disable with MONOCLE_NO_TRACEPARENT=1) and started_at (UTC); never tokens, prompts or text. If the answer is polled, ttft is accurate to the 2 s poll interval
         #[arg(long)]
         timings: bool,
         /// Append one JSON line per phase (connect, delegation, session_create, first_event,
         /// first_text, done/error) to this file; also set by MONOCLE_DIAGNOSTICS_FILE. Off by
-        /// default. Fixed fields only (ts, run_id, event, lane, host, error_kind, duration_ms): never
+        /// default. Fixed fields only (ts, run_id, trace_id, event, lane, host, error_kind, duration_ms): never
         /// tokens, prompts, text, headers or URLs. Created 0600; rotated to PATH.1 at 1 MiB
         #[arg(long = "diagnostics-file", value_name = "PATH")]
         diagnostics_file: Option<std::path::PathBuf>,
@@ -610,6 +678,115 @@ enum McpThreadCommand {
         /// Explicitly clear the set (required when no servers are given)
         #[arg(long, conflicts_with_all = ["servers", "servers_flag"])]
         none: bool,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    /// List your schedules
+    List {
+        /// Print the server's JSON body unchanged (epochs in seconds)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one schedule
+    Show {
+        /// Schedule id (see `monocle schedule list`)
+        id: String,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Switch a schedule on (`enable`) or off (`disable`)
+    Toggle {
+        id: String,
+        #[arg(value_enum)]
+        state: Toggle,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Permanently delete a schedule (single attempt, never retried)
+    Delete { id: String },
+    /// List a schedule's runs, newest first. With --verify, exit code (judged on
+    /// the latest finished run, or --run): 0 a tool ran, 1 none did, 2 cannot
+    /// tell (run unfinished, no tool summary, or unrecognized shape). `--verify=TOOL`
+    /// expects that tool (`server__tool` sanitized as in `mcp exec`, or the bare tool name)
+    Runs {
+        id: String,
+        /// Number of runs to fetch
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+        /// Assert from the run's tool summary that a tool fired (optionally TOOL)
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TOOL")]
+        verify: Option<String>,
+        /// Judge this run id instead of the latest finished run
+        #[arg(long, requires = "verify")]
+        run: Option<String>,
+    },
+    /// Per-schedule MCP server selection: a display/selection set for the schedule
+    /// (it does NOT prove a tool fires; check with `schedule runs --verify`).
+    /// Without --set/--none it prints the set; --set REPLACES the whole set with
+    /// catalog ids from `monocle mcp ls` (the server does not reject unknown ids)
+    McpServers {
+        id: String,
+        /// Server ids to set (space or comma separated)
+        #[arg(long, num_args = 0.., value_delimiter = ',')]
+        set: Option<Vec<String>>,
+        /// Explicitly clear the set (required to empty it)
+        #[arg(long, conflicts_with = "set")]
+        none: bool,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the next fire times (UTC) of an unsaved schedule; nothing is stored
+    #[command(group(clap::ArgGroup::new("when").required(true).args(["recurrence", "run_at"])))]
+    Preview {
+        /// RFC 5545 RRULE, e.g. FREQ=DAILY (needs --dtstart)
+        #[arg(long, requires = "dtstart")]
+        recurrence: Option<String>,
+        /// First occurrence, epoch seconds
+        #[arg(long)]
+        dtstart: Option<i64>,
+        /// One-off run time, epoch seconds
+        #[arg(long, conflicts_with_all = ["recurrence", "dtstart"])]
+        run_at: Option<i64>,
+        /// IANA timezone
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        /// How many fire times
+        #[arg(long, default_value_t = 5)]
+        count: u32,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a schedule (needs --model, a prompt, and --at or --rrule + --dtstart); prints its id
+    Create {
+        #[command(flatten)]
+        write: ScheduleWriteArgs,
+        /// MCP server id to attach (repeatable; set right after creation, see `monocle mcp ls`)
+        #[arg(long = "mcp-server", value_name = "ID")]
+        mcp_servers: Vec<String>,
+        /// Only print the next fire times; nothing is created
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a schedule: only the flags you pass change, everything else is kept
+    Update {
+        id: String,
+        #[command(flatten)]
+        write: ScheduleWriteArgs,
         /// Print the server's JSON body unchanged
         #[arg(long)]
         json: bool,
@@ -1029,6 +1206,7 @@ fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), 
 
 fn main() {
     let cli = Cli::parse();
+    let (explicit_profile, explicit_env) = (cli.profile.clone(), cli.env.clone());
     let client = Client::new();
     let home = util::home_dir();
     let config = Config::new();
@@ -1100,6 +1278,9 @@ fn main() {
         Commands::Status => {
             status_command(&creds, &home, &selection);
             Ok(())
+        }
+        Commands::Whoami { server, json } => {
+            whoami_command(&client, &creds, &selection, server, json)
         }
         Commands::Profile { command } => match command {
             ProfileCommands::List => profile_list_command(&config, &home),
@@ -1185,6 +1366,44 @@ fn main() {
                     }
                 }
             },
+        },
+        Commands::Schedule { command } => match command {
+            ScheduleCommand::List { json } => schedule_list_command(&client, &creds, &selection, json),
+            ScheduleCommand::Show { id, json } => {
+                schedule_show_command(&client, &creds, &selection, &id, None, json)
+            }
+            ScheduleCommand::Toggle { id, state, json } => schedule_show_command(
+                &client,
+                &creds,
+                &selection,
+                &id,
+                Some(matches!(state, Toggle::Enable)),
+                json,
+            ),
+            ScheduleCommand::Delete { id } => {
+                schedule_delete_command(&client, &creds, &selection, &id)
+            }
+            ScheduleCommand::Runs { id, limit, json, verify, run } => schedule_runs_command(
+                &client, &creds, &selection, &id, limit, json, verify.as_deref(), run.as_deref(),
+            ),
+            ScheduleCommand::McpServers { id, set, none, json } => match set {
+                Some(s) if s.is_empty() => Err(monocle_cli::error::AppError::new(
+                    "No servers given to --set: list server ids, or pass --none to clear the schedule's MCP servers.",
+                )),
+                None if none => schedule_mcp_command(&client, &creds, &selection, &id, Some(&[]), json),
+                s => schedule_mcp_command(&client, &creds, &selection, &id, s.as_deref(), json),
+            },
+            ScheduleCommand::Create { write, mcp_servers, dry_run, json } => {
+                schedule_create_command(&client, &creds, &selection, &write, &mcp_servers, dry_run, json)
+            }
+            ScheduleCommand::Update { id, write, json } => {
+                schedule_update_command(&client, &creds, &selection, &id, &write, json)
+            }
+            ScheduleCommand::Preview { recurrence, dtstart, run_at, timezone, count, json } => {
+                schedule_preview_command(
+                    &client, &creds, &selection, recurrence.as_deref(), dtstart, run_at, &timezone, count, json,
+                )
+            }
         },
         Commands::Knowledge { command } => match command {
             KnowledgeCommand::Create { name } => {
@@ -1272,7 +1491,9 @@ fn main() {
             }
             CraftCommand::Turn {
                 text,
+                interactive,
                 session,
+                continue_last,
                 workspace,
                 create_workspace,
                 agent,
@@ -1291,7 +1512,16 @@ fn main() {
                 no_delegation,
                 title,
                 TurnOpts {
-                    text,
+                    continue_last,
+                    last: None,
+                    hint_prefix: monocle_cli::commands::craft_turn::hint_prefix(
+                        lane == Lane::Sdk,
+                        explicit_profile.as_deref(),
+                        explicit_env.as_deref(),
+                    ),
+                    interactive,
+                    follow_up: false,
+                    text: text.unwrap_or_default(),
                     session,
                     workspace,
                     create_workspace,
@@ -1490,6 +1720,22 @@ fn run_image(client: &Client, creds: &Credentials, command: ImageCommands) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn craft_lane_parses_in_every_position() {
+        let lane = |args: &[&str]| match Cli::parse_from(args).command {
+            Commands::Craft { lane, .. } => lane,
+            _ => panic!("expected Craft command"),
+        };
+        for args in [
+            &["monocle", "craft", "--lane", "sdk", "turn", "x"][..],
+            &["monocle", "craft", "turn", "--lane", "sdk", "x"][..],
+            &["monocle", "craft", "session", "list", "--lane", "sdk"][..],
+        ] {
+            assert_eq!(lane(args), Lane::Sdk, "{args:?}");
+        }
+        assert_eq!(lane(&["monocle", "craft", "turn", "x"]), Lane::Openworker);
+    }
 
     #[test]
     fn chat_file_flag_repeats_into_vec() {

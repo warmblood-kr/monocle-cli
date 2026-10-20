@@ -26,7 +26,39 @@ pub enum Approve {
     Once,
 }
 
+/// `monocle craft [--lane sdk] [--profile P] [--env E] turn`: only flags the user passed.
+pub fn hint_prefix(sdk: bool, profile: Option<&str>, env: Option<&str>) -> String {
+    let mut s = String::from("monocle craft");
+    if sdk {
+        s.push_str(" --lane sdk");
+    }
+    if let Some(p) = profile {
+        s.push_str(&format!(" --profile {p}"));
+    }
+    if let Some(e) = env {
+        s.push_str(&format!(" --env {e}"));
+    }
+    s.push_str(" turn");
+    s
+}
+
+/// The runnable hint printed to stderr right after the session id.
+pub fn continue_hint(prefix: &str, id: &str) -> String {
+    format!("continue with: {prefix} --session {id} \"...\"")
+}
+
+#[derive(Clone)]
 pub struct TurnOpts {
+    /// `-i`: this turn is part of an interactive loop; the loop prints the continue hint once at the end.
+    pub interactive: bool,
+    /// A later turn of the loop on an already announced session: no `Session:` line.
+    pub follow_up: bool,
+    /// `--continue`: resolve `session` from the last session of this lane/profile/env.
+    pub continue_last: bool,
+    /// Records the session id for `--continue` once it is known.
+    pub last: Option<crate::craft_state::LastSession>,
+    /// Command prefix for the "continue with:" hint (see [`hint_prefix`]).
+    pub hint_prefix: String,
     pub text: String,
     pub session: Option<String>,
     pub workspace: Option<String>,
@@ -164,6 +196,15 @@ pub fn run_turn(
     opts: &TurnOpts,
     delegate: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
+    run_turn_id(t, opts, delegate).0
+}
+
+/// [`run_turn`] that also returns the session id once it is known (even on failure).
+pub fn run_turn_id(
+    t: &Target,
+    opts: &TurnOpts,
+    delegate: impl FnOnce(&str) -> Result<()>,
+) -> (Result<()>, Option<String>) {
     let deadline = Instant::now() + opts.timeout;
     let token = t.bearer.strip_prefix("Bearer ").unwrap_or(t.bearer);
     let r = Redactor::new(&[token]);
@@ -171,14 +212,29 @@ pub fn run_turn(
         opts.diagnostics_file.clone(),
         crate::instrument::host_of(t.base),
     );
-    let res = run_inner(t, opts, delegate, &r, deadline, &mut tm);
+    let mut sid = None;
+    let res = run_inner(t, opts, delegate, &r, deadline, &mut tm, &mut sid);
     t.client.set_request_cap(None);
     tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
     if opts.timings {
         eprintln!("{}", tm.line());
     }
+    if let Some(id) = &sid {
+        if let Some(last) = &opts.last {
+            last.set(id);
+        }
+        if !opts.interactive {
+            r.errln(&continue_hint(&opts.hint_prefix, id));
+        }
+    }
     // Server-provided text can sit inside any error: scrub at the boundary.
-    res.map_err(|e| AppError::new(r.scrub(&e.to_string())))
+    (res.map_err(|e| AppError::new(r.scrub(&e.to_string()))), sid)
+}
+
+/// The server refused the message (`input_rejected: queue_full`, craft#225) before
+/// accepting it, so sending it again cannot duplicate it.
+pub fn is_queue_full(e: &AppError) -> bool {
+    e.to_string().ends_with("(input_rejected): queue_full")
 }
 
 fn run_inner(
@@ -188,13 +244,17 @@ fn run_inner(
     r: &Redactor,
     deadline: Instant,
     tm: &mut Timings,
+    sid: &mut Option<String>,
 ) -> Result<()> {
     let id = match &opts.session {
         Some(s) if is_valid_chat_id(s) => s.clone(),
         Some(_) => return Err(AppError::new("Invalid session ID.")),
         None => new_session_id(),
     };
-    r.errln(&format!("Session: {id}"));
+    if !opts.follow_up {
+        r.errln(&format!("Session: {id}"));
+    }
+    *sid = Some(id.clone());
     if opts.delegates {
         tm.time_delegation(|| http(t, opts, deadline, || delegate(&id)))?;
     } else {

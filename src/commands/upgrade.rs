@@ -218,9 +218,8 @@ pub fn fetch_latest_version(
     };
     if !resp.ok() {
         return Err(AppError::new(format!(
-            "GitHub API error {}: {}",
-            resp.status,
-            resp.text()
+            "GitHub API error: HTTP {}",
+            resp.status
         )));
     }
     let tag = resp.json::<LatestRelease>()?.tag_name;

@@ -16,6 +16,14 @@ use crate::net::Client;
 use crate::socketio::{ws_origin, SocketIo};
 
 pub struct SdkTurn<'a> {
+    /// `-i`: the loop prints the continue hint once at the end.
+    pub interactive: bool,
+    /// A later turn of the loop on an announced session: no `Session:` line.
+    pub follow_up: bool,
+    /// Records the session id for `--continue` once it is known.
+    pub last: Option<&'a crate::craft_state::LastSession>,
+    /// Command prefix for the "continue with:" hint.
+    pub hint_prefix: &'a str,
     pub client: &'a Client,
     /// jarvice base from `auth::jarvice_url_for`.
     pub base: &'a str,
@@ -86,6 +94,15 @@ fn http<T>(t: &SdkTurn, deadline: Instant, call: impl FnOnce() -> Result<T>) -> 
 /// the socket connect, waiting for `active` and the turn all share it. Every
 /// byte printed goes through the [`Redactor`] (bearer + socket token).
 pub fn run(t: &SdkTurn) -> Result<()> {
+    run_id(t).0
+}
+
+/// [`run`] that also returns the session id once it is known (even on failure).
+pub fn run_id(t: &SdkTurn) -> (Result<()>, Option<String>) {
+    run_checked(t).unwrap_or_else(|e| (Err(e), None))
+}
+
+fn run_checked(t: &SdkTurn) -> Result<(Result<()>, Option<String>)> {
     // Vet the target before any request: nothing leaves the machine for a bad host.
     let origin = ws_origin(t.base)?;
     let id = match t.session {
@@ -99,14 +116,23 @@ pub fn run(t: &SdkTurn) -> Result<()> {
         t.diagnostics_file.clone(),
         crate::instrument::host_of(t.base),
     );
-    let res = run_inner(t, &origin, id, &mut r, deadline, &mut tm);
+    let mut sid = None;
+    let res = run_inner(t, &origin, id, &mut r, deadline, &mut tm, &mut sid);
     t.client.set_request_cap(None);
     tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
     if t.timings {
         eprintln!("{}", tm.line());
     }
+    if let Some(id) = &sid {
+        if let Some(last) = t.last {
+            last.set(id);
+        }
+        if !t.interactive {
+            r.errln(&super::craft_turn::continue_hint(t.hint_prefix, id));
+        }
+    }
     // Server-provided text can sit inside any error: scrub at the boundary.
-    res.map_err(|e| AppError::new(r.scrub(&e.to_string())))
+    Ok((res.map_err(|e| AppError::new(r.scrub(&e.to_string()))), sid))
 }
 
 fn run_inner(
@@ -116,6 +142,7 @@ fn run_inner(
     r: &mut Redactor,
     deadline: Instant,
     tm: &mut Timings,
+    sid: &mut Option<String>,
 ) -> Result<()> {
     let id = match id {
         Some(id) => id,
@@ -125,7 +152,10 @@ fn run_inner(
             })
         })?,
     };
-    r.errln(&format!("Session: {id}"));
+    if !t.follow_up {
+        r.errln(&format!("Session: {id}"));
+    }
+    *sid = Some(id.clone());
     let token = http(t, deadline, || {
         sdk::socket_token(t.client, t.base, t.bearer)
     })?;

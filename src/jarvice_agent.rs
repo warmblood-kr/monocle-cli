@@ -50,6 +50,16 @@ pub fn get_session(client: &Client, base: &str, bearer: &str, id: &str) -> Resul
     get(client, &url, bearer, "Showing session", id)?.json()
 }
 
+/// Whether the session exists: `GET` it; 404 is `false`, other failures are errors.
+pub fn session_exists(client: &Client, base: &str, bearer: &str, id: &str) -> Result<bool> {
+    let url = format!("{base}/api/v1/agent/sessions/{}", checked_id(id)?);
+    let resp = client.get(&url, &auth_headers(bearer))?;
+    match resp.status {
+        404 => Ok(false),
+        _ => check("Showing session", id, resp).map(|_| true),
+    }
+}
+
 /// `GET .../history/v2` (`{events[], event_count, in_flight}`); v1 (`entries[]`,
 /// always empty for cf worker sessions) is tried once, only if v2 is 404.
 pub fn history(client: &Client, base: &str, bearer: &str, id: &str) -> Result<Value> {
