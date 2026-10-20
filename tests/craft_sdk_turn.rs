@@ -33,7 +33,7 @@ fn peek_head(s: &TcpStream) -> String {
     }
 }
 
-fn serve_rest(mut s: TcpStream, log: &Log) {
+fn serve_rest(mut s: TcpStream, log: &Log, stall: Option<&str>) {
     let mut r = BufReader::new(s.try_clone().unwrap());
     let mut line = String::new();
     r.read_line(&mut line).unwrap();
@@ -63,6 +63,9 @@ fn serve_rest(mut s: TcpStream, log: &Log) {
         "{key} auth={auth} body={}",
         String::from_utf8_lossy(&body)
     ));
+    if stall == Some(key.as_str()) {
+        thread::sleep(Duration::from_secs(10));
+    }
     let (status, resp) = match key.as_str() {
         "POST /api/v1/agent/sessions" => (200, r#"{"id":"sess-1","title":"t"}"#.to_string()),
         "GET /api/v1/auths/" => (200, format!(r#"{{"token":"{SOCKTOK}","role":"admin"}}"#)),
@@ -76,6 +79,11 @@ fn serve_rest(mut s: TcpStream, log: &Log) {
 }
 
 fn start(script: Script) -> (String, Log) {
+    start_with(script, None)
+}
+
+/// `stall`: a `METHOD /path` whose response is delayed 10s.
+fn start_with(script: Script, stall: Option<&'static str>) -> (String, Log) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let log = Log::default();
@@ -100,7 +108,7 @@ fn start(script: Script) -> (String, Log) {
                         script(&mut sock, &log);
                     }
                 } else {
-                    serve_rest(s, &log);
+                    serve_rest(s, &log, stall);
                 }
             });
         }
@@ -425,4 +433,179 @@ fn non_allowlisted_host_is_refused_before_any_request() {
     no_secret(&o);
     thread::sleep(Duration::from_millis(200));
     assert!(lines(&log).is_empty(), "{addr}: {:?}", lines(&log));
+}
+
+// ---- redaction and the overall deadline ----
+
+/// Both secrets, a few spellings: whole in a delta, in a `text`, in an error message.
+fn reflect_script(secret: &'static str) -> Script {
+    Arc::new(move |s, log| {
+        handshake(s, log);
+        recv(s, log);
+        status(s, "active");
+        recv(s, log);
+        delta(s, &format!("a {secret} b"));
+        ev(
+            s,
+            "text",
+            &format!(r#"{{"session_id":"sess-1","content":"t {secret}"}}"#),
+        );
+        ev(
+            s,
+            "thinking",
+            &format!(r#"{{"session_id":"sess-1","content":"{secret}"}}"#),
+        );
+        ev(
+            s,
+            "error",
+            &format!(r#"{{"session_id":"sess-1","message":"boom {secret}"}}"#),
+        );
+    })
+}
+
+#[test]
+fn reflected_tokens_never_reach_stdout_or_stderr() {
+    for secret in [SOCKTOK, ACCESS] {
+        for json in [false, true] {
+            let (addr, _) = start(reflect_script(secret));
+            let home = setup(&addr);
+            let args: &[&str] = if json { &["x", "--json"] } else { &["x"] };
+            let o = turn(home.path(), args);
+            no_secret(&o);
+            let (so, se) = (out(&o), err(&o));
+            assert!(so.contains("[REDACTED]"), "{secret} json={json}: {so}");
+            if json {
+                for l in so.lines() {
+                    serde_json::from_str::<serde_json::Value>(l).unwrap();
+                }
+            }
+            assert!(!se.contains(secret));
+        }
+    }
+}
+
+/// Token split in two across `text_delta` frames: whole token never printed.
+#[test]
+fn token_split_across_deltas_is_redacted() {
+    for secret in [SOCKTOK, ACCESS] {
+        for json in [false, true] {
+            let (a, b) = secret.split_at(secret.len() / 2);
+            let (a, b) = (a.to_string(), b.to_string());
+            let (addr, _) = start(Arc::new(move |s, log| {
+                handshake(s, log);
+                recv(s, log);
+                status(s, "active");
+                recv(s, log);
+                delta(s, &format!("pre {a}"));
+                delta(s, &format!("{b} post"));
+                ev(s, "result", r#"{"session_id":"sess-1","success":true}"#);
+            }));
+            let home = setup(&addr);
+            let args: &[&str] = if json { &["x", "--json"] } else { &["x"] };
+            let o = turn(home.path(), args);
+            assert!(o.status.success(), "{}", err(&o));
+            no_secret(&o);
+            let so = out(&o);
+            if json {
+                let joined: String = so
+                    .lines()
+                    .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                    .filter(|v| v["event"] == "text_delta")
+                    .map(|v| v["data"]["content"].as_str().unwrap().to_string())
+                    .collect();
+                assert_eq!(joined, "pre [REDACTED] post");
+            } else {
+                assert_eq!(so, "pre [REDACTED] post\n");
+            }
+        }
+    }
+}
+
+/// Secret prefix streamed in a delta, its rest in an `error` message (--json line).
+#[test]
+fn prefix_in_delta_suffix_in_error_message_is_redacted() {
+    for json in [false, true] {
+        let (a, b) = SOCKTOK.split_at(6);
+        let (a, b) = (a.to_string(), b.to_string());
+        let (addr, _) = start(Arc::new(move |s, log| {
+            handshake(s, log);
+            recv(s, log);
+            status(s, "active");
+            recv(s, log);
+            delta(s, &format!("pre {a}"));
+            ev(
+                s,
+                "error",
+                &format!(r#"{{"session_id":"sess-1","message":"{b} tail"}}"#),
+            );
+        }));
+        let home = setup(&addr);
+        let args: &[&str] = if json { &["x", "--json"] } else { &["x"] };
+        let o = turn(home.path(), args);
+        assert!(!o.status.success());
+        no_secret(&o);
+        let all = format!("{}{}", out(&o), err(&o));
+        assert!(!all.contains(&SOCKTOK[6..]), "json={json}: {all}");
+        assert!(all.contains("[REDACTED]"), "json={json}: {all}");
+    }
+}
+
+/// A held-back tail is emitted at timeout (the hold-back must not eat the text).
+#[test]
+fn timeout_flushes_held_back_tail() {
+    for json in [false, true] {
+        let (addr, _) = start(Arc::new(|s, log| {
+            handshake(s, log);
+            recv(s, log);
+            status(s, "active");
+            recv(s, log);
+            delta(s, "partial answer");
+            while recv(s, log).is_some() {}
+        }));
+        let home = setup(&addr);
+        let args: &[&str] = if json {
+            &["x", "--timeout", "1", "--json"]
+        } else {
+            &["x", "--timeout", "1"]
+        };
+        let o = turn(home.path(), args);
+        assert!(!o.status.success());
+        assert!(err(&o).contains("Timed out after 1s"), "{}", err(&o));
+        assert!(
+            out(&o).contains("partial answer") || {
+                // --json re-chunks: the pieces must add up
+                out(&o)
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .filter_map(|v| v["data"]["content"].as_str().map(str::to_string))
+                    .collect::<String>()
+                    .contains("partial answer")
+            },
+            "json={json}: {}",
+            out(&o)
+        );
+    }
+}
+
+#[test]
+fn stalled_http_calls_respect_the_overall_deadline() {
+    for stall in ["POST /api/v1/agent/sessions", "GET /api/v1/auths/"] {
+        let (addr, log) = start_with(happy(), Some(stall));
+        let home = setup(&addr);
+        let t0 = Instant::now();
+        let o = turn(home.path(), &["x", "--timeout", "2"]);
+        let took = t0.elapsed();
+        assert!(!o.status.success());
+        assert!(took < Duration::from_millis(3500), "{stall}: {took:?}");
+        assert!(
+            err(&o).contains("Timed out after 2s"),
+            "{stall}: {}",
+            err(&o)
+        );
+        assert!(
+            !lines(&log).iter().any(|l| l.starts_with("WS connect")),
+            "{stall}: {:?}",
+            lines(&log)
+        );
+    }
 }

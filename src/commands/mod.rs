@@ -13,6 +13,7 @@ pub mod image_generate;
 pub mod knowledge;
 pub mod login;
 pub mod model_list;
+pub mod redact;
 pub mod repl;
 pub mod setup;
 pub mod status;

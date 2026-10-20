@@ -3,11 +3,11 @@
 //! the exit code. The socket token (a credential) lives in memory only: fetched,
 //! sent as the connect auth to the tenant's own `/ws/socket.io/`, then dropped.
 
-use std::io::Write;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::commands::redact::Redactor;
 use crate::error::{AppError, Result};
 use crate::jarvice_agent as sdk;
 use crate::jarvice_chats::is_valid_chat_id;
@@ -40,11 +40,6 @@ const KNOWN_ERRORS: [&str; 10] = [
     "Failed to reconnect session",
 ];
 
-fn out(t: &str) {
-    print!("{t}");
-    let _ = std::io::stdout().flush();
-}
-
 fn short(v: &Value) -> String {
     let t = v
         .as_str()
@@ -58,48 +53,140 @@ fn short(v: &Value) -> String {
         .collect()
 }
 
+fn timed_out(t: &SdkTurn) -> AppError {
+    AppError::new(format!(
+        "Timed out after {}s waiting for the turn.",
+        t.timeout.as_secs()
+    ))
+}
+
+/// One HTTP call under the overall deadline: it gets what is left (never more
+/// than its normal cap); a failure at/after the deadline is reported as the timeout.
+fn http<T>(t: &SdkTurn, deadline: Instant, call: impl FnOnce() -> Result<T>) -> Result<T> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(timed_out(t));
+    }
+    t.client.set_request_cap(Some(left));
+    let r = call();
+    let left = deadline.saturating_duration_since(Instant::now());
+    // The request's own timer can fire a hair before our clock does.
+    match r {
+        Err(_) if left < Duration::from_millis(200) => Err(timed_out(t)),
+        r => r,
+    }
+}
+
+/// `--timeout` is ONE deadline from here on: session creation, the token fetch,
+/// the socket connect, waiting for `active` and the turn all share it. Every
+/// byte printed goes through the [`Redactor`] (bearer + socket token).
 pub fn run(t: &SdkTurn) -> Result<()> {
     // Vet the target before any request: nothing leaves the machine for a bad host.
     let origin = ws_origin(t.base)?;
     let id = match t.session {
-        Some(s) if is_valid_chat_id(s) => s.to_string(),
+        Some(s) if is_valid_chat_id(s) => Some(s.to_string()),
         Some(_) => return Err(AppError::new("Invalid session ID.")),
-        None => sdk::create_session(t.client, t.base, t.bearer, t.title.unwrap_or("CLI turn"))?,
+        None => None,
     };
-    eprintln!("Session: {id}");
     let deadline = Instant::now() + t.timeout;
-    let step = Duration::from_secs(15).min(t.timeout);
-    let mut sock = {
-        let token = sdk::socket_token(t.client, t.base, t.bearer)?;
-        SocketIo::connect(&origin, &token, step)? // token dropped here
+    let mut r = Redactor::new(&[t.bearer.strip_prefix("Bearer ").unwrap_or(t.bearer)]);
+    let res = run_inner(t, &origin, id, &mut r, deadline);
+    t.client.set_request_cap(None);
+    // Server-provided text can sit inside any error: scrub at the boundary.
+    res.map_err(|e| AppError::new(r.scrub(&e.to_string())))
+}
+
+fn run_inner(
+    t: &SdkTurn,
+    origin: &str,
+    id: Option<String>,
+    r: &mut Redactor,
+    deadline: Instant,
+) -> Result<()> {
+    let id = match id {
+        Some(id) => id,
+        None => http(t, deadline, || {
+            sdk::create_session(t.client, t.base, t.bearer, t.title.unwrap_or("CLI turn"))
+        })?,
     };
-    let r = drive(t, &id, &mut sock, deadline);
-    if matches!(&r, Err(e) if e.to_string().starts_with("Timed out")) {
+    r.errln(&format!("Session: {id}"));
+    let token = http(t, deadline, || {
+        sdk::socket_token(t.client, t.base, t.bearer)
+    })?;
+    r.add_secret(&token); // in memory only; redacted from the moment it exists
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(timed_out(t));
+    }
+    let mut sock =
+        SocketIo::connect(origin, &token, left.min(Duration::from_secs(15))).map_err(|e| {
+            if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(200) {
+                timed_out(t)
+            } else {
+                e
+            }
+        })?;
+    drop(token);
+    let res = drive(t, r, &id, &mut sock, deadline);
+    // Every exit (result, error, timeout, interrupt) flushes the held-back tail.
+    flush(t, r, &id);
+    if matches!(&res, Err(e) if e.to_string().starts_with("Timed out")) {
         let _ = sock.emit("interrupt", &json!({"session_id": id}));
     }
     sock.close();
-    r
+    res
 }
 
-fn drive(t: &SdkTurn, id: &str, sock: &mut SocketIo, deadline: Instant) -> Result<()> {
+/// Emit the held-back stream tail: raw text, or a synthetic `text_delta` line.
+fn flush(t: &SdkTurn, r: &Redactor, id: &str) -> bool {
+    let tail = r.take_tail();
+    if tail.is_empty() {
+        return false;
+    }
+    if t.json {
+        let ev = json!({"event": "text_delta", "data": {"session_id": id, "content": tail}});
+        r.out(&format!("{ev}\n"));
+    } else {
+        r.out(&tail);
+    }
+    true
+}
+
+fn drive(
+    t: &SdkTurn,
+    r: &Redactor,
+    id: &str,
+    sock: &mut SocketIo,
+    deadline: Instant,
+) -> Result<()> {
     sock.emit("start_session", &json!({"session_id": id}))?;
     let (mut sent, mut deltas, mut wrote) = (false, false, false);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(AppError::new(format!(
-                "Timed out after {}s waiting for the turn.",
-                t.timeout.as_secs()
-            )));
+            return Err(timed_out(t));
         }
-        let Some((name, data)) = sock.next_event(left.min(Duration::from_secs(5)))? else {
+        let Some((name, mut data)) = sock.next_event(left.min(Duration::from_secs(5)))? else {
             continue;
         };
         if data["session_id"].as_str().is_some_and(|s| s != id) {
             continue;
         }
         if t.json {
-            println!("{}", json!({"event": name, "data": data}));
+            match name.as_str() {
+                // Re-chunk the delta text from the same scrubbed stream.
+                "text_delta" => {
+                    if let Some(c) = data["content"].as_str() {
+                        data["content"] = json!(r.delta(c));
+                    }
+                }
+                "text" | "error" | "result" | "interrupted" | "reconnect_failed" => {
+                    flush(t, r, id);
+                    r.lead_json(&mut data);
+                }
+                _ => {}
+            }
+            r.out(&format!("{}\n", json!({"event": name, "data": data})));
         }
         let content = data["content"].as_str().unwrap_or("");
         match name.as_str() {
@@ -111,28 +198,29 @@ fn drive(t: &SdkTurn, id: &str, sock: &mut SocketIo, deadline: Instant) -> Resul
                         sent = true;
                     }
                 } else {
-                    eprintln!("[session_status] {}", short(&data["status"]));
+                    r.errln(&format!("[session_status] {}", short(&data["status"])));
                 }
             }
             "text_delta" => {
                 deltas = true;
                 if !t.json {
-                    out(content);
+                    // (--json: `content` was already replaced by the scrubbed chunk)
+                    r.out(&r.delta(content));
                     wrote = true;
                 }
             }
             "text" if !deltas => {
                 if !t.json {
-                    out(content);
+                    r.out(&r.lead(content));
                     wrote = true;
                 }
             }
-            "tool_use" => eprintln!(
+            "tool_use" => r.errln(&format!(
                 "[tool_use] {} {}",
                 short(&data["tool_name"]),
                 short(&data["tool_input"])
-            ),
-            "tool_result" => eprintln!("[tool_result]"),
+            )),
+            "tool_result" => r.errln("[tool_result]"),
             "error" => {
                 let m = data["message"].as_str().unwrap_or("");
                 let m = KNOWN_ERRORS
@@ -145,8 +233,9 @@ fn drive(t: &SdkTurn, id: &str, sock: &mut SocketIo, deadline: Instant) -> Resul
             "reconnect_failed" => return Err(AppError::new("Session reconnect failed.")),
             "interrupted" => return Err(AppError::new("The turn was interrupted.")),
             "result" => {
+                flush(t, r, id);
                 if wrote {
-                    out("\n");
+                    r.out("\n");
                 }
                 return if data["success"].as_bool() == Some(false) {
                     Err(AppError::new("The turn finished unsuccessfully."))
