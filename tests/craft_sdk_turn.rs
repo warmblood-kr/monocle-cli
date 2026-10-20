@@ -703,6 +703,7 @@ fn timings_does_not_change_json_stdout() {
     assert!(a.status.success() && b.status.success());
     assert_eq!(a.stdout, b.stdout);
     assert!(err(&b).contains(r#"{"timings""#));
+}
 
 fn diag_events(path: &Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(path)

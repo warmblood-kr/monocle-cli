@@ -338,6 +338,10 @@ struct RouterChatArgs {
     /// (piped stdin) only — see also inband `file:<path>` tokens in the text.
     #[arg(long = "file")]
     file: Vec<String>,
+    /// One-shot only: print one JSON timings line to stderr (stdout unchanged). Streamed, so
+    /// ttfe = ttft = first answer chunk after the request is sent; total = stream end
+    #[arg(long)]
+    timings: bool,
 }
 
 impl From<RouterChatArgs> for ChatOptions {
@@ -353,7 +357,7 @@ impl From<RouterChatArgs> for ChatOptions {
             tool_ids: Vec::new(),
             verify_tool_firing: None,
             show_tools: false,
-            timings: false,
+            timings: a.timings,
             diagnostics_file: None,
         }
     }

@@ -53,6 +53,8 @@ pub enum Lane {
     Openworker,
     Sdk,
     Chat,
+    /// `monocle router chat` (streamed `/v1/chat/completions`).
+    Router,
 }
 
 /// 16 hex chars from the CSPRNG. Random, non-secret, correlation only.
@@ -386,7 +388,7 @@ mod tests {
             ErrorKind::Server,
             ErrorKind::Other,
         ];
-        for lane in [Lane::Openworker, Lane::Sdk, Lane::Chat] {
+        for lane in [Lane::Openworker, Lane::Sdk, Lane::Chat, Lane::Router] {
             for event in [
                 Connect,
                 Delegation,

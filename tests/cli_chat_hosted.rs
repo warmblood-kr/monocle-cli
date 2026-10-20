@@ -273,3 +273,27 @@ fn chat_diagnostics_file_has_no_content() {
     assert_eq!(names, ["first_event", "first_text", "done"]);
     assert_eq!(ev[0]["lane"], "chat");
 }
+
+#[test]
+fn router_chat_timings_line_on_stderr_only() {
+    let (stub, _) = counting_stub();
+    let home = logged_in_home(&stub);
+    let plain = run_piped(home.path(), &["router", "chat"]);
+    let timed = run_piped(home.path(), &["router", "chat", "--timings"]);
+    assert_eq!(timed.status.code(), Some(0), "{}", stderr(&timed));
+    assert_eq!(stdout(&plain), stdout(&timed));
+    assert!(!stderr(&plain).contains(r#"{"timings""#));
+    let e = stderr(&timed);
+    let l = e
+        .lines()
+        .find(|l| l.starts_with(r#"{"timings""#))
+        .expect(&e);
+    let t = &serde_json::from_str::<serde_json::Value>(l).unwrap()["timings"];
+    assert_eq!(t["lane"], "router");
+    let n = |k: &str| {
+        t[k].as_u64()
+            .unwrap_or_else(|| panic!("{k} missing in {t}"))
+    };
+    assert!(n("ttfe_ms") <= n("ttft_ms") && n("ttft_ms") <= n("total_ms"));
+    assert!(!l.contains("router answer") && !l.contains("Bearer"));
+}

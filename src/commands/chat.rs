@@ -85,6 +85,7 @@ fn call_chat(
     max_tokens: Option<i64>,
     images: &[ImageAttachment],
     files: &[FileAttachment],
+    mut tm: Option<&mut Timings>,
 ) -> Result<(ChatResponse, Option<Duration>)> {
     let req = ChatRequest {
         model: model.to_string(),
@@ -100,9 +101,15 @@ fn call_chat(
     let mut out = std::io::stdout().lock();
     let started = std::time::Instant::now();
     let mut ttfb: Option<Duration> = None;
+    if let Some(tm) = tm.as_deref_mut() {
+        tm.sent();
+    }
     let resp = provider.chat_stream(&req, &mut |delta| {
         if ttfb.is_none() {
             ttfb = Some(started.elapsed());
+            if let Some(tm) = tm.as_deref_mut() {
+                tm.text();
+            }
         }
         let _ = out.write_all(delta.as_bytes());
         let _ = out.flush();
@@ -323,6 +330,8 @@ pub fn chat_command(client: &Client, creds: &Credentials, options: ChatOptions) 
 /// this REPL accumulating the growing conversation itself (see `convo` below)
 /// and resending it in full each turn.
 fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptions) -> Result<()> {
+    // Starts with the command (see `run_responses_chat`); one-shot only.
+    let mut tm = Timings::new(Lane::Router);
     let mut model = options
         .model
         .as_deref()
@@ -420,7 +429,24 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
         }
         messages.push(Message::user(&text));
         // One-shot mode has no `/diag` to show — TTFB is discarded here.
-        let (resp, _ttfb) = call_chat(&provider, &model, messages, max_tokens, &images, &files)?;
+        let res = call_chat(
+            &provider,
+            &model,
+            messages,
+            max_tokens,
+            &images,
+            &files,
+            options.timings.then_some(&mut tm),
+        );
+        tm.finish(
+            res.as_ref()
+                .err()
+                .map(|e| ErrorKind::classify(&e.to_string())),
+        );
+        if options.timings {
+            eprintln!("{}", tm.line());
+        }
+        let (resp, _ttfb) = res?;
         if let Some(msg) = dropped_tool_calls_message(&resp.tool_calls, 0, "monocle chat") {
             eprintln!("{msg}");
         }
@@ -542,6 +568,7 @@ fn run_completions_chat(client: &Client, creds: &Credentials, options: ChatOptio
             max_tokens,
             &images,
             &files,
+            None,
         ) {
             Ok((resp, ttfb)) => {
                 diagnostics = Some(TurnDiagnostics::for_chat(

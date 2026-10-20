@@ -1065,7 +1065,9 @@ fn timings_does_not_change_json_stdout() {
     assert!(a.status.success() && b.status.success());
     assert_eq!(a.stdout, b.stdout);
     assert!(timings_line(&b).is_some());
+}
 
+#[test]
 fn diagnostics_file_records_phases_without_token_or_content() {
     let (addr, _) = start(happy(), Arc::new(rest_default));
     let home = setup(&addr);
