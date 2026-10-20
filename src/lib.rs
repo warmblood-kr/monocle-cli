@@ -27,3 +27,4 @@ pub mod refresh;
 pub mod responses_api;
 pub mod update_notice;
 pub mod util;
+pub mod ws;

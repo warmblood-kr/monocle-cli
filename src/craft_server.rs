@@ -296,3 +296,55 @@ pub fn attach_delegation(
     }
     Ok(v)
 }
+
+/// WebSocket origin (`wss://host` / `ws://loopback:port`) for a base from
+/// [`base_url`]. The WS handshake carries the access token, so beyond `base_url`'s
+/// checks a non-loopback host must be https on the default port; nothing else maps.
+pub fn ws_from_base(base: &str) -> Result<String> {
+    let bad =
+        || AppError::new("Refusing WebSocket URL: need https on the default port, or loopback.");
+    let (scheme, host, port) = url_parts(base).ok_or_else(bad)?;
+    let rest = &base[scheme.len() + 3..];
+    match (scheme, host) {
+        (_, "localhost" | "127.0.0.1" | "::1") => Ok(format!(
+            "{}://{rest}",
+            if scheme == "https" { "wss" } else { "ws" }
+        )),
+        ("https", STG_HOST | PRD_HOST) if matches!(port, None | Some("443")) => {
+            Ok(format!("wss://{rest}"))
+        }
+        _ => Err(bad()),
+    }
+}
+
+/// [`base_url`] mapped through [`ws_from_base`].
+pub fn ws_base(environment: &str) -> Result<String> {
+    ws_from_base(&base_url(environment)?)
+}
+
+#[cfg(test)]
+mod ws_tests {
+    use super::*;
+
+    #[test]
+    fn ws_origin_only_for_https_default_port_or_loopback() {
+        assert_eq!(
+            ws_from_base("https://craft-stg.monocle-ai.com").unwrap(),
+            "wss://craft-stg.monocle-ai.com"
+        );
+        assert_eq!(
+            ws_from_base("http://127.0.0.1:8080").unwrap(),
+            "ws://127.0.0.1:8080"
+        );
+        assert_eq!(ws_from_base("http://[::1]:1").unwrap(), "ws://[::1]:1");
+        for bad in [
+            "http://craft.monocle-ai.com",
+            "https://craft.monocle-ai.com:8443",
+            "https://evil.example",
+            "http://evil.example",
+            "https://user@craft.monocle-ai.com",
+        ] {
+            assert!(ws_from_base(bad).is_err(), "{bad}");
+        }
+    }
+}

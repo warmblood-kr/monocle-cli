@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::auth::get_access_token;
 use crate::commands::chat::resolve_jarvice;
+use crate::commands::craft_turn::{run_turn, Target, TurnOpts};
 use crate::commands::knowledge::print_table;
 use crate::craft_server as craft;
 use crate::credentials::Credentials;
@@ -416,6 +417,33 @@ fn delegate(
         text(&r["expires_at"])
     );
     Ok(())
+}
+
+/// `craft turn`: hosts are vetted (REST base and WS origin) before anything is
+/// sent; delegation (unless skipped) goes first, then the socket.
+pub fn craft_turn_command(
+    client: &Client,
+    creds: &Credentials,
+    selection: &Selection,
+    lane: Lane,
+    no_delegation: bool,
+    opts: TurnOpts,
+) -> Result<()> {
+    openworker_only(lane, "`craft turn`")?;
+    let ws_base = craft::ws_base(&selection.environment)?;
+    let (base, bearer) = connect(client, creds, selection, lane)?;
+    let target = Target {
+        client,
+        base: &base,
+        ws_base: &ws_base,
+        bearer: &bearer,
+    };
+    run_turn(&target, &opts, |id| {
+        if no_delegation {
+            return Ok(());
+        }
+        delegate(client, creds, selection, lane, id, false)
+    })
 }
 
 pub fn craft_workspace_command(
