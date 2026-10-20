@@ -290,3 +290,25 @@ fn thread_errors_never_echo_the_body() {
         assert!(err(&o).contains("HTTP 401") && !err(&o).contains("SECRET_MARKER"));
     }
 }
+
+#[test]
+fn unsafe_detail_codes_are_dropped_from_errors() {
+    // A credential or free text reflected into `detail.code` must not be printed.
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjEifQ.c2lnbmF0dXJl";
+    for code in [
+        format!("{jwt}{jwt}"),
+        "two words".to_string(),
+        "a".repeat(65),
+    ] {
+        let seen = Seen::default();
+        let body = format!(r#"{{"detail":{{"code":"{code}"}}}}"#);
+        let addr = stub(&seen, 401, Box::leak(body.into_boxed_str()));
+        let (o, _s, _h) = run(&addr, &["mcp", "enable", "x"]);
+        let e = err(&o);
+        assert!(e.contains("HTTP 401") && !e.contains(&code), "{e}");
+        assert!(
+            e.contains("Updating the MCP server failed: HTTP 401."),
+            "{e}"
+        );
+    }
+}

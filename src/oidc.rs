@@ -124,7 +124,7 @@ pub fn discover_oidc(client: &Client, domain: &str) -> Result<OIDCConfig> {
         )));
     }
 
-    let doc: DiscoveryDoc = resp.json()?;
+    let doc: DiscoveryDoc = resp.json_redacted("OIDC Discovery")?;
 
     match (doc.authorization_endpoint, doc.token_endpoint, doc.issuer) {
         (Some(authorization_endpoint), Some(token_endpoint), Some(issuer)) => Ok(OIDCConfig {

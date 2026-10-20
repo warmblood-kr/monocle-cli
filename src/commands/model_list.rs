@@ -52,9 +52,8 @@ fn fetch_models_with_session(client: &Client, session: &AuthSession) -> Result<V
 
     if !resp.ok() {
         return Err(AppError::new(format!(
-            "API error {}: {}",
-            resp.status,
-            resp.text()
+            "API error: {}",
+            crate::jarvice_knowledge::status_label(resp.status, &resp.text())
         )));
     }
 

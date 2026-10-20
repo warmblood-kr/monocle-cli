@@ -65,7 +65,7 @@ pub fn refresh_access_token(
         )));
     }
 
-    let token: TokenResponse = resp.json()?;
+    let token: TokenResponse = resp.json_redacted("Token refresh")?;
 
     let now = now_ms();
     let access_expires = to_iso(now + token.expires_in.unwrap_or(3600) * 1000);

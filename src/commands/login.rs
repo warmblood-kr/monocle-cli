@@ -239,13 +239,9 @@ fn handle_callback(
     };
 
     if let Some(err) = get("error") {
-        let desc = get("error_description")
-            .filter(|s| !s.is_empty())
-            .unwrap_or(err);
-        respond_html(req, &error_html(&desc));
-        return Some(Browser::Fatal(AppError::new(format!(
-            "Authorization failed: {desc}"
-        ))));
+        let msg = callback_error_message(&err);
+        respond_html(req, &error_html(&msg));
+        return Some(Browser::Fatal(AppError::new(msg)));
     }
 
     if get("state").as_deref() != Some(state) {
@@ -285,17 +281,12 @@ fn handle_callback(
     };
 
     if !resp.ok() {
-        let err_text = resp
-            .json::<Value>()
-            .ok()
-            .and_then(|v| serde_json::to_string(&v).ok())
-            .unwrap_or_else(|| "{}".to_string());
-        let msg = format!("Token exchange failed (HTTP {}): {err_text}", resp.status);
+        let msg = exchange_failed_message(resp.status, &resp.text());
         respond_html(req, &error_html(&msg));
         return Some(Browser::Fatal(AppError::new(msg)));
     }
 
-    let token: TokenResponse = match resp.json() {
+    let token: TokenResponse = match resp.json_redacted("Token exchange") {
         Ok(t) => t,
         Err(e) => {
             respond_html(req, &error_html(&e.to_string()));
@@ -363,7 +354,7 @@ fn device_code_login(
             resp.status
         )));
     }
-    let device: DeviceAuthResponse = resp.json()?;
+    let device: DeviceAuthResponse = resp.json_redacted("Device authorization")?;
 
     eprintln!();
     eprintln!("{}", c::bold("To authenticate, visit:"));
@@ -424,7 +415,7 @@ fn poll_for_token(
         )?;
 
         if resp.ok() {
-            return resp.json();
+            return resp.json_redacted("Token polling");
         }
 
         let val = resp.json::<Value>().ok();
@@ -449,25 +440,10 @@ fn poll_for_token(
                     "Authorization request was denied by the user.",
                 ))
             }
-            Some(e) => {
-                let desc = val
-                    .as_ref()
-                    .and_then(|v| v.get("error_description"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                return Err(AppError::new(format!("Token polling failed: {e} - {desc}")));
-            }
+            Some(e) => return Err(AppError::new(poll_failed_message(e))),
             None => {
-                let raw = resp.text();
-                let snippet: String = raw.chars().take(200).collect();
-                let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-                let snippet = if snippet.is_empty() {
-                    "(empty)".to_string()
-                } else {
-                    snippet
-                };
                 return Err(AppError::new(format!(
-                    "Token polling failed: server returned HTTP {} with non-OAuth response. Body: {snippet}",
+                    "Token polling failed: server returned HTTP {} with non-OAuth response.",
                     resp.status
                 )));
             }
@@ -477,6 +453,38 @@ fn poll_for_token(
     Err(AppError::new(
         "Device code expired. Please run login again.",
     ))
+}
+
+/// Redirect `error` is shown only if safe; `error_description` is never shown.
+fn callback_error_message(error: &str) -> String {
+    if crate::jarvice_knowledge::is_safe_code(error) {
+        format!("Authorization failed: {error}")
+    } else {
+        "Authorization failed.".to_string()
+    }
+}
+
+/// `HTTP <status>`, plus the OAuth `error` code if safe. The body is only
+/// inspected, never echoed (it may carry tokens).
+fn exchange_failed_message(status: u16, body: &str) -> String {
+    let code = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(Value::as_str).map(String::from))
+        .filter(|e| crate::jarvice_knowledge::is_safe_code(e));
+    match code {
+        Some(c) => format!("Token exchange failed (HTTP {status}): {c}"),
+        None => format!("Token exchange failed (HTTP {status})"),
+    }
+}
+
+/// Server-controlled OAuth `error` is shown only if it is a safe code;
+/// `error_description` is never shown.
+fn poll_failed_message(error: &str) -> String {
+    if crate::jarvice_knowledge::is_safe_code(error) {
+        format!("Token polling failed: {error}")
+    } else {
+        "Token polling failed.".to_string()
+    }
 }
 
 fn build_creds(
@@ -546,4 +554,47 @@ fn print_login_success(email: &str, tenant_name: &str, leading_newline: bool) {
         c::bold("monocle setup"),
         c::dim(".)")
     );
+}
+
+#[cfg(test)]
+mod poll_message_tests {
+    use super::{callback_error_message, exchange_failed_message, poll_failed_message};
+
+    #[test]
+    fn callback_and_exchange_never_echo_server_text() {
+        let m = "SECRET-TOKEN-MARKER";
+        assert_eq!(
+            callback_error_message("access_denied"),
+            "Authorization failed: access_denied"
+        );
+        assert_eq!(
+            callback_error_message(&format!("bad {m}")),
+            "Authorization failed."
+        );
+        let body = format!(
+            r#"{{"error":"invalid_grant","error_description":"{m}","access_token":"{m}"}}"#
+        );
+        assert_eq!(
+            exchange_failed_message(400, &body),
+            "Token exchange failed (HTTP 400): invalid_grant"
+        );
+        let body = format!(r#"{{"error":"{m} x","error_description":"{m}"}}"#);
+        assert_eq!(
+            exchange_failed_message(500, &body),
+            "Token exchange failed (HTTP 500)"
+        );
+        assert_eq!(
+            exchange_failed_message(502, m),
+            "Token exchange failed (HTTP 502)"
+        );
+    }
+
+    #[test]
+    fn unsafe_error_is_omitted() {
+        assert_eq!(
+            poll_failed_message("invalid_grant"),
+            "Token polling failed: invalid_grant"
+        );
+        assert_eq!(poll_failed_message("Bearer eyJ x"), "Token polling failed.");
+    }
 }
