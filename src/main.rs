@@ -34,8 +34,9 @@ use monocle_cli::commands::mcp::{
 };
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::schedule::{
-    schedule_delete_command, schedule_list_command, schedule_mcp_command, schedule_preview_command,
-    schedule_runs_command, schedule_show_command,
+    schedule_create_command, schedule_delete_command, schedule_list_command, schedule_mcp_command,
+    schedule_preview_command, schedule_runs_command, schedule_show_command,
+    schedule_update_command, WriteArgs as ScheduleWriteArgs,
 };
 use monocle_cli::commands::setup::setup_command;
 use monocle_cli::commands::status::status_command;
@@ -80,7 +81,7 @@ Commands:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
     mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
-    schedule Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview)
+    schedule Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview, create, update)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
     craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
 
@@ -171,7 +172,7 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommand,
     },
-    /// Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview)
+    /// Inspect and manage your schedules (list, show, toggle, delete, runs, mcp-servers, preview, create, update)
     Schedule {
         #[command(subcommand)]
         command: ScheduleCommand,
@@ -706,6 +707,29 @@ enum ScheduleCommand {
         /// How many fire times
         #[arg(long, default_value_t = 5)]
         count: u32,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a schedule (needs --model, a prompt, and --at or --rrule + --dtstart); prints its id
+    Create {
+        #[command(flatten)]
+        write: ScheduleWriteArgs,
+        /// MCP server id to attach (repeatable; set right after creation, see `monocle mcp ls`)
+        #[arg(long = "mcp-server", value_name = "ID")]
+        mcp_servers: Vec<String>,
+        /// Only print the next fire times; nothing is created
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the server's JSON body unchanged
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a schedule: only the flags you pass change, everything else is kept
+    Update {
+        id: String,
+        #[command(flatten)]
+        write: ScheduleWriteArgs,
         /// Print the server's JSON body unchanged
         #[arg(long)]
         json: bool,
@@ -1308,6 +1332,12 @@ fn main() {
                 None if none => schedule_mcp_command(&client, &creds, &selection, &id, Some(&[]), json),
                 s => schedule_mcp_command(&client, &creds, &selection, &id, s.as_deref(), json),
             },
+            ScheduleCommand::Create { write, mcp_servers, dry_run, json } => {
+                schedule_create_command(&client, &creds, &selection, &write, &mcp_servers, dry_run, json)
+            }
+            ScheduleCommand::Update { id, write, json } => {
+                schedule_update_command(&client, &creds, &selection, &id, &write, json)
+            }
             ScheduleCommand::Preview { recurrence, dtstart, run_at, timezone, count, json } => {
                 schedule_preview_command(
                     &client, &creds, &selection, recurrence.as_deref(), dtstart, run_at, &timezone, count, json,
