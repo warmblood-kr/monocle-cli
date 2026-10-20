@@ -104,11 +104,29 @@ fn overrides(client: &Client, url: &str, bearer: &str, a: &WriteArgs) -> Result<
     })
 }
 
-pub fn list_command(client: &Client, creds: &Credentials, sel: &Selection) -> Result<()> {
+pub fn list_command(
+    client: &Client,
+    creds: &Credentials,
+    sel: &Selection,
+    json: bool,
+) -> Result<()> {
     let (url, bearer) = connect(client, creds, sel)?;
     let all = models::list_models(client, &url, &bearer)?;
+    if json {
+        let v: Vec<Value> = all
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": s(m, "id"), "name": s(m, "name"), "base_model_id": s(m, "base_model_id"),
+                    "active": m["is_active"].as_bool().unwrap_or(true),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(());
+    }
     if all.is_empty() {
-        eprintln!("No workspace models found.");
+        crate::note!("No workspace models found.");
         return Ok(());
     }
     let rows: Vec<Vec<String>> = all

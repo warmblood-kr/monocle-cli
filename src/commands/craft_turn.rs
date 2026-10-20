@@ -291,7 +291,9 @@ pub fn run_turn_id(
             last.set(id);
         }
         if let Some(prefix) = &opts.hint_prefix {
-            r.errln(&continue_hint(prefix, id));
+            if !crate::util::quiet() {
+                r.errln(&continue_hint(prefix, id));
+            }
         }
     }
     // Server-provided text can sit inside any error: scrub at the boundary.

@@ -128,7 +128,9 @@ fn run_checked(t: &SdkTurn) -> Result<(Result<()>, Option<String>)> {
             last.set(id);
         }
         if let Some(prefix) = t.hint_prefix {
-            r.errln(&super::craft_turn::continue_hint(prefix, id));
+            if !crate::util::quiet() {
+                r.errln(&super::craft_turn::continue_hint(prefix, id));
+            }
         }
     }
     // Server-provided text can sit inside any error: scrub at the boundary.

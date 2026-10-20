@@ -118,6 +118,12 @@ struct Cli {
     /// Show protocol detail on stderr
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
+    /// Hide hints, banners and counts on stderr (errors still print; -v still adds detail)
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
+    /// Disable colored output (same as NO_COLOR)
+    #[arg(long = "no-color", global = true)]
+    no_color: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -140,7 +146,11 @@ enum Commands {
     /// Remove Monocle configuration from Claude Code
     Unset,
     /// Show authentication and configuration status
-    Status,
+    Status {
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show who this profile is signed in as (local, no network by default)
     Whoami {
         /// Also ask the server who it thinks you are. Calls GET /api/v1/auths/, which creates a
@@ -149,7 +159,7 @@ enum Commands {
         /// staging issue)
         #[arg(long)]
         server: bool,
-        /// Print machine-readable JSON
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -285,7 +295,11 @@ enum Commands {
 #[derive(Subcommand)]
 enum ProfileCommands {
     /// List saved profiles and their environments
-    List,
+    List {
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one profile and its login state
     Show { name: Option<String> },
     /// Set the default profile
@@ -424,7 +438,7 @@ impl From<RouterChatArgs> for ChatOptions {
     }
 }
 
-fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
+fn profile_list_command(config: &Config, home: &std::path::Path, json: bool) -> Result<()> {
     let data = profiles::list_profiles(config)?;
     let selected = data.default_profile.as_deref().unwrap_or("default");
     let mut names = data
@@ -436,9 +450,19 @@ fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
     if let Some(default) = data.default_profile.as_ref() {
         names.insert(default.clone());
     }
+    let mut rows = Vec::new();
     for name in names {
         let selection = profiles::resolve_from_data(&data, home, Some(&name), None, None)?;
         let store = selection.store(home);
+        if json {
+            rows.push(serde_json::json!({
+                "name": name,
+                "environment": selection.environment,
+                "logged_in": store.read().is_some(),
+                "default": name == selected,
+            }));
+            continue;
+        }
         let state = if store.read().is_some() {
             "logged in"
         } else {
@@ -446,6 +470,9 @@ fn profile_list_command(config: &Config, home: &std::path::Path) -> Result<()> {
         };
         let marker = if name == selected { "*" } else { " " };
         println!("{marker} {name}  {}  ({state})", selection.environment);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
     }
     Ok(())
 }
@@ -483,7 +510,14 @@ enum ChatCommand {
     /// List your chats (id, title, last updated)
     ///
     /// Includes chats created in the web UI, since both share the same storage.
-    List,
+    List {
+        /// Show only the N newest chats (newest first)
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
     /// Print one chat's active message path to stdout (text only; untrusted content)
     Content {
         /// Chat ID (see `monocle chat list`)
@@ -636,7 +670,9 @@ enum CraftCommand {
         /// Answer for permission prompts (a CLI turn cannot ask interactively)
         #[arg(long, value_enum, default_value = "deny")]
         approve: Approve,
-        /// Print each received frame / polled message as one JSON line instead of text
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        ///
+        /// One JSON line per received frame / polled message instead of text.
         #[arg(long)]
         json: bool,
         /// After the turn, print one JSON timings line to stderr (stdout unchanged). t0 is the
@@ -665,8 +701,9 @@ enum Toggle {
 #[derive(Subcommand)]
 enum McpCommand {
     /// List MCP servers (name, enabled, auth state, tool count)
+    #[command(alias = "list")]
     Ls {
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -674,13 +711,13 @@ enum McpCommand {
     Show {
         /// Server name or id (see `monocle mcp ls`)
         server: String,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
     /// Count servers whose authentication failed and needs attention
     Attention {
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -739,7 +776,7 @@ enum McpThreadCommand {
     Get {
         /// Chat id (see `monocle chat list`)
         chat_id: String,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -759,7 +796,7 @@ enum McpThreadCommand {
         /// Explicitly clear the set (required when no servers are given)
         #[arg(long, conflicts_with_all = ["servers", "servers_flag"])]
         none: bool,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -769,7 +806,9 @@ enum McpThreadCommand {
 enum ScheduleCommand {
     /// List your schedules
     List {
-        /// Print the server's JSON body unchanged (epochs in seconds)
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        ///
+        /// The server's body is passed through unchanged (epochs in seconds).
         #[arg(long)]
         json: bool,
     },
@@ -777,7 +816,7 @@ enum ScheduleCommand {
     Show {
         /// Schedule id (see `monocle schedule list`)
         id: String,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -787,7 +826,7 @@ enum ScheduleCommand {
         id: String,
         #[arg(value_enum)]
         state: Toggle,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -808,7 +847,7 @@ enum ScheduleCommand {
         /// Number of runs to fetch
         #[arg(long, default_value_t = 50)]
         limit: u32,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
         /// Assert from the run's tool summary that a tool fired (optionally TOOL)
@@ -833,7 +872,7 @@ enum ScheduleCommand {
         /// Explicitly clear the set (required to empty it)
         #[arg(long, conflicts_with = "set")]
         none: bool,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -855,7 +894,7 @@ enum ScheduleCommand {
         /// How many fire times
         #[arg(long, default_value_t = 5)]
         count: u32,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -872,7 +911,7 @@ enum ScheduleCommand {
         /// Only print the next fire times; nothing is created
         #[arg(long)]
         dry_run: bool,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -882,7 +921,7 @@ enum ScheduleCommand {
         id: String,
         #[command(flatten)]
         write: ScheduleWriteArgs,
-        /// Print the server's JSON body unchanged
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
         #[arg(long)]
         json: bool,
     },
@@ -910,6 +949,9 @@ enum KnowledgeCommand {
     List {
         /// Collection name or id; omit to list all collections
         collection: Option<String>,
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
     },
     /// Rename and/or re-describe a collection (sharing/access is left unchanged)
     Update {
@@ -967,7 +1009,9 @@ enum KnowledgeCommand {
         /// Model ID to use
         #[arg(long, default_value = monocle_cli::agent::DEFAULT_MODEL)]
         model: String,
-        /// Print {"answer", "sources"} as JSON on stdout
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        ///
+        /// Prints {"answer", "sources"}.
         #[arg(long)]
         json: bool,
     },
@@ -1057,7 +1101,11 @@ impl From<ModelWriteArgs> for WriteArgs {
 #[derive(Subcommand)]
 enum WorkspaceModelCommand {
     /// List workspace models (id, name, base, active)
-    List,
+    List {
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
     /// Print one model as JSON
     Show {
         /// Workspace model ID (see `monocle workspace-model list`)
@@ -1254,7 +1302,11 @@ enum RouterCommands {
     /// Chat via /v1/chat/completions (interactive REPL or pipe from stdin)
     Chat(RouterChatArgs),
     /// List available models from the Monocle router (with modality)
-    Models,
+    Models {
+        /// Print machine-readable JSON to stdout (messages stay on stderr)
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate or edit images via /v1/images/* (OpenAI compatible)
     Image {
         #[command(subcommand)]
@@ -1287,7 +1339,11 @@ fn deprecation(old: &str, new: &str) -> String {
 fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), Commands> {
     use RouterAudioCommands as R;
     let (old, new, rc) = match cmd {
-        Commands::Models => ("models", "router models", RouterCommands::Models),
+        Commands::Models => (
+            "models",
+            "router models",
+            RouterCommands::Models { json: false },
+        ),
         Commands::Model {
             command: ModelCommands::Chat(args),
         } => ("model chat", "router chat", RouterCommands::Chat(args)),
@@ -1359,6 +1415,10 @@ fn main() {
         std::process::exit(e.exit_code());
     });
     monocle_cli::util::set_verbose(cli.verbose);
+    monocle_cli::util::set_quiet(cli.quiet);
+    if cli.no_color {
+        monocle_cli::colors::disable();
+    }
     let client = Client::new();
     let home = util::home_dir();
     let config = Config::new();
@@ -1427,15 +1487,15 @@ fn main() {
         }
         Commands::Setup => setup_command(&creds, &home),
         Commands::Unset => unset_command(&home),
-        Commands::Status => {
-            status_command(&creds, &home, &selection);
+        Commands::Status { json } => {
+            status_command(&creds, &home, &selection, json);
             Ok(())
         }
         Commands::Whoami { server, json } => {
             whoami_command(&client, &creds, &selection, server, json)
         }
         Commands::Profile { command } => match command {
-            ProfileCommands::List => profile_list_command(&config, &home),
+            ProfileCommands::List { json } => profile_list_command(&config, &home, json),
             ProfileCommands::Show { name } => {
                 profile_show_command(&config, &home, name.as_deref(), &selection)
             }
@@ -1452,7 +1512,9 @@ fn main() {
         }
         Commands::Acp => monocle_cli::acp::serve_with_credentials(creds.clone()),
         Commands::Chat { command, args } => match command {
-            Some(ChatCommand::List) => chat_list_command(&client, &creds, &selection),
+            Some(ChatCommand::List { limit, json }) => {
+                chat_list_command(&client, &creds, &selection, limit, json)
+            },
             Some(ChatCommand::Content {
                 id,
                 format,
@@ -1569,8 +1631,8 @@ fn main() {
             KnowledgeCommand::Upload { collection, paths } => {
                 knowledge_upload_command(&client, &creds, &selection, &collection, &paths)
             }
-            KnowledgeCommand::List { collection } => {
-                knowledge_list_command(&client, &creds, &selection, collection.as_deref())
+            KnowledgeCommand::List { collection, json } => {
+                knowledge_list_command(&client, &creds, &selection, collection.as_deref(), json)
             }
             KnowledgeCommand::Update {
                 collection,
@@ -1619,7 +1681,7 @@ fn main() {
             }
         },
         Commands::WorkspaceModel { command } => match command {
-            WorkspaceModelCommand::List => wm::list_command(&client, &creds, &selection),
+            WorkspaceModelCommand::List { json } => wm::list_command(&client, &creds, &selection, json),
             WorkspaceModelCommand::Show { id } => {
                 wm::show_command(&client, &creds, &selection, &id)
             }
@@ -1717,7 +1779,7 @@ fn main() {
         ),
         Commands::Router { command } => match command {
             RouterCommands::Chat(args) => chat_command(&client, &creds, args.into()),
-            RouterCommands::Models => model_list_command(&client, &creds),
+            RouterCommands::Models { json } => model_list_command(&client, &creds, json),
             RouterCommands::Image { command } => run_image(&client, &creds, command),
             RouterCommands::Audio { command } => run_audio(&client, &creds, command),
         },
@@ -1913,7 +1975,7 @@ mod tests {
         let cli = Cli::parse_from(["monocle", "chat", "list"]);
         match cli.command {
             Commands::Chat { command, .. } => {
-                assert!(matches!(command, Some(ChatCommand::List)));
+                assert!(matches!(command, Some(ChatCommand::List { .. })));
             }
             _ => panic!("expected Chat command"),
         }
@@ -2028,7 +2090,7 @@ mod tests {
     fn router_models_parses() {
         assert!(matches!(
             router(&["monocle", "router", "models"]),
-            RouterCommands::Models
+            RouterCommands::Models { .. }
         ));
     }
 
@@ -2117,7 +2179,7 @@ mod tests {
 
         let (warning, rc) = alias(&["monocle", "models"]);
         assert_eq!(warning, w("models", "router models"));
-        assert!(matches!(rc, RouterCommands::Models));
+        assert!(matches!(rc, RouterCommands::Models { .. }));
 
         let (warning, rc) = alias(&[
             "monocle",

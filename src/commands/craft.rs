@@ -143,12 +143,7 @@ fn connect(
             )
         }
     };
-    eprintln!(
-        "Profile: {} ({}) — tenant {}",
-        selection.profile,
-        selection.environment,
-        creds.read().map(|c| c.tenant_domain).unwrap_or_default()
-    );
+    selection.announce(creds);
     Ok((url, bearer))
 }
 
@@ -229,7 +224,7 @@ pub fn craft_session_command(
                 return print_json(&all);
             }
             if all.is_empty() {
-                eprintln!("No sessions found.");
+                crate::note!("No sessions found.");
                 return Ok(());
             }
             let rows: Vec<Vec<String>> = all
@@ -307,7 +302,7 @@ pub fn craft_session_command(
                     .collect()
             };
             if lines.is_empty() {
-                eprintln!("No history.");
+                crate::note!("No history.");
             }
             lines.iter().for_each(|l| println!("{l}"));
         }
@@ -323,7 +318,7 @@ pub fn craft_session_command(
             let list = f["files"].as_array().or(f["artifacts"].as_array());
             let list = list.map(Vec::as_slice).unwrap_or_default();
             if list.is_empty() {
-                eprintln!("No files.");
+                crate::note!("No files.");
             }
             if sdk_lane {
                 let rows: Vec<Vec<String>> = list
@@ -467,7 +462,7 @@ fn check_continue(
             "Session {id} no longer exists. Start a new one without --continue."
         )));
     }
-    eprintln!("Continuing session {id}");
+    crate::note!("Continuing session {id}");
     Ok(id)
 }
 
@@ -668,7 +663,7 @@ pub fn craft_workspace_command(
                 return print_json(&all);
             }
             if all.is_empty() {
-                eprintln!("No recent workspaces.");
+                crate::note!("No recent workspaces.");
                 return Ok(());
             }
             let rows: Vec<Vec<String>> = all
@@ -707,7 +702,7 @@ pub fn craft_agent_command(
         return print_json(&all);
     }
     if all.is_empty() {
-        eprintln!("No agents.");
+        crate::note!("No agents.");
         return Ok(());
     }
     let rows: Vec<Vec<String>> = all
