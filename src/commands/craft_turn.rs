@@ -26,7 +26,7 @@ pub enum Approve {
     Once,
 }
 
-/// `monocle craft turn [--lane sdk] [--env E] [--profile P]`: the same shape for both
+/// `monocle craft turn [--lane sdk] [--env=E] [--profile=P]`: the same shape for both
 /// lanes, flags after the subcommand; `--lane` only for sdk, `--env`/`--profile` only
 /// when not the defaults (prod / default).
 pub fn hint_prefix(sdk: bool, profile: &str, env: &str) -> String {
@@ -35,10 +35,10 @@ pub fn hint_prefix(sdk: bool, profile: &str, env: &str) -> String {
         s.push_str(" --lane sdk");
     }
     if env != "prod" {
-        s.push_str(&format!(" --env {env}"));
+        s.push_str(&format!(" --env={env}"));
     }
     if profile != "default" {
-        s.push_str(&format!(" --profile {profile}"));
+        s.push_str(&format!(" --profile={profile}"));
     }
     s
 }
@@ -56,12 +56,20 @@ mod hint_tests {
         );
         assert_eq!(
             hint_prefix(true, "work", "stg"),
-            "monocle craft turn --lane sdk --env stg --profile work"
+            "monocle craft turn --lane sdk --env=stg --profile=work"
         );
         assert_eq!(
             continue_hint(&hint_prefix(false, "default", "stg"), "cli-1"),
-            r#"continue with: monocle craft turn --env stg --session cli-1 "...""#
+            r#"continue with: monocle craft turn --env=stg --session=cli-1 "...""#
         );
+    }
+
+    #[test]
+    fn hyphen_leading_values_use_equals_form_and_parse() {
+        let prefix = hint_prefix(false, "-work", "prod");
+        assert_eq!(prefix, "monocle craft turn --profile=-work");
+        let hint = continue_hint(&prefix, "-id");
+        assert!(hint.contains("--profile=-work --session=-id"), "{hint}");
     }
 
     #[test]
@@ -76,7 +84,7 @@ mod hint_tests {
 
 /// The runnable hint printed to stderr right after the session id.
 pub fn continue_hint(prefix: &str, id: &str) -> String {
-    format!("continue with: {prefix} --session {id} \"...\"")
+    format!("continue with: {prefix} --session={id} \"...\"")
 }
 
 #[derive(Clone)]

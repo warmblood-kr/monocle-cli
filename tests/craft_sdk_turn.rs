@@ -254,7 +254,7 @@ fn lane_flag_after_the_subcommand_selects_the_sdk_lane() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(out(&o), "Hello\n");
     assert!(
-        err(&o).contains(r#"monocle craft turn --lane sdk --env local --session sess-1 "...""#),
+        err(&o).contains(r#"monocle craft turn --lane sdk --env=local --session=sess-1 "...""#),
         "{}",
         err(&o)
     );
@@ -298,7 +298,7 @@ fn streams_deltas_authenticates_with_socket_token_and_never_leaks_it() {
     assert!(e.contains("Session: sess-1"), "{e}");
     assert!(
         e.contains(
-            r#"continue with: monocle craft turn --lane sdk --env local --session sess-1 "...""#
+            r#"continue with: monocle craft turn --lane sdk --env=local --session=sess-1 "...""#
         ),
         "{e}"
     );

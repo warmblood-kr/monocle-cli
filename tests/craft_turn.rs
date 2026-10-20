@@ -221,7 +221,7 @@ fn streams_text_sends_token_as_subprotocol_and_never_leaks_it() {
     assert_eq!(out(&o), "Hello\n");
     assert!(err(&o).contains("Session: cli-"), "{}", err(&o));
     assert!(
-        err(&o).contains(r#"continue with: monocle craft turn --env local --session cli-"#),
+        err(&o).contains(r#"continue with: monocle craft turn --env=local --session=cli-"#),
         "{}",
         err(&o)
     );

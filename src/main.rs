@@ -1324,8 +1324,28 @@ fn legacy_alias(cmd: Commands) -> std::result::Result<(String, RouterCommands), 
     Ok((deprecation(old, new), rc))
 }
 
+/// If the first non-global token is `claude`, return its index: everything after it
+/// belongs to Claude Code verbatim (including `-v/--verbose`).
+fn claude_split(argv: &[String]) -> Option<usize> {
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-v" | "--verbose" => {}
+            "--profile" | "--env" => i += 1,
+            a if a.starts_with("--profile=") || a.starts_with("--env=") => {}
+            "claude" => return Some(i),
+            _ => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
 fn main() {
-    let cli = Cli::try_parse().unwrap_or_else(|e| {
+    let argv: Vec<String> = std::env::args().collect();
+    let split = claude_split(&argv);
+    let head = &argv[..split.map_or(argv.len(), |i| i + 1)];
+    let cli = Cli::try_parse_from(head).unwrap_or_else(|e| {
         use clap::error::ErrorKind;
         let _ = e.print();
         // `chat "text"`: the prompt is read from stdin, not taken as an argument.
@@ -1421,17 +1441,8 @@ fn main() {
             }
             ProfileCommands::Use { name } => profiles::use_profile(&config, &name),
         },
-        Commands::Claude { mut args } => {
-            // A lone `-v/--verbose` after `claude` is parsed as monocle's global flag;
-            // it belongs to Claude Code here.
-            if args.is_empty() {
-                let raw: Vec<String> = std::env::args().collect();
-                if let Some(v) = raw.iter().skip_while(|a| *a != "claude").nth(1) {
-                    if v == "-v" || v == "--verbose" {
-                        args.push(v.clone());
-                    }
-                }
-            }
+        Commands::Claude { .. } => {
+            let args: Vec<String> = split.map_or(Vec::new(), |i| argv[i + 1..].to_vec());
             if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
                 println!("{CLAUDE_WRAPPER_HELP}");
                 std::process::exit(0);
@@ -2287,6 +2298,31 @@ mod tests {
         assert!(opts.responses);
         assert_eq!(opts.resume.as_deref(), Some("abc"));
         assert_eq!(opts.tool_ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn hyphen_leading_profile_and_session_parse_in_equals_form() {
+        let cli = Cli::try_parse_from([
+            "monocle",
+            "craft",
+            "turn",
+            "--profile=-work",
+            "--session=-id",
+            "hi",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("-work"));
+    }
+
+    #[test]
+    fn claude_split_finds_subcommand_after_globals_only() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(claude_split(&v(&["m", "claude", "-v"])), Some(1));
+        assert_eq!(
+            claude_split(&v(&["m", "-v", "--profile", "claude", "claude"])),
+            Some(4)
+        );
+        assert_eq!(claude_split(&v(&["m", "chat", "claude"])), None);
     }
 
     #[test]
