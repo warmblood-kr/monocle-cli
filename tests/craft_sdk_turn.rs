@@ -68,6 +68,7 @@ fn serve_rest(mut s: TcpStream, log: &Log, stall: Option<&str>) {
     }
     let (status, resp) = match key.as_str() {
         "POST /api/v1/agent/sessions" => (200, r#"{"id":"sess-1","title":"t"}"#.to_string()),
+        "GET /api/v1/agent/sessions/sess-1" => (200, r#"{"id":"sess-1"}"#.to_string()),
         "GET /api/v1/auths/" => (200, format!(r#"{{"token":"{SOCKTOK}","role":"admin"}}"#)),
         _ => (404, "{}".to_string()),
     };
@@ -856,4 +857,114 @@ fn diagnostics_is_off_by_default_and_env_var_enables_it() {
         .map(|e| e["event"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(names.last().map(String::as_str), Some("done"));
+}
+
+fn state_file(home: &Path) -> std::path::PathBuf {
+    home.join(".monocle/craft-last-session.json")
+}
+
+fn seed(home: &Path, key_lane: &str, id: &str) {
+    std::fs::create_dir_all(home.join(".monocle")).unwrap();
+    let k = format!("default/local/{key_lane}");
+    std::fs::write(
+        state_file(home),
+        format!(r#"{{"{k}":{{"session_id":"{id}","updated_at":"2026-01-01T00:00:00Z"}}}}"#),
+    )
+    .unwrap();
+}
+
+fn creds_bytes(home: &Path) -> Vec<u8> {
+    std::fs::read(home.join(".monocle/credentials.json")).unwrap()
+}
+
+#[test]
+fn turn_records_session_and_continue_reuses_it() {
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    let before = creds_bytes(home.path());
+    let o = turn(home.path(), &["hi there"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let st = std::fs::read_to_string(state_file(home.path())).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&st).unwrap();
+    let (k, e) = v.as_object().unwrap().iter().next().unwrap();
+    assert!(k.ends_with("/sdk"), "{k}");
+    assert_eq!(e["session_id"], "sess-1");
+    assert!(e["updated_at"].as_str().unwrap().ends_with('Z'));
+    assert!(!st.contains(ACCESS) && !st.contains(SOCKTOK));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(state_file(home.path())).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+    log.lock().unwrap().clear();
+    let o = turn(home.path(), &["--continue", "hi there"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).contains("Continuing session sess-1"), "{}", err(&o));
+    let l = lines(&log);
+    assert!(
+        !l.iter()
+            .any(|x| x.starts_with("POST /api/v1/agent/sessions ")),
+        "{l:?}"
+    );
+    assert!(
+        l.iter()
+            .any(|x| x.starts_with("GET /api/v1/agent/sessions/sess-1 ")),
+        "{l:?}"
+    );
+    assert_eq!(before, creds_bytes(home.path()));
+}
+
+#[test]
+fn continue_without_stored_session_errors_before_any_request() {
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    let o = turn(home.path(), &["--continue", "hi"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("No previous craft session for lane sdk (profile default, env "),
+        "{}",
+        err(&o)
+    );
+    assert!(lines(&log).is_empty(), "{:?}", lines(&log));
+}
+
+#[test]
+fn continue_ignores_the_other_lane_and_a_corrupt_file() {
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    seed(home.path(), "openworker", "sess-1");
+    let o = turn(home.path(), &["--continue", "hi"]);
+    assert!(err(&o).contains("No previous craft session"), "{}", err(&o));
+    std::fs::write(state_file(home.path()), "{not json").unwrap();
+    let o = turn(home.path(), &["--continue", "hi"]);
+    assert!(err(&o).contains("No previous craft session"), "{}", err(&o));
+    assert!(lines(&log).is_empty());
+}
+
+#[test]
+fn continue_on_a_gone_session_errors_and_drops_the_entry() {
+    let (addr, _log) = start(happy());
+    let home = setup(&addr);
+    seed(home.path(), "sdk", "sess-gone");
+    let o = turn(home.path(), &["--continue", "hi"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("Session sess-gone no longer exists. Start a new one without --continue."),
+        "{}",
+        err(&o)
+    );
+    assert!(!std::fs::read_to_string(state_file(home.path()))
+        .unwrap()
+        .contains("sess-gone"));
+}
+
+#[test]
+fn continue_conflicts_with_session() {
+    let (addr, log) = start(happy());
+    let home = setup(&addr);
+    let o = turn(home.path(), &["--continue", "--session", "sess-1", "hi"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("cannot be used with"), "{}", err(&o));
+    assert!(lines(&log).is_empty());
 }

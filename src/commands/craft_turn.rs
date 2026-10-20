@@ -48,6 +48,10 @@ pub fn continue_hint(prefix: &str, id: &str) -> String {
 }
 
 pub struct TurnOpts {
+    /// `--continue`: resolve `session` from the last session of this lane/profile/env.
+    pub continue_last: bool,
+    /// Records the session id for `--continue` once it is known.
+    pub last: Option<crate::craft_state::LastSession>,
     /// Command prefix for the "continue with:" hint (see [`hint_prefix`]).
     pub hint_prefix: String,
     pub text: String,
@@ -202,6 +206,9 @@ pub fn run_turn(
         eprintln!("{}", tm.line());
     }
     if let Some(id) = &sid {
+        if let Some(last) = &opts.last {
+            last.set(id);
+        }
         r.errln(&continue_hint(&opts.hint_prefix, id));
     }
     // Server-provided text can sit inside any error: scrub at the boundary.

@@ -16,6 +16,8 @@ use crate::net::Client;
 use crate::socketio::{ws_origin, SocketIo};
 
 pub struct SdkTurn<'a> {
+    /// Records the session id for `--continue` once it is known.
+    pub last: Option<&'a crate::craft_state::LastSession>,
     /// Command prefix for the "continue with:" hint.
     pub hint_prefix: &'a str,
     pub client: &'a Client,
@@ -109,6 +111,9 @@ pub fn run(t: &SdkTurn) -> Result<()> {
         eprintln!("{}", tm.line());
     }
     if let Some(id) = &sid {
+        if let Some(last) = t.last {
+            last.set(id);
+        }
         r.errln(&super::craft_turn::continue_hint(t.hint_prefix, id));
     }
     // Server-provided text can sit inside any error: scrub at the boundary.
