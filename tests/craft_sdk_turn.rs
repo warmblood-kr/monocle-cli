@@ -238,6 +238,27 @@ fn turn(home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[test]
+fn lane_flag_after_the_subcommand_selects_the_sdk_lane() {
+    let (addr, _log) = start(happy());
+    let home = setup(&addr);
+    let o = Command::new(env!("CARGO_BIN_EXE_monocle"))
+        .args(["craft", "turn", "--lane", "sdk", "hi there"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("MONOCLE_PROFILE")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "Hello\n");
+    assert!(
+        err(&o).contains("--lane sdk turn --session sess-1"),
+        "{}",
+        err(&o)
+    );
+}
+
 fn out(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
@@ -274,6 +295,20 @@ fn streams_deltas_authenticates_with_socket_token_and_never_leaks_it() {
     assert_eq!(out(&o), "Hello\n");
     let e = err(&o);
     assert!(e.contains("Session: sess-1"), "{e}");
+    assert!(
+        e.contains(r#"continue with: monocle craft --lane sdk turn --session sess-1 "...""#),
+        "{e}"
+    );
+    assert!(!out(&o).contains("continue with"), "{}", out(&o));
+    assert_eq!(e.matches("continue with").count(), 1, "{e}");
+    assert!(
+        e.trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("continue with"),
+        "{e}"
+    );
     assert!(e.contains("[session_status] connecting"), "{e}");
     assert!(e.contains("[tool_use] Bash"), "{e}");
     assert!(!e.contains("BIGRESULT"), "{e}");
@@ -407,6 +442,7 @@ fn timeout_interrupts_and_fails() {
     let o = turn(home.path(), &["x", "--timeout", "1"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("Timed out after 1s"), "{}", err(&o));
+    assert_eq!(err(&o).matches("continue with: ").count(), 1, "{}", err(&o));
     assert!(wait_for(
         &log,
         r#"WS recv 42/agent,["interrupt",{"session_id":"sess-1"}]"#

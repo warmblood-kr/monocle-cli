@@ -16,6 +16,8 @@ use crate::net::Client;
 use crate::socketio::{ws_origin, SocketIo};
 
 pub struct SdkTurn<'a> {
+    /// Command prefix for the "continue with:" hint.
+    pub hint_prefix: &'a str,
     pub client: &'a Client,
     /// jarvice base from `auth::jarvice_url_for`.
     pub base: &'a str,
@@ -99,11 +101,15 @@ pub fn run(t: &SdkTurn) -> Result<()> {
         t.diagnostics_file.clone(),
         crate::instrument::host_of(t.base),
     );
-    let res = run_inner(t, &origin, id, &mut r, deadline, &mut tm);
+    let mut sid = None;
+    let res = run_inner(t, &origin, id, &mut r, deadline, &mut tm, &mut sid);
     t.client.set_request_cap(None);
     tm.finish(res.as_ref().err().map(|e| e.to_string()).as_deref());
     if t.timings {
         eprintln!("{}", tm.line());
+    }
+    if let Some(id) = &sid {
+        r.errln(&super::craft_turn::continue_hint(t.hint_prefix, id));
     }
     // Server-provided text can sit inside any error: scrub at the boundary.
     res.map_err(|e| AppError::new(r.scrub(&e.to_string())))
@@ -116,6 +122,7 @@ fn run_inner(
     r: &mut Redactor,
     deadline: Instant,
     tm: &mut Timings,
+    sid: &mut Option<String>,
 ) -> Result<()> {
     let id = match id {
         Some(id) => id,
@@ -126,6 +133,7 @@ fn run_inner(
         })?,
     };
     r.errln(&format!("Session: {id}"));
+    *sid = Some(id.clone());
     let token = http(t, deadline, || {
         sdk::socket_token(t.client, t.base, t.bearer)
     })?;

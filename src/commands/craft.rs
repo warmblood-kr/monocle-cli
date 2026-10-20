@@ -436,6 +436,7 @@ pub fn craft_turn_command(
         }
         let (base, bearer) = connect(client, creds, selection, lane)?;
         return craft_sdk_turn::run(&SdkTurn {
+            hint_prefix: &opts.hint_prefix,
             client,
             base: &base,
             bearer: &bearer,

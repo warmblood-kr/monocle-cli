@@ -220,6 +220,23 @@ fn streams_text_sends_token_as_subprotocol_and_never_leaks_it() {
     // Deltas printed live; the final assistant_message is not printed again; reasoning ignored.
     assert_eq!(out(&o), "Hello\n");
     assert!(err(&o).contains("Session: cli-"), "{}", err(&o));
+    assert!(
+        err(&o).contains(r#"continue with: monocle craft turn --session cli-"#),
+        "{}",
+        err(&o)
+    );
+    assert!(!out(&o).contains("continue with"), "{}", out(&o));
+    assert_eq!(err(&o).matches("continue with").count(), 1, "{}", err(&o));
+    assert!(
+        err(&o)
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("continue with"),
+        "{}",
+        err(&o)
+    );
     no_token(&o);
     let l = lines(&log);
     let c = l.iter().find(|x| x.starts_with("WS connect")).unwrap();
@@ -525,6 +542,7 @@ fn sdk_lane_refuses_workspace_flag() {
 
 fn opts() -> TurnOpts {
     TurnOpts {
+        hint_prefix: "monocle craft turn".into(),
         text: "hi there".into(),
         session: Some("sess-1".into()),
         workspace: None,
