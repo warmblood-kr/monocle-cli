@@ -21,8 +21,10 @@ fn reply(method: &str, url: &str) -> (u16, Vec<u8>) {
             r#"[{"id":"sess-a","title":"First\nchat","status":"idle","created_at":1700000000,"updated_at":1700003600}]"#)),
         ("GET", "/api/v1/agent/sessions/sess-a", _) => (200, json(
             r#"{"id":"sess-a","user_id":"u1","title":"First chat","status":"idle","created_at":1700000000,"updated_at":1700003600,"meta":{"k":1},"craft_env":null}"#)),
-        ("GET", "/api/v1/agent/sessions/sess-a/history", _) => (200, json(
-            r#"{"task_id":"t","session_id":"sess-a","entries":[{"type":"user","x":1},{"type":"assistant"}],"entry_count":2,"in_flight":false}"#)),
+        ("GET", "/api/v1/agent/sessions/sess-a/history/v2", _) => (200, json(
+            r#"{"task_id":"t","session_id":"sess-a","events":[{"type":"user","content":"hi\nthere","timestamp":1},{"type":"text","content":"PONG","timestamp":2},{"type":"tool_use","name":"Bash","input":{"cmd":"ls"}},{"type":"tool_result","content":"SECRET-RESULT"},{"type":"result","success":true}],"event_count":5,"in_flight":false}"#)),
+        ("GET", "/api/v1/agent/sessions/sess-old/history", _) => (200, json(
+            r#"{"task_id":"t","session_id":"sess-old","entries":[{"type":"user","content":"old"}],"entry_count":1,"in_flight":false}"#)),
         ("GET", "/api/v1/agent/sessions/sess-a/files?folder=outputs", _) => (200, json(
             r#"{"task_id":"t","folder":"outputs","path":"/o","files":[{"name":"a b.txt","size":5,"modified":"2024-01-01","is_directory":false},{"name":"sub","size":0,"modified":"2024-01-02","is_directory":true}]}"#)),
         ("GET", "/api/v1/agent/sessions/sess-a/files/download/outputs/a%20b.txt", _) => (200, b"sdk-bytes\x00\xff".to_vec()),
@@ -161,12 +163,12 @@ fn sdk_list_show_history() {
     let o = sdk(home.path(), &["history", "sess-a"]);
     assert_eq!(
         out(&o),
-        "{\"type\":\"user\",\"x\":1}\n{\"type\":\"assistant\"}\n"
+        "user\thi there\ntext\tPONG\ntool_use\tBash\ntool_result\t\nresult\t{\"type\":\"result\",\"success\":true}\n"
     );
     let o = sdk(home.path(), &["history", "sess-a", "--json"]);
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&out(&o)).unwrap()["entry_count"],
-        2
+        serde_json::from_str::<serde_json::Value>(&out(&o)).unwrap()["event_count"],
+        5
     );
 
     let a = SDK_AUTH;
@@ -176,8 +178,24 @@ fn sdk_list_show_history() {
             format!("GET /api/v1/agent/sessions?skip=0&limit=50 {a}"),
             format!("GET /api/v1/agent/sessions/sess-a {a}"),
             format!("GET /api/v1/agent/sessions/sess-a {a}"),
-            format!("GET /api/v1/agent/sessions/sess-a/history {a}"),
-            format!("GET /api/v1/agent/sessions/sess-a/history {a}"),
+            format!("GET /api/v1/agent/sessions/sess-a/history/v2 {a}"),
+            format!("GET /api/v1/agent/sessions/sess-a/history/v2 {a}"),
+        ]
+    );
+}
+
+#[test]
+fn sdk_history_falls_back_to_v1_only_on_v2_404() {
+    let (_, log, home) = setup();
+    let o = sdk(home.path(), &["history", "sess-old"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o), "user\told\n");
+    let a = SDK_AUTH;
+    assert_eq!(
+        requests(&log),
+        [
+            format!("GET /api/v1/agent/sessions/sess-old/history/v2 {a}"),
+            format!("GET /api/v1/agent/sessions/sess-old/history {a}"),
         ]
     );
 }

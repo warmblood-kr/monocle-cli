@@ -319,7 +319,7 @@ Inspect and clean up Craft sessions from the terminal, on either backend (`--lan
 ```bash
 monocle craft session list [--workspace PATH]       # id, messages, updated, title
 monocle craft session show <id>
-monocle craft session history <id> [--all]          # openworker: `role<TAB>text` per message (--all adds system)
+monocle craft session history <id> [--all]          # openworker: `role<TAB>text` per message (--all adds system); sdk: `type<TAB>text` per event (user/text content, tool name for tool events)
 monocle craft session files <id>                    # sdk: [--folder uploads|outputs]
 monocle craft session download <id> <path> [-o FILE]  # bytes to stdout, or to FILE
 monocle craft session delete <id>

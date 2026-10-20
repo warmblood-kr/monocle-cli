@@ -270,12 +270,9 @@ pub fn craft_session_command(
                 return print_json(&h);
             }
             let lines: Vec<String> = if sdk_lane {
-                h["entries"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|e| e.to_string())
-                    .collect()
+                // v2 `events`; v1 fallback `entries` (shapes beyond `type`/`content` unpinned).
+                let list = h["events"].as_array().or(h["entries"].as_array());
+                list.into_iter().flatten().map(sdk_event_line).collect()
             } else {
                 h["messages"]
                     .as_array()
@@ -545,4 +542,21 @@ pub fn craft_agent_command(
         .collect();
     print_table(&["NAME", "DEFAULT", "NEEDS WS", "TITLE", "TAGLINE"], &rows);
     Ok(())
+}
+
+/// One sdk history event as `type<TAB>summary`: user/text show their content;
+/// other types (tool_use, tool_result, thinking, result, ...) a tool name or
+/// truncated compact JSON — never a full tool result.
+fn sdk_event_line(e: &serde_json::Value) -> String {
+    let kind = s(e, "type");
+    let body = if matches!(kind, "user" | "text") {
+        one_line(&text(&e["content"]))
+    } else if kind == "tool_result" {
+        String::new() // never dump tool output
+    } else if let Some(n) = ["tool_name", "name"].iter().find_map(|k| e[*k].as_str()) {
+        one_line(n)
+    } else {
+        one_line(&e.to_string()).chars().take(120).collect()
+    };
+    format!("{kind}\t{body}")
 }

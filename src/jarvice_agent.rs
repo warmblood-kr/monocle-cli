@@ -50,9 +50,15 @@ pub fn get_session(client: &Client, base: &str, bearer: &str, id: &str) -> Resul
     get(client, &url, bearer, "Showing session", id)?.json()
 }
 
+/// `GET .../history/v2` (`{events[], event_count, in_flight}`); v1 (`entries[]`,
+/// always empty for cf worker sessions) is tried once, only if v2 is 404.
 pub fn history(client: &Client, base: &str, bearer: &str, id: &str) -> Result<Value> {
     let url = format!("{base}/api/v1/agent/sessions/{}/history", checked_id(id)?);
-    get(client, &url, bearer, "Reading session history", id)?.json()
+    let resp = client.get(&format!("{url}/v2"), &auth_headers(bearer))?;
+    if resp.status == 404 {
+        return get(client, &url, bearer, "Reading session history", id)?.json();
+    }
+    check("Reading session history", id, resp)?.json()
 }
 
 pub fn files(
