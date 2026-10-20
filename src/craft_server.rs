@@ -43,6 +43,12 @@ pub(crate) fn url_parts(url: &str) -> Option<(&str, &str, Option<&str>)> {
 /// but the bearer must never cross environments: a known craft host has to match
 /// the selected env, and any other host must be http(s) loopback (tests/local dev).
 pub fn base_url(environment: &str) -> Result<String> {
+    let url = checked_base_url(environment)?;
+    crate::trace::register_host(&url);
+    Ok(url)
+}
+
+fn checked_base_url(environment: &str) -> Result<String> {
     let Ok(url) = std::env::var("MONOCLE_CRAFT_URL") else {
         return env_host(environment)
             .map(|h| format!("https://{h}"))

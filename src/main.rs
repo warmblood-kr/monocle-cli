@@ -312,7 +312,7 @@ struct ChatArgs {
     show_tools: bool,
     /// One-shot only: print one JSON timings line to stderr (stdout unchanged). t0 is the moment
     /// the request is sent; the reply is one blocking response, so ttfe = ttft = total (no
-    /// streaming). Includes a random run_id and started_at (UTC); never tokens, prompts or text
+    /// streaming). Includes a random run_id (= trace_id, sent as `traceparent` to Monocle hosts only; disable with MONOCLE_NO_TRACEPARENT=1) and started_at (UTC); never tokens, prompts or text
     #[arg(long)]
     timings: bool,
     /// One-shot only: append one JSON line per phase to this file (also MONOCLE_DIAGNOSTICS_FILE);
@@ -561,13 +561,13 @@ enum CraftCommand {
         /// moment the user message is handed to the socket; ttfe = first server frame after t0,
         /// ttft = first non-empty assistant text, total = turn end (all ms from t0, monotonic;
         /// null if it never happened). t_request_ms = ms from command start to t0; connect_ms,
-        /// delegation_ms, session_create_ms are setup phases. Includes a random run_id and
-        /// started_at (UTC); never tokens, prompts or text. If the answer is polled, ttft is accurate to the 2 s poll interval
+        /// delegation_ms, session_create_ms are setup phases. Includes a random run_id (= trace_id, sent as
+        /// `traceparent` to Monocle hosts only; disable with MONOCLE_NO_TRACEPARENT=1) and started_at (UTC); never tokens, prompts or text. If the answer is polled, ttft is accurate to the 2 s poll interval
         #[arg(long)]
         timings: bool,
         /// Append one JSON line per phase (connect, delegation, session_create, first_event,
         /// first_text, done/error) to this file; also set by MONOCLE_DIAGNOSTICS_FILE. Off by
-        /// default. Fixed fields only (ts, run_id, event, lane, host, error_kind, duration_ms): never
+        /// default. Fixed fields only (ts, run_id, trace_id, event, lane, host, error_kind, duration_ms): never
         /// tokens, prompts, text, headers or URLs. Created 0600; rotated to PATH.1 at 1 MiB
         #[arg(long = "diagnostics-file", value_name = "PATH")]
         diagnostics_file: Option<std::path::PathBuf>,

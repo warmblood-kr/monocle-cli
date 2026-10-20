@@ -809,6 +809,7 @@ fn diagnostics_file_has_ordered_fixed_fields_and_no_secrets_even_on_error() {
                     "lane",
                     "run_id",
                     "status",
+                    "trace_id",
                     "ts",
                     "ws_close_code"
                 ]
