@@ -310,6 +310,9 @@ struct ChatArgs {
     /// (`tools_used`) to stderr, e.g. `Tools: web_search, model_designer__delegate_model`.
     #[arg(long = "show-tools")]
     show_tools: bool,
+    /// Experimental: streams the answer as it arrives (headless path). The thread title may appear a moment later in the web UI.
+    #[arg(long)]
+    stream: bool,
     /// One-shot only: print one JSON timings line to stderr (stdout unchanged). t0 is the moment
     /// the request is sent; the reply is one blocking response, so ttfe = ttft = total (no
     /// streaming). Includes a random run_id (= trace_id, sent as `traceparent` to Monocle hosts only; disable with MONOCLE_NO_TRACEPARENT=1) and started_at (UTC); never tokens, prompts or text
@@ -338,6 +341,7 @@ impl From<ChatArgs> for ChatOptions {
                 None => ToolFiringExpectation::Any,
             }),
             show_tools: a.show_tools,
+            stream: a.stream,
             timings: a.timings,
             diagnostics_file: a.diagnostics_file,
         }
@@ -383,6 +387,7 @@ impl From<RouterChatArgs> for ChatOptions {
             tool_ids: Vec::new(),
             verify_tool_firing: None,
             show_tools: false,
+            stream: false,
             timings: a.timings,
             diagnostics_file: None,
         }

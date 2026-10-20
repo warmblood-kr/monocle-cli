@@ -68,6 +68,13 @@ pub fn responses_headers(bearer: &str) -> [(&str, &str); 3] {
     ]
 }
 
+/// Headers for a headless (`stream: true`) `/api/responses` call. Deliberately
+/// WITHOUT `X-Session-Id`: with it, jarvice answers a streaming request with
+/// `{"status":true,"task_id"}` and delivers tokens over Socket.IO instead.
+pub fn responses_stream_headers(bearer: &str) -> [(&str, &str); 2] {
+    [("Authorization", bearer), origin_header()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +89,12 @@ mod tests {
         let h = responses_headers("Bearer t");
         let found = h.iter().find(|(k, _)| *k == SESSION_HEADER_NAME);
         assert_eq!(found.map(|(_, v)| *v), Some(session_id()));
+    }
+
+    #[test]
+    fn stream_headers_omit_the_session_id() {
+        let h = responses_stream_headers("Bearer t");
+        assert!(h.iter().all(|(k, _)| *k != SESSION_HEADER_NAME));
     }
 
     #[test]
