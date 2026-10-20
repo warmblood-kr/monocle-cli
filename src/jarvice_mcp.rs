@@ -64,6 +64,30 @@ impl Server {
     }
 }
 
+/// jarvice `backend/open_webui/utils/mcp_client.py:638-651` (`_INVALID_FN_NAME_CHARS`,
+/// `_sanitize_fn_name_part`): chars outside `[a-zA-Z0-9_-]` become `_`.
+pub fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `{server}__{tool}` as jarvice builds it, `mcp_client.py:654-662`
+/// (`mcp_tool_to_openai_spec`: each part sanitized, name cut to 128 chars);
+/// the tool id is `mcp:` + this (`mcp_tool_selected`, `mcp_client.py:711-732`).
+pub fn fn_name(server: &str, tool: &str) -> String {
+    format!("{}__{}", sanitize(server), sanitize(tool))
+        .chars()
+        .take(128)
+        .collect()
+}
+
 fn get_value(client: &Client, url: &str, bearer: &str, what: &str) -> Result<Value> {
     let resp = client.get(url, &auth_headers(bearer))?;
     if !resp.ok() {

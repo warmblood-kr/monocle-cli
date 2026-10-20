@@ -691,7 +691,7 @@ fn tools_line(tools_used: &[String], unparsed: usize, present: bool) -> String {
     )
 }
 
-fn dropped_tool_calls_message(
+pub(crate) fn dropped_tool_calls_message(
     tool_calls: &[ToolCall],
     unparsed: usize,
     mode: &str,
@@ -792,7 +792,7 @@ fn unparsed_note(unparsed_tools_used: usize) -> String {
     )
 }
 
-fn tool_firing_verification(
+pub(crate) fn tool_firing_verification(
     expected: &ToolFiringExpectation,
     tools_used: &[String],
     unparsed_tools_used: usize,
