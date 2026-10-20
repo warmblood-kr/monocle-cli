@@ -2,12 +2,18 @@
 //! logged-in user's MCP servers (the web "Apps" page). Data goes to stdout;
 //! the profile banner and confirmations go to stderr.
 
+use crate::agent::DEFAULT_MODEL;
+use crate::commands::chat::{
+    dropped_tool_calls_message, resolve_jarvice, tool_firing_verification, ToolFiringExpectation,
+    ToolFiringVerdict,
+};
 use crate::commands::knowledge::{connect, print_table};
 use crate::credentials::Credentials;
 use crate::error::Result;
-use crate::jarvice_mcp as mcp;
+use crate::jarvice_mcp::{self as mcp, Server};
 use crate::net::Client;
 use crate::profiles::Selection;
+use crate::responses_api::ResponsesClient;
 
 fn yn(b: bool) -> String {
     if b { "yes" } else { "no" }.to_string()
@@ -142,6 +148,143 @@ pub fn mcp_thread_command(
     }
     for id in ids.iter().filter_map(|v| v.as_str()) {
         println!("{id}");
+    }
+    Ok(())
+}
+
+/// Fixed prompt when the user gives none: forces a real tool call.
+fn exec_template(server: &str, tool: Option<&str>) -> String {
+    match tool {
+        Some(t) => format!("Call the `{t}` tool of the `{server}` MCP server now with a minimal valid argument, then reply with one short sentence stating what it returned. Do not answer from memory."),
+        None => format!("Call one tool of the `{server}` MCP server now (pick the simplest read-only one), then reply with one short sentence stating what it returned. Do not answer from memory."),
+    }
+}
+
+/// Cheap checks against the catalog so a doomed turn is never sent.
+/// Returns the server id to use in the `mcp:` tool id.
+fn exec_preflight(all: &[mcp::Server], server: &str, tool: Option<&str>) -> Result<String> {
+    let s = mcp::find_server(all, server)?;
+    let fail = |m: String| Err(crate::error::AppError::new(m));
+    if !s.enabled {
+        return fail(format!(
+            "MCP server '{server}' is disabled (run `monocle mcp enable {server}`)."
+        ));
+    }
+    if matches!(s.auth_state(), "needed" | "failed") {
+        return fail(format!(
+            "MCP server '{server}' needs authentication (state: {}); reconnect it in the web Apps page.",
+            s.auth_state()
+        ));
+    }
+    if let Some(t) = tool {
+        // Custom servers list no tools in the catalog; only judge when it does.
+        if !s.tools.is_empty() {
+            match s.tools.iter().find(|x| x.name == t) {
+                None => {
+                    return fail(format!(
+                        "MCP server '{server}' has no tool '{t}' (run `monocle mcp show {server}`)."
+                    ))
+                }
+                Some(x) if !x.enabled => {
+                    return fail(format!(
+                        "Tool '{t}' of '{server}' is disabled (run `monocle mcp tool {server} {t} enable`)."
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(s.id.clone())
+}
+
+/// `tools_used` names are `SERVER__TOOL`; accept the bare tool name too.
+/// Server-only runs must have fired a tool of that server.
+fn exec_verdict(
+    server: &Server,
+    tool: Option<&str>,
+    reply: &crate::responses_api::ResponsesReply,
+) -> ToolFiringVerdict {
+    let dropped = dropped_tool_calls_message(
+        &reply.tool_calls,
+        reply.unparsed_tool_calls,
+        "--responses mode",
+    );
+    let prefixes = [format!("{}__", server.id), format!("{}__", server.name)];
+    let expected = match tool {
+        Some(t) => {
+            let qualified = prefixes.iter().map(|p| format!("{p}{t}"));
+            let want = qualified
+                .into_iter()
+                .find(|q| reply.tools_used.contains(q))
+                .unwrap_or_else(|| t.to_string());
+            ToolFiringExpectation::Named(want)
+        }
+        None => ToolFiringExpectation::Any,
+    };
+    let verdict = tool_firing_verification(
+        &expected,
+        &reply.tools_used,
+        reply.unparsed_tools_used,
+        reply.tools_used_present,
+        dropped.as_deref(),
+    );
+    let foreign = tool.is_none()
+        && matches!(verdict, ToolFiringVerdict::Passed(_))
+        && !reply.tools_used.is_empty()
+        && !reply
+            .tools_used
+            .iter()
+            .any(|u| prefixes.iter().any(|p| u.starts_with(p.as_str())));
+    if foreign {
+        return ToolFiringVerdict::Failed(format!(
+            "✗ tool-firing verification FAILED: no tool of `{}` ran; these ran instead: {}",
+            server.name,
+            reply.tools_used.join(", ")
+        ));
+    }
+    verdict
+}
+
+/// `monocle mcp exec SERVER[/TOOL] [PROMPT...] [--verify] [--model M]`
+pub fn mcp_exec_command(
+    client: &Client,
+    creds: &Credentials,
+    target: &str,
+    prompt: &[String],
+    verify: bool,
+    model: Option<&str>,
+) -> Result<()> {
+    let (server, tool) = match target.split_once('/') {
+        Some((s, t)) if !s.is_empty() && !t.is_empty() => (s, Some(t)),
+        _ => (target, None),
+    };
+    let (session, url, bearer) = resolve_jarvice(client, creds)?;
+    let all = mcp::parse_servers(&mcp::list_servers_raw(client, &url, &bearer)?)?;
+    let id = exec_preflight(&all, server, tool)?;
+    let tool_id = match tool {
+        Some(t) => format!("mcp:{id}__{t}"),
+        None => format!("mcp:{id}"),
+    };
+    let text = if prompt.is_empty() {
+        exec_template(server, tool)
+    } else {
+        prompt.join(" ")
+    };
+    let model = model.unwrap_or(DEFAULT_MODEL);
+    eprintln!("Using model: {model}; tool id: {tool_id}");
+    let rc = ResponsesClient::new(client, session.token, url);
+    let reply = rc.respond(model, &text, &[], &[], None, &[tool_id])?;
+    println!("{}", reply.content);
+    if let Some(id) = &reply.thread_id {
+        eprintln!("Thread: {id}");
+    }
+    if verify {
+        let srv = mcp::find_server(&all, server)?;
+        let v = exec_verdict(srv, tool, &reply);
+        eprintln!("{}", v.message());
+        if v.exit_code() != 0 {
+            std::process::exit(v.exit_code());
+        }
     }
     Ok(())
 }

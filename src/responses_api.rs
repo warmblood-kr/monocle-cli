@@ -204,11 +204,8 @@ impl<'a> ResponsesClient<'a> {
             &body,
         )?;
         if !resp.ok() {
-            return Err(AppError::new(format!(
-                "Responses API error {}: {}",
-                resp.status,
-                resp.text()
-            )));
+            // Status (+ error code) only: never echo the server's body.
+            return Err(crate::jarvice_knowledge::api_error("Responses API", &resp));
         }
         let data: Value = resp.json()?;
         let thread_id = resp.header("x-thread-id").map(str::to_string);

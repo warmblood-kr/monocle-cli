@@ -28,7 +28,8 @@ use monocle_cli::commands::knowledge::{
 };
 use monocle_cli::commands::login::login_command;
 use monocle_cli::commands::mcp::{
-    mcp_attention_command, mcp_ls_command, mcp_set_command, mcp_show_command, mcp_thread_command,
+    mcp_attention_command, mcp_exec_command, mcp_ls_command, mcp_set_command, mcp_show_command,
+    mcp_thread_command,
 };
 use monocle_cli::commands::model_list::model_list_command;
 use monocle_cli::commands::setup::setup_command;
@@ -73,7 +74,7 @@ Commands:
   Chat:
     chat     Chat with Monocle hosted Chat (server-side threads, visible in the web UI; REPL or pipe from stdin)
     knowledge  Manage knowledge collections (create, upload, list, update, remove, replace, content, ask, delete)
-    mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, tool, thread)
+    mcp      Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
     workspace-model  Manage workspace (custom) models: system prompt, tools, knowledge
     craft    Inspect Craft sessions, workspaces and agents (session, workspace, agent)
 
@@ -159,7 +160,7 @@ enum Commands {
         #[command(subcommand)]
         command: KnowledgeCommand,
     },
-    /// Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, tool, thread)
+    /// Inspect and toggle your MCP servers and their tools (ls, show, attention, enable, disable, exec, tool, thread)
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
@@ -507,6 +508,23 @@ enum McpCommand {
     Disable {
         /// Server name (see `monocle mcp ls`)
         server: String,
+    },
+    /// Run an MCP server's tool through one Hosted Chat turn (LLM-driven; there
+    /// is no direct tool-invoke API). Prints the reply to stdout, the thread id
+    /// to stderr. With --verify, exit code: 0 a tool of it ran, 1 none did
+    /// (or a dropped tool call), 2 server cannot report `tools_used`.
+    /// Pre-flight failures (unknown/disabled/unauthenticated) also exit 1.
+    Exec {
+        /// `SERVER` (any one tool) or `SERVER/TOOL`
+        target: String,
+        /// Prompt (replaces the built-in "call the tool now" instruction)
+        prompt: Vec<String>,
+        /// Assert from the server's `tools_used` that the tool actually ran
+        #[arg(long)]
+        verify: bool,
+        /// Model id (default: the CLI default)
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Switch one tool of an enabled server on or off (does not run the tool)
     Tool {
@@ -1078,6 +1096,12 @@ fn main() {
             McpCommand::Disable { server } => {
                 mcp_set_command(&client, &creds, &selection, &server, None, false)
             }
+            McpCommand::Exec {
+                target,
+                prompt,
+                verify,
+                model,
+            } => mcp_exec_command(&client, &creds, &target, &prompt, verify, model.as_deref()),
             McpCommand::Tool {
                 server,
                 tool,
