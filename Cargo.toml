@@ -12,6 +12,7 @@ name = "monocle"
 path = "src/main.rs"
 
 [dependencies]
+agent-core-rust-sequence = { git = "https://github.com/warmblood-kr/monocle-agent-core.git", rev = "3854adf2ba0f911a01f853f84a5c7bd1c8ff9493" }
 clap = { version = "4", features = ["derive"] }
 # Blocking HTTP only — keeps tokio out of our code. async stays a two-way door:
 # all network I/O is quarantined behind src/net.rs, so a future async need can be

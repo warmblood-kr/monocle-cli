@@ -265,6 +265,9 @@ enum Commands {
         /// Skip the per-tool approval prompt (dangerous)
         #[arg(long = "auto-approve")]
         auto_approve: bool,
+        /// Buffered text-only shared-core turn, no tools; one model call (--max-steps is native-only)
+        #[arg(long = "experimental-core-model-only")]
+        experimental_core_model_only: bool,
     },
     /// [Deprecated] Use `monocle router audio` instead
     #[command(hide = true)]
@@ -1807,6 +1810,7 @@ fn main() {
             max_steps,
             session,
             auto_approve,
+            experimental_core_model_only,
         } => agent_command(
             &client,
             &creds,
@@ -1817,6 +1821,7 @@ fn main() {
                 max_steps,
                 session,
                 auto_approve,
+                experimental_core_model_only,
             },
         ),
         Commands::Router { command } => match command {
@@ -2469,3 +2474,7 @@ mod tests {
         assert!(help.contains("--resume"), "{help}");
     }
 }
+
+#[cfg(test)]
+#[path = "tests/core_selection.rs"]
+mod core_selection_contract;
