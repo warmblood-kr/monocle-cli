@@ -1,0 +1,9 @@
+# WIP: explicit model-only shared-core route
+
+`monocle agent --experimental-core-model-only` opts into one buffered text-only model call through the shared synchronous core. Omitting the flag keeps the native streaming/tool loop. The experimental route advertises no tools, rejects tool history and unsolicited tool responses, and never falls back or retries after a model effect. The existing host owns authentication, diagnostics, conversation and session append. This is not streaming/tool parity, immutable archival or a production rollout.
+
+The core dependency remains pinned to Git revision3854adf2ba0f911a01f853f84a5c7bd1c8ff9493. **Cargo.lock reconciliation for that Git source is unresolved in this WIP branch.** No verification-only filesystem dependency locator or absolute workspace path is committed. Do not merge this draft until its actual Git graph and current devel source are compiled/tested under the agreed constraints.
+
+A separate local verification snapshot based on CLI7c2ee553bde1496a349fa778b521ec5e4dcb0ff5 used byte-exact sources from that core commit with a temporary local locator and narrow reconciled lock: actual CLI helper7, adapter8, interface3 and actual parser2 tests passed. That20-test result is not a claimed build of this newer devel-based branch. Current branch integrates the same intended source changes onto develbd94590e7c7d1bff0eb25f6c2ca54b9faa0db110 and separates new unit sources under src/tests; current-base tests remain pending.
+
+Remaining gates: real Git dependency lock/cache reconciliation; current-base library/parser units; actual host auth/session failure regressions; independent source review and any release approval. Session JSONL append is not an immutable archive receipt. No real-provider, cloud, deployment or merge is authorized by this WIP.
