@@ -266,8 +266,17 @@ enum Commands {
         #[arg(long = "auto-approve")]
         auto_approve: bool,
         /// Buffered text-only shared-core turn, no tools; one model call (--max-steps is native-only)
-        #[arg(long = "experimental-core-model-only")]
+        #[arg(
+            long = "experimental-core-model-only",
+            conflicts_with = "experimental_core_tool_workflow"
+        )]
         experimental_core_model_only: bool,
+        /// Bounded shared-core serial tool workflow; default native loop is unchanged
+        #[arg(
+            long = "experimental-core-tool-workflow",
+            conflicts_with = "experimental_core_model_only"
+        )]
+        experimental_core_tool_workflow: bool,
     },
     /// [Deprecated] Use `monocle router audio` instead
     #[command(hide = true)]
@@ -1811,6 +1820,7 @@ fn main() {
             session,
             auto_approve,
             experimental_core_model_only,
+            experimental_core_tool_workflow,
         } => agent_command(
             &client,
             &creds,
@@ -1822,6 +1832,7 @@ fn main() {
                 session,
                 auto_approve,
                 experimental_core_model_only,
+                experimental_core_tool_workflow,
             },
         ),
         Commands::Router { command } => match command {

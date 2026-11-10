@@ -5,8 +5,8 @@
 //! tools, permission/sandboxing, session, and ACP surface come later.
 
 pub mod commands;
-pub(crate) mod core_interface;
 pub(crate) mod core_model_only;
+pub(crate) mod core_tool_workflow;
 pub mod guide;
 pub mod permission;
 pub mod providers;

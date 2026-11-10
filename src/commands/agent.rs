@@ -11,7 +11,9 @@ use serde_json::Value;
 
 use crate::agent::commands::{config_text, help_text, login_view, status_text};
 use crate::agent::permission::PermissionStore;
-use crate::agent::providers::{ChatRequest, ChatResponse, LlmProvider, Message, MonocleProvider, TokenUsage};
+use crate::agent::providers::{
+    ChatRequest, ChatResponse, LlmProvider, Message, MonocleProvider, TokenUsage,
+};
 use crate::agent::runner::{Agent, AllowAll, Approver, Cancel, Observer, RunStop};
 use crate::agent::session::{session_path, SessionStore};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
@@ -38,19 +40,96 @@ pub struct AgentOptions {
     pub auto_approve: bool,
     /// Explicit buffered, text-only shared-core lane; native remains the default.
     pub experimental_core_model_only: bool,
+    /// Explicit bounded tool-workflow lane using the existing native provider and tools.
+    pub experimental_core_tool_workflow: bool,
 }
 
 /// Pure preflight runs before auth refresh or any provider call.
 fn validate_core_history(messages: &[Message]) -> Result<()> {
+    if messages.is_empty()
+        || !messages.iter().any(|message| message.role == "system")
+        || messages
+            .iter()
+            .any(|message| !matches!(message.role.as_str(), "system" | "user" | "assistant"))
+    {
+        return Err(AppError::new("core model-only: unsupported request"));
+    }
     if messages.iter().any(|message| {
-        message.role == "tool" || message.tool_call_id.is_some() || !message.tool_calls.is_empty()
+        message.role == "tool"
+            || message.tool_call_id.is_some()
+            || !message.tool_calls.is_empty()
+            || message.role == "system"
+                && message
+                    .content
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
     }) {
         return Err(AppError::new("core model-only: unsupported request"));
     }
     Ok(())
 }
 
+/// The tool-workflow lane can resume existing assistant/tool exchanges, but
+/// still requires one valid system prompt and only native chat roles.
+fn validate_core_tool_history(messages: &[Message]) -> Result<()> {
+    if messages.is_empty()
+        || !messages.iter().any(|message| message.role == "system")
+        || messages.iter().any(|message| {
+            !matches!(
+                message.role.as_str(),
+                "system" | "user" | "assistant" | "tool"
+            ) || message.role == "tool" && message.tool_call_id.is_none()
+                || message.role == "system"
+                    && message
+                        .content
+                        .as_deref()
+                        .is_none_or(|content| content.trim().is_empty())
+        })
+    {
+        return Err(AppError::new("core tool workflow: unsupported request"));
+    }
+    Ok(())
+}
+
 /// The actual Repl dispatch seam. The native closure is the unchanged Agent run.
+fn run_selected_turn_with_session<P, N>(
+    experimental_core_model_only: bool,
+    provider: &P,
+    request: &ChatRequest,
+    conversation: &mut Vec<Message>,
+    observer: &mut dyn Observer,
+    cancel: &Cancel,
+    persisted: &mut usize,
+    session: Option<&SessionStore>,
+    poisoned: &mut bool,
+    native: N,
+) -> Result<RunStop>
+where
+    P: LlmProvider + ?Sized,
+    N: FnOnce(&mut Vec<Message>, &mut dyn Observer) -> Result<RunStop>,
+{
+    if !experimental_core_model_only {
+        return native(conversation, observer);
+    }
+    let response = crate::agent::core_model_only::run_model_only(
+        provider,
+        request,
+        conversation,
+        persisted,
+        session,
+        poisoned,
+        cancel,
+    )?;
+    observer.on_turn_step(&response);
+    if !response.content.is_empty() {
+        observer.on_text_delta(&response.content);
+    }
+    Ok(RunStop::EndTurn)
+}
+
+/// Unit-test seam for the old adapter contract. The real Repl route below uses
+/// `run_selected_turn_with_session`, which requires the archive transaction.
+#[cfg(test)]
 fn run_selected_turn<P, N>(
     experimental_core_model_only: bool,
     provider: &P,
@@ -67,13 +146,40 @@ where
     if !experimental_core_model_only {
         return native(conversation, observer);
     }
-    let response = crate::agent::core_model_only::run_model_only(provider, request, cancel)?;
+    if cancel.is_cancelled() {
+        return Err(AppError::new("core model-only: cancelled"));
+    }
+    let response = provider.chat(request)?;
+    if cancel.is_cancelled() {
+        return Err(AppError::new("core model-only: cancelled"));
+    }
+    if response.truncated || !response.tool_calls.is_empty() {
+        return Err(AppError::new("core model-only: unsupported response"));
+    }
     observer.on_turn_step(&response);
     if !response.content.is_empty() {
         observer.on_text_delta(&response.content);
     }
     conversation.push(Message::assistant(response.content));
     Ok(RunStop::EndTurn)
+}
+
+/// Keep the REPL's production and synthetic providers behind one sized type so
+/// `Agent` can retain its borrowed provider without changing agent-core.
+struct CliProvider(Box<dyn LlmProvider>);
+
+impl LlmProvider for CliProvider {
+    fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
+        self.0.chat(request)
+    }
+
+    fn chat_stream(
+        &self,
+        request: &ChatRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ChatResponse> {
+        self.0.chat_stream(request, on_delta)
+    }
 }
 
 fn turn_ttfb(
@@ -91,24 +197,43 @@ fn turn_ttfb(
 /// Turn-scoped accumulator for `/diag`: `Agent::run`'s tool-use loop can call
 /// the LLM several times per turn (each a "step"), and this collects the
 /// last-known served model plus a running token total across all of them.
-#[derive(Default)]
-struct CliObserver {
+struct CliObserver<'a> {
+    output: &'a mut dyn Write,
     served_model: Option<String>,
     usage: Option<TokenUsage>,
     steps: u32,
     /// Set on the first `on_text_delta` call this turn — used to compute
     /// `/diag`'s "time to first byte" line (relative to `run_turn`'s `started`).
     first_delta_at: Option<std::time::Instant>,
+    buffer_output: bool,
+    buffered_text: String,
 }
-impl Observer for CliObserver {
+impl<'a> CliObserver<'a> {
+    fn new(output: &'a mut dyn Write, buffer_output: bool) -> Self {
+        Self {
+            output,
+            served_model: None,
+            usage: None,
+            steps: 0,
+            first_delta_at: None,
+            buffer_output,
+            buffered_text: String::new(),
+        }
+    }
+}
+
+impl Observer for CliObserver<'_> {
     fn on_text_delta(&mut self, delta: &str) {
         if self.first_delta_at.is_none() {
             self.first_delta_at = Some(std::time::Instant::now());
         }
-        // Stream assistant text to stdout as it arrives (tool progress goes to stderr).
-        let mut out = std::io::stdout();
-        let _ = out.write_all(delta.as_bytes());
-        let _ = out.flush();
+        if self.buffer_output {
+            self.buffered_text.push_str(delta);
+        } else {
+            // Stream assistant text to stdout as it arrives (tool progress goes to stderr).
+            let _ = self.output.write_all(delta.as_bytes());
+            let _ = self.output.flush();
+        }
     }
     fn on_tool_call(&mut self, _id: &str, name: &str, args: &Value) {
         eprintln!(
@@ -151,6 +276,159 @@ impl Observer for CliObserver {
             acc.total_tokens = acc.total_tokens.saturating_add(u.total_tokens);
         }
     }
+}
+
+/// Shared post-preflight lifecycle for one Repl turn. Production prepares auth,
+/// provider, Agent, and approver before entering so their construction stays
+/// outside the latency timer; tests supply synthetic callbacks to assert
+/// ordering and rollback without contacting a provider.
+fn run_turn_lifecycle<P, A, E, S>(
+    experimental_core_model_only: bool,
+    experimental_core_tool_workflow: bool,
+    conversation: &mut Vec<Message>,
+    persisted: &mut usize,
+    selected_session_poisoned: &mut bool,
+    diagnostics: &mut Option<TurnDiagnostics>,
+    session: Option<&SessionStore>,
+    cancel: &Cancel,
+    model: &str,
+    user: String,
+    output: &mut dyn Write,
+    authenticate_and_prepare: A,
+    execute: E,
+    append: S,
+) -> Result<()>
+where
+    A: FnOnce() -> P,
+    E: FnOnce(
+        P,
+        &ChatRequest,
+        &mut Vec<Message>,
+        &mut dyn Observer,
+        &Cancel,
+        &mut usize,
+        Option<&SessionStore>,
+        &mut bool,
+    ) -> Result<String>,
+    S: FnOnce(Option<&SessionStore>, &[Message]) -> Result<()>,
+{
+    let selected_core = experimental_core_model_only || experimental_core_tool_workflow;
+    if experimental_core_model_only {
+        if let Err(error) = validate_core_history(conversation) {
+            *diagnostics = None;
+            return Err(error);
+        }
+        if session.is_none() {
+            *diagnostics = None;
+            return Err(AppError::new(
+                "core model-only: a named session is required",
+            ));
+        }
+    }
+    if experimental_core_tool_workflow {
+        if let Err(error) = validate_core_tool_history(conversation) {
+            *diagnostics = None;
+            return Err(error);
+        }
+        if session.is_none() {
+            *diagnostics = None;
+            return Err(AppError::new(
+                "core tool workflow: a named session is required",
+            ));
+        }
+    }
+
+    // Keep auth/provider construction after pure preflight and before adding
+    // this user's message, matching the existing Repl ordering exactly.
+    let prepared = authenticate_and_prepare();
+    cancel.reset();
+    let mark = conversation.len();
+    let mut working = conversation.clone();
+    working.push(Message::user(user.clone()));
+    if !selected_core {
+        conversation.push(Message::user(user));
+    }
+    let started = std::time::Instant::now();
+    let mut observer = CliObserver::new(output, selected_core);
+    let request = ChatRequest {
+        model: model.to_string(),
+        messages: if selected_core {
+            working.clone()
+        } else {
+            conversation.clone()
+        },
+        ..Default::default()
+    };
+
+    let target = if selected_core {
+        &mut working
+    } else {
+        &mut *conversation
+    };
+    let turn_endpoint = match execute(
+        prepared,
+        &request,
+        target,
+        &mut observer,
+        cancel,
+        persisted,
+        session,
+        selected_session_poisoned,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            *diagnostics = None;
+            if experimental_core_tool_workflow && *selected_session_poisoned {
+                *conversation = working;
+            }
+            if !selected_core {
+                conversation.truncate(mark);
+            }
+            return Err(error);
+        }
+    };
+    if selected_core {
+        // The adapter has appended successfully before it returns; publish its
+        // working conversation and committed cursor together at this boundary.
+        *conversation = working;
+    }
+
+    let served_model = observer.served_model.clone();
+    let first_delta_at = observer.first_delta_at;
+    let usage = observer.usage.clone();
+    let steps = observer.steps;
+    let buffered_text = observer.buffered_text.clone();
+    drop(observer);
+    if selected_core {
+        if let Err(error) = output
+            .write_all(buffered_text.as_bytes())
+            .and_then(|_| output.write_all(b"\n"))
+            .and_then(|_| output.flush())
+        {
+            *diagnostics = None;
+            return Err(error.into());
+        }
+    } else {
+        output.write_all(b"\n")?;
+        output.flush()?;
+    }
+    *diagnostics = Some(TurnDiagnostics::for_agent(
+        model.to_string(),
+        served_model,
+        turn_endpoint,
+        turn_ttfb(selected_core, first_delta_at, started),
+        started.elapsed().as_millis(),
+        usage,
+        steps,
+    ));
+
+    if !selected_core {
+        if let Some(store) = session {
+            append(Some(store), &conversation[*persisted..])?;
+            *persisted = conversation.len();
+        }
+    }
+    Ok(())
 }
 
 /// The slash commands the REPL understands, offered by the completer and shown
@@ -260,9 +538,12 @@ struct Repl<'a> {
     session: Option<SessionStore>,
     convo: Vec<Message>,
     persisted: usize,
+    /// A failed selected append may have partially written; require reopen/reconciliation.
+    selected_session_poisoned: bool,
     /// `--auto-approve`: run side-effecting tools without prompting.
     auto_approve: bool,
     experimental_core_model_only: bool,
+    experimental_core_tool_workflow: bool,
     /// Whether this session runs on an interactive TTY (can prompt for approval).
     interactive: bool,
     /// Remembered tool-permission decisions (session + `.monocle/settings.json`),
@@ -271,6 +552,11 @@ struct Repl<'a> {
     /// Last turn's diagnostics, shown on demand by `/diag` — `None` until the
     /// first successful turn, mirroring `monocle chat`'s REPL.
     diagnostics: Option<TurnDiagnostics>,
+    /// Synthetic-only injection for exercising the actual `run_turn` entry.
+    #[cfg(test)]
+    test_provider: Option<(Box<dyn LlmProvider>, String)>,
+    #[cfg(test)]
+    test_output: Option<&'a mut dyn Write>,
 }
 
 impl Repl<'_> {
@@ -284,92 +570,170 @@ impl Repl<'_> {
     }
 
     fn run_turn(&mut self, user: String) -> Result<()> {
+        if (self.experimental_core_model_only || self.experimental_core_tool_workflow)
+            && self.selected_session_poisoned
+        {
+            self.diagnostics = None;
+            return Err(AppError::new(
+                "core agent: session requires reopen or reconciliation",
+            ));
+        }
+        // Actual Repl entry preflights before token refresh/provider construction.
         if self.experimental_core_model_only {
             if let Err(error) = validate_core_history(&self.convo) {
                 self.diagnostics = None;
                 return Err(error);
             }
+            if self.session.is_none() {
+                self.diagnostics = None;
+                return Err(AppError::new(
+                    "core model-only: a named session is required",
+                ));
+            }
         }
-        // Fresh token each turn (get_access_token refreshes if near expiry).
-        let auth = get_access_token(self.client, self.creds);
-        // Captured before `MonocleProvider::from_session` consumes `auth` —
-        // `/diag`'s endpoint must reflect the request this turn actually sent
-        // (the full URL `MonocleProvider` posts to, not just the router base).
-        let turn_endpoint = format!("{}{}", auth.router_url, crate::endpoints::CHAT_COMPLETIONS);
-        let provider = MonocleProvider::from_session(auth);
+        if self.experimental_core_tool_workflow {
+            if let Err(error) = validate_core_tool_history(&self.convo) {
+                self.diagnostics = None;
+                return Err(error);
+            }
+            if self.session.is_none() {
+                self.diagnostics = None;
+                return Err(AppError::new(
+                    "core tool workflow: a named session is required",
+                ));
+            }
+        }
+        if let Some(session) = self.session.as_ref() {
+            crate::agent::core_tool_workflow::ensure_no_pending_dispatches(session)?;
+        }
+
+        #[cfg(test)]
+        let test_provider = self.test_provider.take();
+        #[cfg(test)]
+        let test_output = self.test_output.take();
+
+        let (provider, turn_endpoint) = {
+            #[cfg(test)]
+            if let Some((provider, endpoint)) = test_provider {
+                (CliProvider(provider), endpoint)
+            } else {
+                let auth = get_access_token(self.client, self.creds);
+                let endpoint = format!("{}{}", auth.router_url, crate::endpoints::CHAT_COMPLETIONS);
+                (
+                    CliProvider(Box::new(MonocleProvider::from_session(auth))),
+                    endpoint,
+                )
+            }
+            #[cfg(not(test))]
+            {
+                let auth = get_access_token(self.client, self.creds);
+                let endpoint = format!("{}{}", auth.router_url, crate::endpoints::CHAT_COMPLETIONS);
+                (
+                    CliProvider(Box::new(MonocleProvider::from_session(auth))),
+                    endpoint,
+                )
+            }
+        };
+
+        let Repl {
+            tools,
+            workdir,
+            model,
+            max_steps,
+            cancel,
+            session,
+            convo,
+            persisted,
+            selected_session_poisoned,
+            auto_approve,
+            experimental_core_model_only,
+            experimental_core_tool_workflow,
+            interactive,
+            permissions,
+            diagnostics,
+            ..
+        } = self;
+
+        // Preserve the original timing boundary: build the Agent and select its
+        // approver before the timer starts in run_turn_lifecycle.
         let agent = Agent::with_max_steps(
             &provider,
-            &self.tools,
-            ToolContext::new(self.workdir.clone()).with_cancel(self.cancel.clone()),
-            self.model.as_str(),
-            self.max_steps,
+            tools,
+            ToolContext::new(workdir.clone()).with_cancel(cancel.clone()),
+            model.as_str(),
+            *max_steps,
         );
-
-        // Clear any cancel from an idle Ctrl-C press before starting this turn.
-        self.cancel.reset();
-        let mark = self.convo.len();
-        self.convo.push(Message::user(user));
-        // Gate side-effecting tools behind the user in interactive mode; scripts
-        // / one-shot / `--auto-approve` keep the unattended `AllowAll` behavior.
         let mut allow = AllowAll;
-        let mut prompt = PromptApprover {
-            store: &mut self.permissions,
+        let mut prompt = PromptApprover { store: permissions };
+        let approver: &mut dyn Approver = if use_prompt_approver(*auto_approve, *interactive) {
+            &mut prompt
+        } else {
+            &mut allow
         };
-        let approver: &mut dyn Approver =
-            if use_prompt_approver(self.auto_approve, self.interactive) {
-                &mut prompt
-            } else {
-                &mut allow
-            };
-        // Wrapped tightly around the agent-core loop itself — this is what
-        // `/diag`'s `Latency (total):` line reports (and, via the observer's
-        // first `on_text_delta`, its `Time to first byte:` line).
-        let started = std::time::Instant::now();
-        let mut observer = CliObserver::default();
-        let request = ChatRequest {
-            model: self.model.clone(),
-            messages: self.convo.clone(),
-            ..Default::default()
+
+        let mut stdout = std::io::stdout();
+        #[cfg(test)]
+        let output: &mut dyn Write = match test_output {
+            Some(writer) => writer,
+            None => &mut stdout,
         };
-        let cancel = &self.cancel;
-        if let Err(e) = run_selected_turn(
-            self.experimental_core_model_only,
-            &provider,
-            &request,
-            &mut self.convo,
-            &mut observer,
+        #[cfg(not(test))]
+        let output: &mut dyn Write = &mut stdout;
+
+        run_turn_lifecycle(
+            *experimental_core_model_only,
+            *experimental_core_tool_workflow,
+            convo,
+            persisted,
+            selected_session_poisoned,
+            diagnostics,
+            session.as_ref(),
             cancel,
-            |conversation, observer| agent.run(conversation, approver, observer, cancel),
-        ) {
-            // Roll back this failed turn's (partial) messages so a retry — and the
-            // persisted session — stay well-formed. A failed turn must not leave
-            // stale diagnostics from an earlier successful turn silently
-            // displayable via `/diag`, mirroring `monocle chat`'s REPL.
-            self.diagnostics = None;
-            self.convo.truncate(mark);
-            return Err(e);
-        }
-
-        let mut out = std::io::stdout();
-        out.write_all(b"\n")?;
-        out.flush()?;
-
-        self.diagnostics = Some(TurnDiagnostics::for_agent(
-            self.model.clone(),
-            observer.served_model.clone(),
-            turn_endpoint,
-            turn_ttfb(self.experimental_core_model_only, observer.first_delta_at, started),
-            started.elapsed().as_millis(),
-            observer.usage.clone(),
-            observer.steps,
-        ));
-
-        // Persist this turn's new messages (append-only).
-        if let Some(store) = &self.session {
-            store.append(&self.convo[self.persisted..])?;
-            self.persisted = self.convo.len();
-        }
-        Ok(())
+            model,
+            user,
+            output,
+            // Auth/provider and Agent/approver are prepared above, before the
+            // timer starts. This no-op retains the helper's preflight seam.
+            || (),
+            |(), request, conversation, observer, cancel, persisted, session, poisoned| {
+                if *experimental_core_tool_workflow {
+                    crate::agent::core_tool_workflow::run_tool_workflow(
+                        &provider,
+                        request,
+                        conversation,
+                        observer,
+                        cancel,
+                        persisted,
+                        session,
+                        poisoned,
+                        tools,
+                        &ToolContext::new(workdir.clone()).with_cancel(cancel.clone()),
+                        approver,
+                        *max_steps,
+                    )?;
+                } else {
+                    run_selected_turn_with_session(
+                        *experimental_core_model_only,
+                        &provider,
+                        request,
+                        conversation,
+                        observer,
+                        cancel,
+                        persisted,
+                        session,
+                        poisoned,
+                        |conversation, observer| {
+                            agent.run(conversation, approver, observer, cancel)
+                        },
+                    )?;
+                }
+                Ok(turn_endpoint)
+            },
+            |session, messages| match session {
+                Some(store) => store.append(messages),
+                None => Ok(()),
+            },
+        )
     }
 }
 
@@ -449,6 +813,7 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         .map(|name| SessionStore::new(session_path(&home_dir(), name)));
     let (convo, persisted) = match &session {
         Some(store) => {
+            crate::agent::core_tool_workflow::ensure_no_pending_dispatches(store)?;
             let loaded = store.load()?;
             if loaded.is_empty() {
                 (vec![Message::system(system_prompt)], 0)
@@ -479,11 +844,17 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         session,
         convo,
         persisted,
+        selected_session_poisoned: false,
         auto_approve: opts.auto_approve,
         experimental_core_model_only: opts.experimental_core_model_only,
+        experimental_core_tool_workflow: opts.experimental_core_tool_workflow,
         interactive,
         permissions,
         diagnostics: None,
+        #[cfg(test)]
+        test_provider: None,
+        #[cfg(test)]
+        test_output: None,
     };
 
     // Seed the first turn from the prompt arg, or (non-interactive) piped stdin.
@@ -709,3 +1080,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/selected_turn.rs"]
 mod selected_turn_contract;
+
+#[cfg(test)]
+#[path = "../tests/repl_lifecycle.rs"]
+mod repl_lifecycle_contract;
