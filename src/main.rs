@@ -265,6 +265,10 @@ enum Commands {
         /// Skip the per-tool approval prompt (dangerous)
         #[arg(long = "auto-approve")]
         auto_approve: bool,
+        /// Limited opt-in: named session, nonstream model calls and native read_file only.
+        /// Other native tools are unsupported; native absolute paths remain allowed (workdir is not a sandbox).
+        #[arg(long)]
+        experimental_core_tool_workflow: bool,
     },
     /// [Deprecated] Use `monocle router audio` instead
     #[command(hide = true)]
@@ -1807,6 +1811,7 @@ fn main() {
             max_steps,
             session,
             auto_approve,
+            experimental_core_tool_workflow,
         } => agent_command(
             &client,
             &creds,
@@ -1817,6 +1822,7 @@ fn main() {
                 max_steps,
                 session,
                 auto_approve,
+                experimental_core_tool_workflow,
             },
         ),
         Commands::Router { command } => match command {

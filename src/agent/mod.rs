@@ -5,6 +5,7 @@
 //! tools, permission/sandboxing, session, and ACP surface come later.
 
 pub mod commands;
+pub(crate) mod core_named_turn;
 pub mod guide;
 pub mod permission;
 pub mod providers;
