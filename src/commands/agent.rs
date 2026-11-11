@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::agent::commands::{config_text, help_text, login_view, status_text};
 use crate::agent::permission::PermissionStore;
-use crate::agent::providers::{ChatResponse, Message, MonocleProvider, TokenUsage};
+use crate::agent::providers::{ChatRequest, ChatResponse, Message, MonocleProvider, TokenUsage};
 use crate::agent::runner::{Agent, AllowAll, Approver, Cancel, Observer};
 use crate::agent::session::{session_path, SessionStore};
 use crate::agent::tools::{ToolContext, ToolOutcome, ToolRegistry};
@@ -23,7 +23,7 @@ use crate::commands::repl::{
     diag_output, mode_banner, run_repl, LoopControl, ModelReplHelper, TurnDiagnostics, PROMPT,
 };
 use crate::credentials::Credentials;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::net::Client;
 use crate::util::home_dir;
 
@@ -36,6 +36,7 @@ pub struct AgentOptions {
     /// Skip the per-tool approval prompt (dangerous) — run side-effecting tools
     /// unattended, as scripts/one-shot already do.
     pub auto_approve: bool,
+    pub experimental_core_tool_workflow: bool,
 }
 
 /// Turn-scoped accumulator for `/diag`: `Agent::run`'s tool-use loop can call
@@ -220,6 +221,8 @@ struct Repl<'a> {
     /// Last turn's diagnostics, shown on demand by `/diag` — `None` until the
     /// first successful turn, mirroring `monocle chat`'s REPL.
     diagnostics: Option<TurnDiagnostics>,
+    experimental_core_tool_workflow: bool,
+    selected_session_poisoned: bool,
 }
 
 impl Repl<'_> {
@@ -233,6 +236,25 @@ impl Repl<'_> {
     }
 
     fn run_turn(&mut self, user: String) -> Result<()> {
+        if self.experimental_core_tool_workflow {
+            self.diagnostics = None;
+            if self.selected_session_poisoned {
+                return Err(AppError::new(
+                    "selected core session requires reopen or reconciliation",
+                ));
+            }
+            if self.session.is_none() {
+                return Err(AppError::new(
+                    "selected core read_file route requires a named session",
+                ));
+            }
+            if self.persisted > self.convo.len() {
+                return Err(AppError::new(
+                    "selected core native session cursor is invalid",
+                ));
+            }
+            crate::agent::core_named_turn::validate_history(&self.convo, self.max_steps)?;
+        }
         // Fresh token each turn (get_access_token refreshes if near expiry).
         let auth = get_access_token(self.client, self.creds);
         // Captured before `MonocleProvider::from_session` consumes `auth` —
@@ -269,6 +291,63 @@ impl Repl<'_> {
         // first `on_text_delta`, its `Time to first byte:` line).
         let started = std::time::Instant::now();
         let mut observer = CliObserver::default();
+        if self.experimental_core_tool_workflow {
+            let selected = crate::agent::core_named_turn::run(
+                &provider,
+                ChatRequest {
+                    model: self.model.clone(),
+                    messages: self.convo.clone(),
+                    ..Default::default()
+                },
+                self.session.as_ref().unwrap(),
+                &self.convo[self.persisted..],
+                &self.tools,
+                &ToolContext::new(self.workdir.clone()).with_cancel(self.cancel.clone()),
+                &self.cancel,
+                self.max_steps,
+                &mut self.selected_session_poisoned,
+            );
+            let selected = match selected {
+                Ok(selected) => selected,
+                Err(error) => {
+                    if !self.selected_session_poisoned {
+                        self.convo.truncate(mark);
+                    }
+                    return Err(error);
+                }
+            };
+            self.convo.extend(selected.generated);
+            self.persisted = self.convo.len();
+            for step in &selected.steps {
+                observer.on_turn_step(step);
+            }
+            for event in selected.events {
+                observer.on_tool_call(&event.id, "read_file", &event.arguments);
+                observer.on_tool_result(&event.id, "read_file", &event.outcome);
+            }
+            let mut out = std::io::stdout();
+            observer.first_delta_at = Some(std::time::Instant::now());
+            if let Err(error) = out
+                .write_all(selected.response.content.as_bytes())
+                .and_then(|_| out.write_all(b"\n"))
+                .and_then(|_| out.flush())
+            {
+                self.selected_session_poisoned = true;
+                return Err(error.into());
+            }
+            self.diagnostics = Some(TurnDiagnostics::for_agent(
+                self.model.clone(),
+                observer.served_model.clone().or(selected.response.model),
+                turn_endpoint,
+                observer
+                    .first_delta_at
+                    .map(|at| at.duration_since(started).as_millis()),
+                started.elapsed().as_millis(),
+                observer.usage.clone(),
+                observer.steps,
+            ));
+            return Ok(());
+        }
         if let Err(e) = agent.run(&mut self.convo, approver, &mut observer, &self.cancel) {
             // Roll back this failed turn's (partial) messages so a retry — and the
             // persisted session — stay well-formed. A failed turn must not leave
@@ -335,6 +414,16 @@ fn dispatch_command(input: &str) -> Command {
 }
 
 pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -> Result<()> {
+    if opts.experimental_core_tool_workflow
+        && opts
+            .session
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+    {
+        return Err(AppError::new(
+            "selected core read_file route requires a nonblank named session",
+        ));
+    }
     let workdir = opts
         .workdir
         .map(PathBuf::from)
@@ -350,7 +439,9 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
     // Interactive sessions gate side-effecting tools behind a y/N prompt (unless
     // `--auto-approve`); scripts / one-shot / piped runs have no TTY to prompt on
     // and keep running tools unattended, so the warning differs by mode.
-    let warning = if use_prompt_approver(opts.auto_approve, interactive) {
+    let warning = if opts.experimental_core_tool_workflow {
+        "⚠ experimental: selected core route supports nonstream model calls and read_file only; native absolute paths remain allowed."
+    } else if use_prompt_approver(opts.auto_approve, interactive) {
         "⚠ experimental: side-effecting tools (write/edit + shell) require approval before each run. Run only in a directory you trust."
     } else {
         "⚠ experimental: tools auto-approved (read/write/edit + shell). Run only in a directory you trust."
@@ -414,6 +505,8 @@ pub fn agent_command(client: &Client, creds: &Credentials, opts: AgentOptions) -
         interactive,
         permissions,
         diagnostics: None,
+        experimental_core_tool_workflow: opts.experimental_core_tool_workflow,
+        selected_session_poisoned: false,
     };
 
     // Seed the first turn from the prompt arg, or (non-interactive) piped stdin.
