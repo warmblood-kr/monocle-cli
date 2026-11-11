@@ -782,4 +782,148 @@ mod tests {
         let url = format!("http://{addr}/");
         assert!(send_with_retry("GET", &url, client.get(&url)).is_err());
     }
+
+    /// Characterizes the production transport retry for a POST whose first
+    /// attempt receives a malformed (non-timeout) response: the loopback
+    /// server records both complete request bodies and the retry succeeds.
+    /// This shows the retry re-sends the cloned request body; it says nothing
+    /// about exactly-once delivery or any effect on a real remote service.
+    #[test]
+    fn send_with_retry_replays_the_post_body_after_a_malformed_response() {
+        fn accept_within(
+            listener: &std::net::TcpListener,
+            deadline: std::time::Instant,
+        ) -> std::io::Result<std::net::TcpStream> {
+            listener.set_nonblocking(true)?;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+                        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+                        return Ok(stream);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "loopback server timed out waiting for a connection",
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        /// Read one complete HTTP/1.1 request and return its body. The test
+        /// request carries a buffered JSON body, so `content-length` is set.
+        fn read_request_body(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed before request headers completed",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "request had no content-length",
+                    )
+                })?;
+            while buf.len() < header_end + content_length {
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed before request body completed",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Ok(buf[header_end..header_end + content_length].to_vec())
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || -> std::io::Result<Vec<Vec<u8>>> {
+            let mut bodies = Vec::new();
+
+            let mut first = accept_within(
+                &listener,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )?;
+            bodies.push(read_request_body(&mut first)?);
+            first.write_all(b"not an http response at all\r\n\r\n")?;
+            first.flush()?;
+            drop(first);
+
+            let mut second = accept_within(
+                &listener,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )?;
+            bodies.push(read_request_body(&mut second)?);
+            second.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+            )?;
+            second.flush()?;
+            drop(second);
+
+            Ok(bodies)
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/submit");
+        let payload = serde_json::json!({
+            "model": "characterization-model",
+            "input": "same POST body on both transport attempts",
+        });
+        let req = client.post(&url).json(&payload);
+
+        let resp = send_with_retry("POST", &url, req).expect("the retry should recover");
+        assert_eq!(resp.status(), 200);
+
+        let bodies = server
+            .join()
+            .expect("server thread panicked")
+            .expect("server thread failed");
+        assert_eq!(
+            bodies.len(),
+            2,
+            "two request bodies should have been observed"
+        );
+        assert_eq!(
+            bodies[0], bodies[1],
+            "both attempts must carry the same POST body"
+        );
+        assert!(
+            !bodies[0].is_empty(),
+            "the recorded POST body must be complete"
+        );
+        let observed: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).expect("recorded body should be the JSON payload");
+        assert_eq!(observed, payload);
+    }
 }
